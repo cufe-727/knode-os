@@ -33,7 +33,7 @@ import { removeHeldTempDirs, sweepStaleTempDirs } from './tmp.js';
 import { boundedTrace } from './trace.js';
 import { SystemEnv, SystemUnderTest, taggedEmbedder } from './systems/types.js';
 import { extractFinalAnswer } from './metrics/text.js';
-import { AnswerRecord, BuildRecord, emptyUsage, ScoreRecord, Suite, SUITES, Task, TaskType } from './types.js';
+import { AnswerRecord, BuildRecord, emptyUsage, ScoreRecord, Suite, SUITES, Task, TaskType, Usage } from './types.js';
 
 /**
  * `knode-os eval run` (docs/design/23 §7). For each pack: stage the corpus,
@@ -902,6 +902,30 @@ export function judgeAuditFor(share: number | undefined, seed: string | number, 
   return s > 0 ? { share: s, seed, record: (r) => store.putJudgeAudit(r) } : null;
 }
 
+/** Usages added field by field. */
+function addUsage(a: Usage, b: Usage): Usage {
+  const out = { ...a };
+  for (const [k, v] of Object.entries(b) as [keyof Usage, number][]) if (typeof v === 'number') out[k] = ((out[k] as number | undefined) ?? 0) + v;
+  return out;
+}
+
+/**
+ * A resumed build's record (`resumed` in its notes): the earlier attempt's
+ * time and cost counted with this one's, since both went into the build, and
+ * what that attempt ended with.
+ */
+export function withEarlierAttempt(rec: BuildRecord, earlier: BuildRecord | null): BuildRecord {
+  const own = (rec.notes?.resumed && typeof rec.notes.resumed === 'object' ? rec.notes.resumed : {}) as Record<string, unknown>;
+  const resumed = { ...own, ...(earlier ? { earlier: { at: earlier.at, error: earlier.error ?? null, ms: earlier.ms, weightedTokens: earlier.usage.weightedTokens, embeddingTokens: earlier.usage.embeddingTokens } } : { earlier: null }) };
+  if (!earlier) return { ...rec, notes: { ...rec.notes, resumed } };
+  const stages = { ...earlier.stages };
+  for (const [k, u] of Object.entries(rec.stages)) stages[k] = stages[k] ? addUsage(stages[k], u) : u;
+  return {
+    ...rec, ms: rec.ms + earlier.ms, usage: addUsage(earlier.usage, rec.usage), stages,
+    peakRssBytes: Math.max(rec.peakRssBytes ?? 0, earlier.peakRssBytes ?? 0) || undefined, notes: { ...rec.notes, resumed },
+  };
+}
+
 async function buildGroup(store: RunStore, meter: Meter, env: SystemEnv, group: string, members: SystemUnderTest[], fraction: number, seed: string | number, progress: (m: string) => void, signal?: AbortSignal): Promise<boolean> {
   if (signal?.aborted) throw new RunCancelledError();
   const builder = members.find((s) => s.build);
@@ -922,7 +946,11 @@ async function buildGroup(store: RunStore, meter: Meter, env: SystemEnv, group: 
       store.log('reused build rebuilt', { pack: env.pack.manifest.id, group, from, reason });
     }
   }
-  progress(`[${env.pack.manifest.id}/${group}] building`);
+  // an earlier attempt of this build that stopped or failed, which the builder continues from: its cost is the build's too
+  const resuming = Boolean(builder.resumable?.(env));
+  const earlier = resuming && done && !done.ok ? done : null;
+  progress(`[${env.pack.manifest.id}/${group}] ${resuming ? 'resuming the build' : 'building'}`);
+  if (resuming) store.log('build resumed', { pack: env.pack.manifest.id, group, ...(earlier ? { earlierError: earlier.error, earlierAt: earlier.at } : {}) });
   const mark = meter.mark();
   const t0 = Date.now();
   let peak = process.memoryUsage().rss;
@@ -948,7 +976,8 @@ async function buildGroup(store: RunStore, meter: Meter, env: SystemEnv, group: 
   } finally {
     clearInterval(sampler);
   }
-  // a cancelled run writes no record of what it stopped: a resumed run builds it whole
+  if (resuming) rec = withEarlierAttempt(rec, earlier);
+  // a cancelled run writes no record of what it stopped: a resumed run builds it again (knode continues what it left)
   if (signal?.aborted) throw new RunCancelledError();
   // nor a build one of whose pieces is stuck: the group waits for a resume, and the run goes on without it
   if (remote?.stuckFor(stuckMark, group).length || (!rec.ok && rec.error && /^cancelled:/.test(rec.error))) {

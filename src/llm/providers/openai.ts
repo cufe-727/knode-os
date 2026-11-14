@@ -4,6 +4,7 @@ import { LlmConfig, LlmEffort, LlmProtocol, resolveSecret } from '../../config.j
 import type { LlmBackend, LlmProviderPlugin } from '../../plugins/types.js';
 import type { ChatMessage, CompletionOptions, ImageAttachment } from '../client.js';
 import { demoteToChat, negotiateProtocol, OPTIONAL_PARAMETERS, refusedParameter, takesParameter } from '../protocol.js';
+import { fetchRetrying } from '../network.js';
 import { usageFromOpenAi } from '../usage.js';
 
 /**
@@ -75,7 +76,8 @@ export class OpenAiCompatibleBackend implements LlmBackend {
     for (const key of optional()) if (!takesParameter(this.baseUrl, model, key)) delete sent[key];
     for (;;) {
       const request = JSON.stringify(sent);
-      const res = await fetch(`${this.baseUrl}${route}`, { method: 'POST', headers: this.headers(), body: request });
+      // a connection dropped before any response is tried again, with backoff (src/llm/network.ts)
+      const res = await fetchRetrying(`${this.baseUrl}${route}`, { method: 'POST', headers: this.headers(), body: request });
       if (res.status !== 400) return { res, request };
       const error = await res.clone().text();
       const named = optional().find((key) => error.includes(key));

@@ -66,6 +66,13 @@ export interface SystemUnderTest {
   applicable?(pack: LoadedPack, staged?: StagedCorpus): boolean;
   /** Build the group's knowledge base; called once per pack for the first system of its group. */
   build?(env: SystemEnv): Promise<{ notes?: Record<string, unknown>; kbDir?: string }>;
+  /**
+   * Can `build` continue from what an earlier attempt of this build left (a
+   * run stopped or failed mid-build and resumed) rather than start over? The
+   * build itself decides the same way; the run asks first, to count the
+   * earlier attempt's cost with this one and say so on the record.
+   */
+  resumable?(env: SystemEnv): boolean;
   /** Reopen an earlier build (a resumed run) without rebuilding. */
   reopen?(env: SystemEnv): Promise<void>;
   answer?(task: Task, prompt: string, env: SystemEnv): Promise<SystemAnswer>;

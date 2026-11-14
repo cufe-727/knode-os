@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { defaultConfig, defaultRoutedLlmConfig, KnodeConfig, LlmConnection } from '../../config.js';
@@ -312,6 +313,67 @@ function readPageSources(s: KnodeState): void {
   }
 }
 
+/**
+ * A build in progress, beside its index (`.knode/eval-build.json`): what it is
+ * a build of, and the phases it has finished. A run that stopped or failed
+ * mid-build (the 10× build lost a connection after five hours) continues from
+ * it when it is resumed: the documents synced, extracted and embedded stay,
+ * the extraction queue holds what is left, and finished phases are not done
+ * again.
+ */
+interface BuildProgress {
+  /** The staged corpus (paths and sizes), the pack version and the models: anything else is another build. */
+  fingerprint: string;
+  startedAt: string;
+  /** Attempts so far, this one among them. */
+  attempts: number;
+  done: ('synced' | 'extracted' | 'wiki' | 'refined')[];
+  wikiPages?: number;
+  refined?: unknown;
+}
+
+const progressFile = (s: KnodeState) => path.join(s.ws, '.knode', 'eval-build.json');
+
+function readProgress(s: KnodeState): BuildProgress | null {
+  try {
+    return JSON.parse(fs.readFileSync(progressFile(s), 'utf8')) as BuildProgress;
+  } catch {
+    return null;
+  }
+}
+
+function writeProgress(s: KnodeState, p: BuildProgress): void {
+  fs.mkdirSync(path.dirname(progressFile(s)), { recursive: true });
+  fs.writeFileSync(progressFile(s), JSON.stringify(p, null, 2));
+}
+
+export function buildFingerprint(env: Pick<SystemEnv, 'pack' | 'staged' | 'models'>): string {
+  const docs = env.staged.docs.map((d) => {
+    let size = -1;
+    try {
+      size = fs.statSync(path.join(env.staged.dir, d.path)).size;
+    } catch {
+      /* not staged as a file */
+    }
+    return [d.path, size];
+  }).sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+  return crypto.createHash('sha1').update(JSON.stringify([env.pack.manifest.id, env.pack.manifest.version, docs, env.models ?? null])).digest('hex');
+}
+
+/**
+ * The progress an earlier attempt left in this workspace, when this build can
+ * continue from it: the same corpus and models, the workspace's config there,
+ * and its index this workspace's own (a copy of another run's build is never
+ * continued: its index is not this run's).
+ */
+function resumableProgress(s: KnodeState, env: SystemEnv): BuildProgress | null {
+  const prior = readProgress(s);
+  if (!prior || prior.fingerprint !== buildFingerprint(env)) return null;
+  if (!fs.existsSync(path.join(s.ws, 'knode.config.json'))) return null;
+  const index = readIndexRecord(s);
+  return index && index.workspace === path.resolve(s.ws) ? prior : null;
+}
+
 async function drain(ctx: AppContext, env: SystemEnv): Promise<Record<string, number>> {
   const totals = { passes: 0, processed: 0, failed: 0, calls: 0, callsFailed: 0, summaries: 0 };
   for (let i = 0; i < 2000; i++) {
@@ -336,38 +398,78 @@ function knodeSystem(id: string, label: string, kind: SystemUnderTest['kind'], a
     group: 'knode',
     kind,
     answers,
+    resumable(env) {
+      return resumableProgress(stateFor(env), env) !== null;
+    },
     async build(env) {
       const s = stateFor(env);
       await close(s);
-      fs.rmSync(s.ws, { recursive: true, force: true });
-      fs.mkdirSync(s.ws, { recursive: true });
+      const prior = resumableProgress(s, env);
       const config = evalWorkspaceConfig(env);
-      fs.writeFileSync(path.join(s.ws, 'knode.config.json'), JSON.stringify(config, null, 2));
-      // a build starts empty: on PostgreSQL the workspace's schema outlives its directory (an earlier, failed build)
-      if (config.database.kind === 'postgres') await dropEvalWorkspace(s.ws, config.database);
-      fs.cpSync(env.staged.dir, path.join(s.ws, 'raw', 'docs'), { recursive: true });
+      if (prior) {
+        // an earlier attempt's workspace: kept, and pointed at this run's shim (its port changed) and database
+        fs.writeFileSync(path.join(s.ws, 'knode.config.json'), JSON.stringify(config, null, 2));
+        await adoptIndex(s, env, config);
+        env.log(`knode: resuming the build started ${prior.startedAt} (attempt ${prior.attempts + 1}; done: ${prior.done.join(', ') || 'nothing yet'})`);
+      } else {
+        fs.rmSync(s.ws, { recursive: true, force: true });
+        fs.mkdirSync(s.ws, { recursive: true });
+        fs.writeFileSync(path.join(s.ws, 'knode.config.json'), JSON.stringify(config, null, 2));
+        // a build starts empty: on PostgreSQL the workspace's schema outlives its directory (an earlier, failed build)
+        if (config.database.kind === 'postgres') await dropEvalWorkspace(s.ws, config.database);
+        fs.cpSync(env.staged.dir, path.join(s.ws, 'raw', 'docs'), { recursive: true });
+      }
+      const progress: BuildProgress = prior
+        ? { ...prior, done: [...prior.done], attempts: prior.attempts + 1 }
+        : { fingerprint: buildFingerprint(env), startedAt: new Date().toISOString(), attempts: 1, done: [] };
+      const finish = (phase: BuildProgress['done'][number]) => {
+        if (!progress.done.includes(phase)) progress.done.push(phase);
+        writeProgress(s, progress);
+      };
       const ctx = await open(s);
-      const index = await recordIndex(s, ctx);
-      const t0 = Date.now();
-      const synced = await sync(ctx, { datasources: false, onProgress: (m) => env.log(`knode sync: ${m}`) });
-      const tSync = Date.now() - t0;
-      const passes = await drain(ctx, env);
-      const tPasses = Date.now() - t0 - tSync;
-      const pages = await generateWiki(ctx.store, ctx.llm, { config: ctx.config, embedder: ctx.embedder, onProgress: (m) => env.log(`knode wiki: ${m}`) });
-      const refined = await refineWiki(ctx.store, ctx.config, ctx.llm, { embedder: ctx.embedder });
-      // the generated pages are searchable too, as in a live workspace
-      await sync(ctx, { datasources: false, llmGraph: false });
-      readPageSources(s);
-      const [counts] = await ctx.store.query<Record<string, number>>(
+      const index = prior ? readIndexRecord(s)! : await recordIndex(s, ctx);
+      writeProgress(s, progress);
+      const countsOf = async () => (await ctx.store.query<Record<string, number>>(
         `SELECT (SELECT count(*)::int FROM documents WHERE status = 'indexed') AS documents,
                 (SELECT count(*)::int FROM chunks) AS chunks,
                 (SELECT count(*)::int FROM entities WHERE tx_to IS NULL AND canonical_id IS NULL) AS entities,
                 (SELECT count(*)::int FROM relations WHERE tx_to IS NULL) AS relations,
-                (SELECT count(*)::int FROM claims WHERE tx_to IS NULL AND canonical_id IS NULL) AS claims`,
-      );
+                (SELECT count(*)::int FROM claims WHERE tx_to IS NULL AND canonical_id IS NULL) AS claims,
+                (SELECT count(*)::int FROM extraction_queue) AS queued`,
+      ))[0];
+      // what the earlier attempts left: indexed and embedded documents, and the extraction queue still to drain
+      const before = prior ? await countsOf() : null;
+      const t0 = Date.now();
+      // sync is incremental: a resumed build indexes (and embeds) only what the earlier attempt had not
+      const synced = await sync(ctx, { datasources: false, onProgress: (m) => env.log(`knode sync: ${m}`) });
+      finish('synced');
+      const tSync = Date.now() - t0;
+      const passes = await drain(ctx, env);
+      finish('extracted');
+      const tPasses = Date.now() - t0 - tSync;
+      let pages = progress.wikiPages ?? 0;
+      if (!progress.done.includes('wiki')) {
+        pages = (await generateWiki(ctx.store, ctx.llm, { config: ctx.config, embedder: ctx.embedder, onProgress: (m) => env.log(`knode wiki: ${m}`) })).length;
+        progress.wikiPages = pages;
+        finish('wiki');
+      }
+      let refined = progress.refined;
+      if (!progress.done.includes('refined')) {
+        refined = await refineWiki(ctx.store, ctx.config, ctx.llm, { embedder: ctx.embedder });
+        progress.refined = refined;
+        finish('refined');
+      }
+      // the generated pages are searchable too, as in a live workspace
+      await sync(ctx, { datasources: false, llmGraph: false });
+      readPageSources(s);
+      const { queued: _queued, ...counts } = await countsOf();
       return {
         kbDir: s.ws,
-        notes: { ...counts, database: describeDatabase(ctx.config.database), ...(index.schema ? { schema: index.schema } : {}), ...passes, passConcurrency: ctx.config.extraction.concurrency, judgeConcurrency: ctx.config.review?.directConcurrency ?? 1, passBatch: ctx.config.extraction.batchSize, wikiPages: pages.length, refined, indexed: synced.indexed, stageMs: { sync: tSync, documentPasses: tPasses, wiki: Date.now() - t0 - tSync - tPasses } },
+        notes: {
+          ...counts, database: describeDatabase(ctx.config.database), ...(index.schema ? { schema: index.schema } : {}), ...passes, passConcurrency: ctx.config.extraction.concurrency, judgeConcurrency: ctx.config.review?.directConcurrency ?? 1, passBatch: ctx.config.extraction.batchSize, wikiPages: pages, refined, indexed: synced.indexed, stageMs: { sync: tSync, documentPasses: tPasses, wiki: Date.now() - t0 - tSync - tPasses },
+          // a resumed build: what the earlier attempts had done, and what this one found already there
+          ...(prior ? { resumed: { startedAt: prior.startedAt, attempt: progress.attempts, phasesDone: prior.done, before } } : {}),
+        },
       };
     },
     async reopen(env) {
