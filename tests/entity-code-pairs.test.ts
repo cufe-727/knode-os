@@ -27,6 +27,10 @@ describe('code-like names that differ only in their numbers', () => {
       ['D4T3-C2', 'D4T3-C3'],
       ['T1-1124', 'T1-1123'],
       ['inc-012', 'INC-021'],
+      // codes without a separator are codes too: two Windows versions are two things
+      ['Windows10', 'Windows11'],
+      // a one-digit number with another digit before it is another number, not one written two ways
+      ['R-7', 'R-17'],
     ]) expect(codesApartByDigits(e(a), e(b)), `${a} / ${b}`).toBe(true);
   });
 
@@ -44,6 +48,13 @@ describe('code-like names that differ only in their numbers', () => {
       ['平台组周报 · 第25周', '平台组周报 · 第26周'],
       ['天权中心', '天权中心2'],
       ['INC-012', 'INC-12'],
+      // one number written two ways: a year in two digits and in four, or digits put before
+      ['COVID-19', 'COVID-2019'],
+      ['FY25', 'FY2025'],
+      ['1H25', '1H2025'],
+      ['WWDC23', 'WWDC2023'],
+      ['INC-76', 'INC-176'],
+      // a name with a space is no code: other signals' to weigh
       ['Windows 10', 'Windows 11'],
       ['GPT-4', 'GPT-4o'],
       ['2024', '2025'],
@@ -80,6 +91,8 @@ describe('the duplicate-entity audit', () => {
       await store.query(`INSERT INTO entities (id, name, type, name_key, aliases) VALUES ($1, $2, 'event', $1, $3::jsonb)`, [id, name, JSON.stringify([alias])]);
       await store.query(`INSERT INTO entity_alias_keys (entity_id, alias_key, kind) VALUES ($1, $2, 'exact')`, [id, alias]);
     }
+    // a second shared alias brings the code pair up twice: it is still one pair
+    for (const id of ['inc-012-t1', 'inc-021-t1']) await store.query(`INSERT INTO entity_alias_keys (entity_id, alias_key, kind) VALUES ($1, 'cache-outage', 'exact')`, [id]);
     const shown: string[] = [];
     const complete = async (messages: { role: string; content: string }[]) => {
       const user = messages.find((m) => m.role === 'user')?.content ?? '';

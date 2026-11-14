@@ -9,6 +9,7 @@ import { toDateString, toIso } from '../store/temporal.js';
 import { directJudge, JudgeCall, JudgeRunner, verdictMayDecide } from '../work/judge.js';
 import { applyClaimMerge, reanchorClaimGroups } from './claim-merge.js';
 import { sameValue } from './claim-state.js';
+import { claimId, readingWeek } from './store.js';
 import { packSubjectBatches, SubjectBatch } from './subject-batches.js';
 import { alikeWording, Wording, wordingOf, wordingPrefixLength } from './wording.js';
 
@@ -64,6 +65,8 @@ export interface ClaimDedupeStats {
   series: number;
   /** One attribute, one date, one value: merged without a model. */
   sameValue: number;
+  /** Pairs of weekly readings of other weeks (keyedWeek): two claims by their identity, never judged or stored. */
+  readingsApart: number;
   judged: number;
   /** Pairs that needed the judge but did not fit under review.claimMergeMaxJudgedPerRun: left for a later run. */
   deferred: number;
@@ -83,6 +86,8 @@ export type ClaimRelation = 'same' | 'contains' | 'conflict' | 'different_time' 
 
 interface ClaimLite {
   id: string;
+  /** Its own subject (claimId's), before entity merges; `subject` is the canonical one. */
+  subject_id: string;
   subject: string;
   object: string | null;
   subject_name: string;
@@ -142,6 +147,33 @@ export function claimPairId(a: string, b: string): string {
 /** Letters and digits only, NFKC-folded and lower-cased: "…增长 20%。" and "…增长20％" meet. */
 export function statementKey(s: string): string {
   return s.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+}
+
+/**
+ * The ISO week a claim is a reading of (readingWeek in src/graph/store.ts),
+ * when its id carries it; null for every other claim, a claim written before
+ * readings were keyed included. Two readings of other weeks are two claims by
+ * construction: the audit never pairs them, so a statement repeated k weeks
+ * costs no k(k−1)/2 verdicts, and no rule or judge can merge them.
+ */
+const keyedWeeks = new WeakMap<object, string | null>();
+export function keyedWeek(c: Pick<ClaimLite, 'id' | 'subject_id' | 'statement' | 'attribute' | 'value_num' | 'date_source' | 'event_at' | 'valid_from' | 'valid_to'>): string | null {
+  const memo = keyedWeeks.get(c);
+  if (memo !== undefined) return memo;
+  const week = readingWeek({
+    statement: c.statement, attribute: c.attribute, valueNum: c.value_num, dateSource: c.date_source,
+    eventAt: c.event_at, validFrom: c.valid_from, validTo: c.valid_to,
+  });
+  const keyed = week && claimId(c.subject_id, c.statement, week) === c.id ? week : null;
+  keyedWeeks.set(c, keyed);
+  return keyed;
+}
+
+/** Two readings of other weeks: settled apart by their identity (keyedWeek). */
+function readingsApart(a: ClaimLite, b: ClaimLite): boolean {
+  const wa = keyedWeek(a);
+  const wb = keyedWeek(b);
+  return Boolean(wa && wb && wa !== wb);
 }
 
 const UNIT = '万亿|亿美元|亿港元|亿元|亿|万吨|万元|万|千万|百万|个百分点|pct|bp|%|倍|美元|港元|元|吨|gwh|gw|mwh|mw';
@@ -362,7 +394,7 @@ async function textCandidates(
       const sharing = indexes.get(block) ?? indexes.set(block, indexBlock(block, read, opts.words)).get(block)!;
       for (const i of sharing(f)) {
         const c = block[i];
-        if (c.id === f.id) continue;
+        if (c.id === f.id || readingsApart(f, c)) continue;
         if (read.key(c) === fKey) {
           propose(f, c, 'identical');
           continue;
@@ -532,33 +564,55 @@ export function ownSpan(c: Pick<ClaimLite, 'valid_from' | 'valid_to' | 'event_at
  * The times the two claims state of themselves are both known and do not
  * meet: a validity window, or an event read as wide as its date allows
  * (ownSpan). A date only the document gives is not the claim's own and
- * settles nothing here (reportedApart reads those). Exported for tests.
+ * settles nothing here (reportedApart reads those), and two single days side
+ * by side are left to the judge. Exported for tests.
  */
 export function datesApart(a: Pick<ClaimLite, 'valid_from' | 'valid_to' | 'event_at'>, b: Pick<ClaimLite, 'valid_from' | 'valid_to' | 'event_at'>): boolean {
   const sa = ownSpan(a);
   const sb = ownSpan(b);
   if (!sa || !sb) return false;
-  return Boolean((sa[1] && sa[1] < sb[0]) || (sb[1] && sb[1] < sa[0]));
+  const [first, second] = sa[0] <= sb[0] ? [sa, sb] : [sb, sa];
+  if (!first[1] || first[1] >= second[0]) return false;
+  // two single days side by side are how two sources date one figure (published on the 8th,
+  // reported on the 9th): too near to call two times without the judge
+  const days = (x: [string, string | null]) => (Date.parse(x[1] ?? x[0]) - Date.parse(x[0])) / DAY_MS;
+  const gap = (Date.parse(second[0]) - Date.parse(first[1])) / DAY_MS;
+  return !(gap < 1 && days(first) < 1 && days(second) < 1);
 }
 
 /** A year a statement names, which periodsOf reads instead. */
 const NAMED_YEAR = /(?<![\d.])(?:20\d{2}|\d{2}\s*年)|fy\s*\d{2}|\d[qh]\d{2}/i;
 const MONTH = /(?<![\d.])(\d{1,2})\s*月/g;
+/** A tenor or a span of months, which is no time at all: 3月期 Shibor, 6个月期, 3个月内. */
+const MONTH_SPAN = /(?<![\d.])\d{1,2}\s*个?\s*月\s*期|(?<![\d.])\d{1,2}\s*个\s*月/g;
+/** The month of the document that reports the fact: 5月月报, 4月份周报, 10月报告. */
+const REPORT_MONTH = /(?<![\d.])(\d{1,2})\s*月份?\s*(?:月报|周报|报告|简报|报)/g;
+/** A time besides months: a quarter, a half, a numbered or relative week, a relative year. */
+const OTHER_TIME = /[一二三四1-4]\s*季度|[上下本]季度|\bq[1-4]|[1-4]\s*q\b|\bh[12]\b|[上下]半年|第\s*\d{1,3}\s*周|\bw\d{1,2}\b|[上下本]周|周[前后]|[去今明前]年/i;
 
 /**
- * The months of the year a statement names without a year ("10月月报列示…",
- * "4月上线"); empty when it names a year, which periodsOf reads. A monthly
- * report with no date of its own says "4月月报列示四部支付组在岗人数为7人".
+ * The months of the year a statement names as the time of its fact, without a
+ * year ("8月五部平台组在岗人数为6人", "4月上线"); empty when it names a year (periodsOf
+ * reads those). A tenor (3月期) is no time. The month of the report that states
+ * the fact (5月月报) is the fact's time only for a measured state (`measure`: the
+ * claim gives an attribute's value) whose statement names no other time:
+ * "4月月报列示在岗人数为7人" is April's headcount, but "5月月报列示Orion已于第18周上线"
+ * and "4月月报列示一季度营收为3亿元" speak of week 18 and of Q1, whichever report says so.
  * Exported for tests.
  */
-export function yearlessMonthsOf(s: string): Set<number> {
-  const text = s.normalize('NFKC');
+export function yearlessMonthsOf(s: string, measure = false): Set<number> {
+  const text = s.normalize('NFKC').replace(MONTH_SPAN, ' ');
   if (NAMED_YEAR.test(text)) return new Set();
   const out = new Set<number>();
-  for (const m of text.matchAll(MONTH)) {
-    const n = Number(m[1]);
+  const add = (m: string) => {
+    const n = Number(m);
     if (n >= 1 && n <= 12) out.add(n);
-  }
+  };
+  const reports = [...text.matchAll(REPORT_MONTH)].map((m) => m[1]);
+  const rest = text.replace(REPORT_MONTH, ' ');
+  if (OTHER_TIME.test(rest)) return new Set();
+  for (const m of rest.matchAll(MONTH)) add(m[1]);
+  if (out.size === 0 && measure) for (const m of reports) add(m);
   return out;
 }
 
@@ -571,20 +625,20 @@ function windowMonth(c: Pick<ClaimLite, 'valid_from' | 'valid_to'>): Set<number>
 
 /**
  * Two claims whose months of the year miss each other, at least one of them
- * named in the statement without a year: an April and an October are two
- * times whatever their years. The other side may give its month by a window
- * inside one month. A forecast is left out — "6月月报预计Orion于第32周上线" and
- * the May report's same words name the reports' months, not the forecast's:
- * on the 1× benchmark copy the judge called four such pairs the same.
- * Exported for tests.
+ * named in the statement without a year (yearlessMonthsOf): an April and an
+ * October are two times whatever their years. The other side may give its
+ * month by a window inside one month. A forecast is left out: its time is the
+ * one it foresees, which its statement's month need not be. `monthsOf` reads a
+ * statement once per audit (a memo of yearlessMonthsOf). Exported for tests.
  */
 export function monthsApart(
-  a: Pick<ClaimLite, 'statement' | 'kind' | 'valid_from' | 'valid_to'>,
-  b: Pick<ClaimLite, 'statement' | 'kind' | 'valid_from' | 'valid_to'>,
+  a: Pick<ClaimLite, 'statement' | 'kind' | 'valid_from' | 'valid_to' | 'attribute'>,
+  b: Pick<ClaimLite, 'statement' | 'kind' | 'valid_from' | 'valid_to' | 'attribute'>,
+  monthsOf: (statement: string, measure: boolean) => Set<number> = yearlessMonthsOf,
 ): boolean {
   if (a.kind === 'prediction' || b.kind === 'prediction') return false;
-  const na = yearlessMonthsOf(a.statement);
-  const nb = yearlessMonthsOf(b.statement);
+  const na = monthsOf(a.statement, Boolean(a.attribute));
+  const nb = monthsOf(b.statement, Boolean(b.attribute));
   if (na.size === 0 && nb.size === 0) return false;
   const ma = na.size ? na : windowMonth(a);
   const mb = nb.size ? nb : windowMonth(b);
@@ -660,7 +714,7 @@ export function reportedApart(
 export const CLAIMS_PER_BATCH = 40_000;
 
 /** Every representative claim that takes part, with its canonical subject / object; narrowed by the caller. */
-const CLAIM_SELECT = `SELECT c.id, COALESCE(se.canonical_id, c.subject_id) AS subject, COALESCE(oe.canonical_id, c.object_id) AS object,
+const CLAIM_SELECT = `SELECT c.id, c.subject_id, COALESCE(se.canonical_id, c.subject_id) AS subject, COALESCE(oe.canonical_id, c.object_id) AS object,
             se.name AS subject_name, c.statement, c.status, c.kind, c.type, c.valid_from, c.valid_to, c.event_at,
             c.evidence_count, (SELECT count(*)::int FROM claims m WHERE m.canonical_id = c.id) AS members,
             c.tx_from, s.key AS source_path, c.chunk_id,
@@ -745,7 +799,7 @@ export async function auditDuplicateClaims(
 ): Promise<ClaimDedupeStats> {
   const { store, config } = ctx;
   const progress = opts.onProgress ?? (() => {});
-  const stats: ClaimDedupeStats = { candidates: 0, identical: 0, differentTime: 0, series: 0, sameValue: 0, judged: 0, deferred: 0, merged: 0, suggested: 0, conflicts: 0, embedded: 0, reanchored: 0, leftToPerson: 0 };
+  const stats: ClaimDedupeStats = { candidates: 0, identical: 0, differentTime: 0, series: 0, sameValue: 0, readingsApart: 0, judged: 0, deferred: 0, merged: 0, suggested: 0, conflicts: 0, embedded: 0, reanchored: 0, leftToPerson: 0 };
   const mode = config.review?.claimMerge ?? 'auto';
   if (mode === 'off') return stats;
   const minConfidence = config.review?.claimMergeMinConfidence ?? 0.9;
@@ -940,13 +994,25 @@ export async function auditDuplicateClaims(
     const numbersIn = perStatement(numbersOf);
     const periodsIn = perStatement(periodsOf);
     const negatedIn = perStatement(negated);
+    const monthMemo = new Map<string, Set<number>>();
+    const monthsIn = (statement: string, measure: boolean): Set<number> => {
+      const k = `${measure ? 1 : 0}${statement}`;
+      let v = monthMemo.get(k);
+      if (!v) monthMemo.set(k, (v = yearlessMonthsOf(statement, measure)));
+      return v;
+    };
     for (const pair of pairs.values()) {
       await pause();
       if (decided.has(pair.id)) continue;
       const { a, b } = pair;
-      if (pair.why.includes('identical')) {
-        // one wording of two times — a weekly report's "本周服务可用性为99.92%" in week 3
-        // and in week 17 (claimId's reading day) — is two readings, not one claim twice
+      // readings of other weeks are two claims by construction, however they came up (keyedWeek)
+      if (readingsApart(a, b)) {
+        stats.readingsApart++;
+        continue;
+      }
+      // one wording is one claim only where neither side is a weekly reading: a reading and an
+      // older claim of the same words (several weeks folded, or dated otherwise) go to the rules below
+      if (pair.why.includes('identical') && (opts.stateRules === false || (!keyedWeek(a) && !keyedWeek(b)))) {
         if (opts.stateRules !== false && datesApart(a, b)) {
           outcomes.push({ pair, verdict: { relation: 'different_time', keep: null, confidence: 1, reason: '同一说法、不同时点', model: 'rule' } });
           stats.differentTime++;
@@ -977,7 +1043,7 @@ export async function auditDuplicateClaims(
         stats.series++;
         continue;
       }
-      if (datesApart(a, b) || periodsDisjoint(periodsIn(a), periodsIn(b)) || (opts.stateRules !== false && monthsApart(a, b))) {
+      if (datesApart(a, b) || periodsDisjoint(periodsIn(a), periodsIn(b)) || (opts.stateRules !== false && monthsApart(a, b, monthsIn))) {
         outcomes.push({ pair, verdict: { relation: 'different_time', keep: null, confidence: 1, reason: '时期不同', model: 'rule' } });
         stats.differentTime++;
         continue;

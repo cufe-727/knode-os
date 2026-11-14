@@ -7,15 +7,14 @@ import { initDataDir } from '../src/fs/datadir.js';
 import { auditDuplicateClaims, datesApart, eventSpanEnd, monthsApart, yearlessMonthsOf } from '../src/graph/claim-dedupe.js';
 import { refreshClaimState } from '../src/graph/claim-state-store.js';
 import { RawExtractReply } from '../src/graph/llm-extract.js';
-import { claimId } from '../src/graph/store.js';
+import { claimId, readingWeek } from '../src/graph/store.js';
 import { enqueueTier1, runTier1Pass } from '../src/graph/tier1.js';
 import { sync } from '../src/ingest/sync.js';
-import { readingDay } from '../src/lineage/writer.js';
 import { LlmClient } from '../src/llm/client.js';
 import { markSupersededClaims } from '../src/wiki/refine.js';
 
 /**
- * A claim's identity (src/graph/store.ts claimId, src/lineage/writer.ts readingDay):
+ * A claim's identity (src/graph/store.ts claimId, readingWeek):
  * one sentence a weekly report repeats about a measure is a reading per week, while a
  * restated text value stays one claim. On the 10× reports benchmark (2026-11-14) 603 of
  * 1,440 weekly metric values had folded into another week's claim.
@@ -92,22 +91,44 @@ async function build(name: string): Promise<AppContext> {
 }
 
 describe('a claim identity', () => {
-  it('carries the day of a dated reading of a number, and nothing else', () => {
-    const reading = { statement: '平台组本周服务可用性为99.92%。', attribute: '服务可用性', valueNum: 99.92, dateSource: 'stated', validFrom: '2025-01-06T00:00:00.000Z' };
-    expect(readingDay(reading)).toBe('2025-01-06');
-    expect(readingDay({ ...reading, statement: '七部增长组两周前的周活跃用户为136万。' })).toBe('2025-01-06');
-    expect(readingDay({ ...reading, eventAt: '2025-03-03T00:00:00.000Z' })).toBe('2025-03-03');
-    expect(readingDay({ ...reading, valueNum: null })).toBeNull();
-    expect(readingDay({ ...reading, attribute: null })).toBeNull();
-    expect(readingDay({ ...reading, dateSource: 'document' })).toBeNull();
-    expect(readingDay({ ...reading, validFrom: null })).toBeNull();
-    // a statement that names its own time is one fact however many sources report it on other days
-    for (const statement of ['2026Q2 净利润 120 亿元', '平台组2025年第24周服务可用性为99.92%', '10月月报列示四部平台组在岗人数为6人', '2025-06-16当周可用性99.92%', 'FY25 revenue was 3.2bn', '上半年营收12亿元']) {
-      expect(readingDay({ ...reading, statement })).toBeNull();
-    }
-    // without a day the id is what it always was, so claims of existing workspaces keep theirs
-    expect(claimId('平台组', 'x')).toBe(claimId('平台组', 'x', null));
-    expect(claimId('平台组', 'x', '2025-01-06')).not.toBe(claimId('平台组', 'x', '2025-01-20'));
+  const reading = {
+    statement: '平台组本周服务可用性为99.92%。', attribute: '服务可用性', valueNum: 99.92, dateSource: 'stated',
+    validFrom: '2025-06-16T00:00:00.000Z', validTo: '2025-06-20T23:59:59.999Z',
+  };
+
+  it('carries the ISO week of a weekly reading of a number', () => {
+    expect(readingWeek(reading)).toBe('2025-W25');
+    // another day of the week, an open window from a day of it, an event in it: one week, one id
+    expect(readingWeek({ ...reading, validFrom: '2025-06-17T00:00:00.000Z', validTo: '2025-06-22T23:59:59.999Z' })).toBe('2025-W25');
+    expect(readingWeek({ ...reading, validTo: null })).toBe('2025-W25');
+    expect(readingWeek({ ...reading, validFrom: null, validTo: null, eventAt: '2025-06-18T00:00:00.000Z' })).toBe('2025-W25');
+    expect(readingWeek({ ...reading, statement: '本周7日年化收益率为2.1%' })).toBe('2025-W25');
+    expect(readingWeek({ ...reading, statement: '3号线本周客流为120万人次' })).toBe('2025-W25');
+    expect(readingWeek({ ...reading, statement: 'Revenue this week was 3.2m' })).toBe('2025-W25');
+    // a window across two weeks is no week's reading
+    expect(readingWeek({ ...reading, validTo: '2025-06-24T23:59:59.999Z' })).toBeNull();
+  });
+
+  it('leaves every other claim the identity it had', () => {
+    expect(readingWeek({ ...reading, valueNum: null })).toBeNull();
+    expect(readingWeek({ ...reading, attribute: null })).toBeNull();
+    expect(readingWeek({ ...reading, dateSource: 'document' })).toBeNull();
+    expect(readingWeek({ ...reading, validFrom: null, validTo: null })).toBeNull();
+    // not relative to this week: a restated fact or another period's figure is one claim however many reports date it
+    for (const statement of [
+      '宁德时代净利润120亿元', '六部增长组目前有8人。', '七部增长组两周前的周活跃用户为136万。', '2026Q2 净利润 120 亿元',
+      '本周公布Q3净利润同比增长20%', '本周披露H1营收12亿元', 'March revenue this week was 3bn', '本周W37完成度46%', '本周确认去年营收12亿元',
+      '平台组2025年第24周服务可用性为99.92%', '10月月报列示本周在岗人数为6人', '本周6月18日可用性99.92%', '上周及本周可用性99.92%',
+    ]) expect(readingWeek({ ...reading, statement }), statement).toBeNull();
+  });
+
+  it('keeps the ids main gave every claim that is not a reading', () => {
+    // sha256 of "subject|statement", computed apart from this code
+    expect(claimId('宁德时代', '2026Q2 净利润 120 亿元')).toBe('c8139f0950ce4e10b2c8b648');
+    expect(claimId('r-70', 'R-70负责人为姜婷。')).toBe('d180122f0f46f32e748ebf1c');
+    expect(claimId('六部增长组', '六部增长组目前有8人。')).toBe('328f1c550a9b4a23dc54ce2e');
+    expect(claimId('平台组', '平台组本周服务可用性为99.92%。')).toBe('0da6375eef963cfa744fcb25');
+    expect(claimId('平台组', '平台组本周服务可用性为99.92%。', '2025-W25')).not.toBe('0da6375eef963cfa744fcb25');
   });
 });
 
@@ -130,8 +151,9 @@ describe('weekly readings of one measure', () => {
     expect(readings.map((r) => [r.statement, r.valid_from.toISOString().slice(0, 10), r.valid_to.toISOString().slice(0, 10), r.evidence_count])).toEqual(
       WEEKS.map((v, k) => [`平台组本周服务可用性为${v}%。`, monday(k), friday(k), 1]),
     );
-    const owner = await ctx.store.query<{ evidence_count: number }>(`SELECT evidence_count FROM claims WHERE subject_id = 'r-70' AND tx_to IS NULL`);
-    expect(owner).toEqual([{ evidence_count: WEEKS.length }]);
+    const owner = await ctx.store.query<{ id: string; evidence_count: number }>(`SELECT id, evidence_count FROM claims WHERE subject_id = 'r-70' AND tx_to IS NULL`);
+    // the id main gave it
+    expect(owner).toEqual([{ id: 'd180122f0f46f32e748ebf1c', evidence_count: WEEKS.length }]);
 
     // the two 99.92% weeks are worded alike; the audit settles them apart without a model and merges nothing
     const judged = { pairs: 0 };
@@ -139,10 +161,10 @@ describe('weekly readings of one measure', () => {
     expect(judged.pairs).toBe(0);
     expect(stats.merged).toBe(0);
     expect(stats.identical).toBe(0);
-    const [{ reason }] = await ctx.store.query<{ reason: string }>(
-      `SELECT v.reason FROM claim_pair_verdicts v JOIN claims a ON a.id = v.a_id JOIN claims b ON b.id = v.b_id WHERE a.statement = b.statement`,
-    );
-    expect(reason).toBe('同一说法、不同时点');
+    // two readings of other weeks are never even a pair: no verdict is stored for them
+    expect(await ctx.store.query(
+      `SELECT 1 FROM claim_pair_verdicts v JOIN claims a ON a.id = v.a_id JOIN claims b ON b.id = v.b_id WHERE a.statement = b.statement`,
+    )).toHaveLength(0);
 
     // the history holds all four weeks, the last one current
     await refreshClaimState(ctx.store);
@@ -181,22 +203,31 @@ describe('the dates a claim states of itself', () => {
     expect(datesApart(event('2025-08-25T00:00:00Z'), week('2025-08-27', '2025-08-29T23:59:59Z'))).toBe(false);
     expect(datesApart(event('2025-07-01T00:00:00Z'), week('2025-08-01', '2025-08-31T23:59:59Z'))).toBe(false);
     expect(datesApart(event('2025-09-08T00:00:00Z'), week('2025-10-13', '2025-10-17T23:59:59Z'))).toBe(true);
+    // two sources dating one figure a day apart: the judge's, not two times
+    const day = (d: string) => week(`${d}T00:00:00Z`, `${d}T23:59:59.999Z`);
+    expect(datesApart(day('2025-04-08'), day('2025-04-09'))).toBe(false);
+    expect(datesApart(event('2025-04-08T00:00:00Z'), event('2025-04-09T00:00:00Z'))).toBe(false);
+    expect(datesApart(day('2025-04-08'), day('2025-04-10'))).toBe(true);
     // a date only the document gives is not the claim's own
     expect(datesApart({ ...none }, week('2025-01-06', '2025-01-10T23:59:59Z'))).toBe(false);
   });
 });
 
 describe('months a statement names without a year', () => {
-  const claim = (statement: string, kind = 'fact', window: [string, string] | null = null) => ({
-    statement, kind, valid_from: window?.[0] ?? null, valid_to: window?.[1] ?? null,
+  const claim = (statement: string, kind = 'fact', window: [string, string] | null = null, attribute: string | null = '在岗人数') => ({
+    statement, kind, attribute, valid_from: window?.[0] ?? null, valid_to: window?.[1] ?? null,
   });
 
-  it('are read only where no year is named', () => {
-    expect([...yearlessMonthsOf('4月月报列示四部支付组在岗人数为7人。')]).toEqual([4]);
-    expect([...yearlessMonthsOf('10月月报列示X计划于12月31日前完成')].sort((x, y) => x - y)).toEqual([10, 12]);
+  it('are the fact\'s months, and a report\'s month only for a measured state that names no other time', () => {
+    expect([...yearlessMonthsOf('8月五部平台组在岗人数为6人')]).toEqual([8]);
+    expect([...yearlessMonthsOf('4月月报列示四部支付组在岗人数为7人。', true)]).toEqual([4]);
+    expect(yearlessMonthsOf('4月月报列示四部支付组在岗人数为7人。', false).size).toBe(0);
+    expect(yearlessMonthsOf('5月月报列示Orion已于第18周上线', true).size).toBe(0);
+    expect(yearlessMonthsOf('4月月报列示一季度营收为3亿元', true).size).toBe(0);
+    expect(yearlessMonthsOf('3月期Shibor为1.8%', true).size).toBe(0);
+    expect(yearlessMonthsOf('6个月期存款利率为1.5%').size).toBe(0);
     expect(yearlessMonthsOf('2025年8月结算平台完成度为69%').size).toBe(0);
     expect(yearlessMonthsOf('预计3个月内完成').size).toBe(0);
-    expect(yearlessMonthsOf('支付组本周支付成功率为97.4%').size).toBe(0);
   });
 
   it('settle two other months of the year apart, a forecast never', () => {
@@ -207,8 +238,14 @@ describe('months a statement names without a year', () => {
     expect(monthsApart(claim('4月月报列示在岗人数为7人。'), claim('本周在岗7人', 'fact', ['2025-06-16T00:00:00Z', '2025-06-20T23:59:59Z']))).toBe(true);
     expect(monthsApart(claim('4月月报列示在岗人数为7人。'), claim('本周在岗7人', 'fact', ['2025-04-14T00:00:00Z', '2025-04-18T23:59:59Z']))).toBe(false);
     expect(monthsApart(claim('4月月报列示在岗人数为7人。'), claim('本周在岗7人', 'fact', ['2025-04-28T00:00:00Z', '2025-05-02T23:59:59Z']))).toBe(false);
+    // the report's month is not the time of what the report says
+    expect(monthsApart(claim('5月月报列示Orion已于第18周上线', 'fact', null, null), claim('6月月报列示Orion已于第18周上线', 'fact', null, null))).toBe(false);
+    expect(monthsApart(claim('4月月报列示一季度营收为3亿元', 'fact', null, '营收'), claim('5月月报列示一季度营收为3.2亿元', 'fact', null, '营收'))).toBe(false);
+    expect(monthsApart(claim('3月期Shibor为1.8%', 'fact', null, 'Shibor'), claim('6月期Shibor为1.9%', 'fact', null, 'Shibor'))).toBe(false);
     // the same forecast in two monthly reports is one forecast
     expect(monthsApart(claim('6月月报预计Orion于第32周上线。', 'prediction'), claim('5月月报预计Orion于第32周上线。', 'prediction'))).toBe(false);
+    // and not by its kind alone: it names week 32, the report's month is not its time
+    expect(monthsApart(claim('6月月报预计Orion于第32周上线。'), claim('5月月报预计Orion于第32周上线。'))).toBe(false);
     // nothing to read
     expect(monthsApart(claim('在岗7人'), claim('在岗8人'))).toBe(false);
   });
@@ -249,4 +286,63 @@ describe('the duplicate-claim audit before the judge', () => {
     expect(stats.differentTime).toBe(2);
     expect(judged.pairs).toBe(1);
   });
+});
+
+describe('weekly readings worded alike, in every shape of date', () => {
+  const opened: AppContext[] = [];
+  afterAll(async () => {
+    for (const ctx of opened) {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+  const VALUES = [99.92, 99.91, 99.92, 99.93, 99.92];
+  // the shapes an extraction may give "本周" in: a start without an end, a month, an ISO week
+  const shapes: Record<string, (k: number) => { startDate?: string; endDate?: string; eventDate?: string }> = {
+    'open windows': (k) => ({ startDate: monday(k) }),
+    'monthly event dates': (k) => ({ eventDate: `2025-0${k + 1}` }),
+    'week event dates': (k) => ({ eventDate: `2025-W${36 + k}` }),
+  };
+
+  for (const [shape, dates] of Object.entries(shapes)) {
+    it(`stay apart with ${shape}, whatever claimMerge says`, async () => {
+      const dataDir = path.join(tmp, `shape-${shape.replace(/\s+/g, '-')}`);
+      initDataDir(dataDir);
+      const docs = new Map<string, { text: string; reply: RawExtractReply }>();
+      VALUES.forEach((v, k) => docs.set(`raw/docs/周报/平台组/s${k + 1}.md`, {
+        text: `# 平台组周报 · 第${k + 2}周\n\n本周服务可用性为${v}%。\n`,
+        reply: {
+          entities: [{ name: '平台组', type: 'organization', aliases: [] }],
+          relations: [],
+          claims: [{ subject: '平台组', statement: `平台组本周服务可用性为${v}%。`, type: 'other', status: 'fact', kind: 'fact', attribute: '服务可用性', value: v, unit: '%', ...dates(k) }],
+        },
+      }));
+      for (const [p, d] of docs) {
+        fs.mkdirSync(path.dirname(path.join(dataDir, p)), { recursive: true });
+        fs.writeFileSync(path.join(dataDir, p), d.text);
+      }
+      const ctx = await createContext(dataDir);
+      opened.push(ctx);
+      await sync(ctx, { llmGraph: false });
+      for (const d of await ctx.store.query<{ id: string }>(`SELECT id FROM documents WHERE root = 'docs'`)) await enqueueTier1(ctx.store, d.id);
+      (ctx.config.extraction as { entityLlm?: unknown }).entityLlm = undefined;
+      for (let i = 0; i < 10; i++) if ((await runTier1Pass(ctx.store, ctx.config, stubExtractor(docs), { batchSize: 64 })).queued === 0) break;
+      const ids = async () => (await ctx.store.query<{ id: string }>(
+        `SELECT id FROM claims WHERE subject_id = '平台组' AND statement = '平台组本周服务可用性为99.92%。' AND tx_to IS NULL AND canonical_id IS NULL`,
+      )).map((r) => r.id);
+      expect(await ids()).toHaveLength(3);
+      for (const mode of ['suggest', 'auto'] as const) {
+        const judged = { pairs: 0 };
+        const config = { ...ctx.config, review: { ...ctx.config.review, claimMerge: mode } };
+        await auditDuplicateClaims({ store: ctx.store, embedder: ctx.embedder, config, llm: countingJudge(judged) });
+        expect(await ids(), mode).toHaveLength(3);
+        // nothing between the three is stored as the same claim, and no judge is asked about them
+        const same = await ctx.store.query(
+          `SELECT 1 FROM claim_pair_verdicts v JOIN claims a ON a.id = v.a_id JOIN claims b ON b.id = v.b_id
+           WHERE a.statement = b.statement AND v.relation IN ('same', 'contains')`,
+        );
+        expect(same, mode).toHaveLength(0);
+      }
+    });
+  }
 });
