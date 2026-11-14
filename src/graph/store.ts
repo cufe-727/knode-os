@@ -269,13 +269,78 @@ export function relationId(sourceId: string, type: string, targetId: string): st
 
 /**
  * Claim identity: subject + normalized statement (NFKC, trimmed, whitespace-collapsed),
- * and for a dated reading of a measure the day it is of (`at`, YYYY-MM-DD; see
- * LineageWriter.claim): "平台组本周服务可用性为99.92%" in week 3 and in week 17 are two
- * readings, not one claim reported twice. Without `at` the id is what it always was.
+ * and for a weekly reading the ISO week it is of (`at`, "2025-W24"; readingWeek):
+ * "平台组本周服务可用性为99.92%" in week 3 and in week 17 are two readings, not one
+ * claim reported twice. Without `at` the id is what it always was.
  */
 export function claimId(subjectId: string, statement: string, at?: string | null): string {
   const normalized = statement.normalize('NFKC').trim().replace(/\s+/g, ' ');
   return crypto.createHash('sha256').update(`${subjectId}|${normalized}${at ? `|@${at}` : ''}`).digest('hex').slice(0, 24);
+}
+
+/** "This week", the one period a weekly report's statements are relative to. */
+const THIS_WEEK = /本周|当周|\bthis week\b/i;
+
+/**
+ * Any other time a statement names: a year (2025年, 2025, FY25, 去年), a quarter
+ * or half (Q3, 3Q25, 三季度, H1, 上半年), a week (W37, 第24周, 上周, 两周前), a month
+ * (6月, 六月, March, 本月 — not a tenor: 3月期), a date (18日, 18号 — not 7日年化,
+ * 3号线, 5日均线) or a day word (今日, 昨天). A statement that names one is not a
+ * reading of this week, whatever else it says.
+ */
+const OTHER_TIME = new RegExp([
+  String.raw`\d{4}\s*年|(?<![\d.])(?:19|20)\d{2}(?![\d.%])|\bfy\s*'?\d{2,4}|[去今明前]年|年[初中底末]`,
+  String.raw`\bq[1-4]\b|q[1-4](?=\s*\d|[^a-z]|$)|(?<![\d.])[1-4]\s*q|[一二三四1-4]\s*季度|[上下本]季度|\bh[12]\b|h[12](?=[^a-z]|$)|(?<![\d.])[12]\s*h(?=\d|[^a-z]|$)|[上下]半年`,
+  String.raw`\bw\d{1,2}\b|w\d{1,2}(?=[^\d]|$)|第\s*\d{1,3}\s*周|[上下]{1,2}周|[两三四\d]+\s*周[前后]`,
+  String.raw`\d{1,2}\s*月(?!期)|[一二三四五六七八九十]{1,2}月(?!期)|[上下本]月|月[初中底末]|\b(?:january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov|dec)\b`,
+  String.raw`(?<![\d.])\d{1,2}\s*[日号](?![均年线])|[今昨明前]日|[今昨明前]天`,
+].join('|'), 'i');
+
+/** ISO week of a UTC instant: "2025-W24". */
+export function isoWeekOf(iso: string): string {
+  const d = new Date(iso);
+  const day = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  const dow = day.getUTCDay() || 7;
+  day.setUTCDate(day.getUTCDate() + 4 - dow);
+  const week = Math.ceil(((day.getTime() - Date.UTC(day.getUTCFullYear(), 0, 1)) / 86_400_000 + 1) / 7);
+  return `${day.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
+}
+
+/**
+ * The ISO week a claim is a reading of, or null: what claimId's `at` carries.
+ *
+ * A reading is what the weekly reports of the 10× benchmark (2026-11-14) showed
+ * folding together — 603 of 1,440 weekly metric values had become one claim with
+ * another week's: a number on an attribute, in a statement relative to this week
+ * (本周, 当周, "this week") and naming no other time (OTHER_TIME), dated by the
+ * source itself — a window inside one ISO week, an open window from a day of it,
+ * or an event in it. It is keyed by the week, not the day, so two sources dating
+ * one week's figure on other days of it give one claim. Everything else keeps
+ * the identity it always had: a quarterly figure, a restated fact, a text value,
+ * an undated claim.
+ */
+export function readingWeek(c: {
+  statement: string;
+  attribute?: string | null;
+  valueNum?: number | null;
+  dateSource?: string | null;
+  eventAt?: string | Date | null;
+  validFrom?: string | Date | null;
+  validTo?: string | Date | null;
+}): string | null {
+  if (!c.attribute || c.valueNum === null || c.valueNum === undefined || !Number.isFinite(c.valueNum) || c.dateSource !== 'stated') return null;
+  const text = c.statement.normalize('NFKC');
+  if (!THIS_WEEK.test(text) || OTHER_TIME.test(text)) return null;
+  const iso = (t: string | Date | null | undefined) => {
+    if (t === null || t === undefined || t === '') return null;
+    const d = t instanceof Date ? t : new Date(t);
+    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  };
+  const from = iso(c.validFrom) ?? iso(c.eventAt);
+  if (!from) return null;
+  const week = isoWeekOf(from);
+  const to = iso(c.validFrom) ? iso(c.validTo) : null;
+  return to && isoWeekOf(to) !== week ? null : week;
 }
 
 /**
