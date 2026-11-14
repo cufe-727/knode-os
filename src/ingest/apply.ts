@@ -174,8 +174,6 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
   const parse = (): ParsedMarkdown => (code ? { frontmatter: {}, body: raw } : parseFrontmatter(raw));
   if (live && live.sha === sha && sameModel && !opts.reapply && !citationsStale && !mindMapStale) {
     await redateDocument(store, live, { file, root, raw, sha, docId, at: opts.at }, parse, progress);
-  }
-  if (live && live.sha === sha && sameModel && !opts.reapply && !citationsStale && !mindMapStale) {
     // a sidecar may have gained a replayable tier-1 extraction since (copied
     // from another machine, or written by a bench run) — apply it as the
     // document's child scope without re-indexing the document itself
