@@ -97,8 +97,8 @@ export interface EvalSessionAnswer {
 }
 
 export type EvalOutcome =
-  | { outcome: 'answered'; worker: string; backend: string; text: string; usage: CallUsage | null; model: string; session?: EvalSessionAnswer }
-  | { outcome: 'error'; worker: string; backend: string; error: string; usage: CallUsage | null }
+  | { outcome: 'answered'; worker: string; backend: string; pool?: string | null; text: string; usage: CallUsage | null; model: string; session?: EvalSessionAnswer }
+  | { outcome: 'error'; worker: string; backend: string; pool?: string | null; error: string; usage: CallUsage | null }
   /** Three different machines could not serve it (docs/design/32 §3): it is left unanswered, never answered another way. */
   | { outcome: 'stuck'; workers: string[]; lastError: string }
   | { outcome: 'cancelled' }
@@ -417,7 +417,7 @@ export class EvalSource implements WorkSource {
       }
       // the model's own failure on a call: the call's, as the run's own backend would throw it
       this.totals.answered++;
-      p.settle({ outcome: 'error', worker: who.worker, backend, error: outcome.error || 'failed without a message', usage: outcome.usage ?? null });
+      p.settle({ outcome: 'error', worker: who.worker, backend, pool: who.pool ?? null, error: outcome.error || 'failed without a message', usage: outcome.usage ?? null });
       return { accepted: true };
     }
     if (outcome.model && outcome.model !== `${p.spec.agent.family}:${p.spec.agent.model}`) {
@@ -427,7 +427,7 @@ export class EvalSource implements WorkSource {
     }
     if (p.spec.kind === 'eval-call') {
       this.totals.answered++;
-      p.settle({ outcome: 'answered', worker: who.worker, backend, text: outcome.text, usage: outcome.usage ?? null, model: p.spec.agent.model });
+      p.settle({ outcome: 'answered', worker: who.worker, backend, pool: who.pool ?? null, text: outcome.text, usage: outcome.usage ?? null, model: p.spec.agent.model });
       return { accepted: true };
     }
     const s: SessionAnswer = outcome.session ?? { exitCode: 0, output: outcome.text ?? '', stderr: '', lastMessage: null };
@@ -442,7 +442,7 @@ export class EvalSource implements WorkSource {
       return { accepted: true, failure: failure.kind };
     }
     this.totals.answered++;
-    p.settle({ outcome: 'answered', worker: who.worker, backend, text: answer.lastMessage ?? '', usage: outcome.usage ?? readCodexEvents(answer.stdout).usage, model: p.spec.agent.model, session: answer });
+    p.settle({ outcome: 'answered', worker: who.worker, backend, pool: who.pool ?? null, text: answer.lastMessage ?? '', usage: outcome.usage ?? readCodexEvents(answer.stdout).usage, model: p.spec.agent.model, session: answer });
     return { accepted: true };
   }
 

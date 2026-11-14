@@ -466,6 +466,12 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   const repeatsOf = (s: SystemUnderTest) => (repeat > 1 && (!opts.repeatSystems?.length || opts.repeatSystems.includes(s.id)) ? repeat : 1);
   if (repeat > 1) meta.repeat = { n: repeat, systems: opts.repeatSystems?.length ? opts.repeatSystems : opts.systems };
   if (remote.where === 'serve') meta.remote = { serve: opts.remote!.serveUrl, calls: callsLeave, judge: Boolean(judgeLeaves && !anyPrivate) };
+  // where its work goes, as this start of the run has it (docs/design/32): a resume with other slots says so here
+  meta.work = {
+    broker: remote.where, ...(remote.where === 'serve' ? { serve: opts.remote!.serveUrl } : {}),
+    local: placement.local, pool: remote.pool, waitMinutes: remote.waitMinutes, legacy: placement.legacy,
+  };
+  delete meta.stuck;
   store.writeMeta(meta);
   const tasksByKey = new Map<string, Task>();
   const corpusDocs = new Map<string, Set<string>>();
@@ -669,6 +675,11 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     }
     throw remote.stopped ?? err;
   } finally {
+    // the stuck pieces of this start of the run, for its report, however it ended
+    if (remote.stuck.length) {
+      meta.stuck = remote.stuck.map((p) => ({ ...p, lastError: p.lastError.slice(0, 500) }));
+      store.writeMeta(meta);
+    }
     remote.close();
     await remote.drained();
     setAgentRouting(null);

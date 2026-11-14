@@ -16,6 +16,7 @@ import { withRemote } from '../src/eval/placement.js';
 import { PackScope, packMayLeave, RemoteEval, WaitLimitError } from '../src/eval/remote.js';
 import { runEval, scoreRun } from '../src/eval/run.js';
 import { RunStore } from '../src/eval/runstore.js';
+import { writeReport } from '../src/eval/report.js';
 import { evalPassSettings, evalWorkspaceConfig, KNODE_EVAL_BATCH, KNODE_EVAL_CONCURRENCY } from '../src/eval/systems/knode.js';
 import { loadPack } from '../src/eval/pack.js';
 import { createEmbeddingProvider } from '../src/ingest/embeddings.js';
@@ -486,6 +487,9 @@ describe('a run that waits for workers (docs/design/32 §3)', () => {
     const stuck = events.find((e) => e.event === 'piece stuck')!;
     expect(stuck.system).toBe('closed-book');
     expect([...stuck.workers!].sort()).toEqual(['laptop/wa', 'laptop/wb', 'laptop/wc']);
+    // run.json and the report list it
+    expect(new RunStore(runDir).meta()!.stuck).toHaveLength(1);
+    expect(fs.readFileSync(writeReport(runDir).md, 'utf8')).toMatch(/### Stuck: 1 piece\(s\) left unanswered[\s\S]*closed-book · answer[\s\S]*laptop\/w[abc]/);
     // a resume with a worker that can answers it
     await stopAll();
     startWorker('wd', {}, 'codex:1');
@@ -503,6 +507,9 @@ describe('a run that waits for workers (docs/design/32 §3)', () => {
     const store = new RunStore(res.runDir);
     expect(new Set(store.allAnswers().map((a) => a.worker))).toEqual(new Set(['laptop/wp']));
     expect(new Set(store.allScores().filter((x) => x.worker).map((x) => x.worker))).toEqual(new Set(['laptop/wp']));
+    // the report says which pool and worker did the work
+    expect(writeReport(res.runDir).data.ranAt!.filter((r) => r.calls + r.sessions > 0).map((r) => `${r.pool} ${r.worker}`)).toEqual(['gateway laptop/wp']);
+    expect(store.meta()!.work).toMatchObject({ broker: 'serve', serve: base, local: null, pool: 'gateway', waitMinutes: 30, legacy: false });
     // a worker that declares no pool is in its token's
     const byToken = await runEval({ ...common, packs: [packDir], systems: ['closed-book'], runDir: path.join(runs, 'pooled-token'), remote: remoteOpts(), pool: 'laptop', skipScoring: true });
     expect(new Set(new RunStore(byToken.runDir).allAnswers().map((a) => a.worker))).toEqual(new Set(['laptop/wq']));

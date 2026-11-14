@@ -109,6 +109,8 @@ export interface AgentRunResult {
   backend?: string;
   /** Killed by a signal, or stopped with the run: never an answer (its `error` says so). */
   cancelled?: boolean;
+  /** The pool of the worker that ran it (docs/design/32 §2). */
+  pool?: string;
 }
 
 /** Tokens a session's usage counts, 0 when it reported none. */

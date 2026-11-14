@@ -121,6 +121,38 @@ export interface ReportData {
   /** Run-to-run variance where a system answered the same tasks more than once (`eval run --repeat`). */
   variance?: Record<string, Record<string, Variance>>;
   judgeUsage: { calls: number; weightedTokens: number; costUsd: number };
+  /**
+   * Where the run's model work ran (docs/design/32): per pool and worker, the
+   * model calls and agent sessions it answered (replays from the reply cache
+   * apart), from the meter; this machine's are the run's own slots.
+   */
+  ranAt?: { pool: string; worker: string; calls: number; sessions: number; replayed: number }[];
+}
+
+/** The meter's model calls and sessions by pool and worker (embeddings are the run's own, and left out). */
+export function ranAtOf(runDir: string, localPool: string): NonNullable<ReportData['ranAt']> {
+  const file = path.join(runDir, 'meter.jsonl');
+  if (!fs.existsSync(file)) return [];
+  const by = new Map<string, { pool: string; worker: string; calls: number; sessions: number; replayed: number }>();
+  for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+    if (!line.trim()) continue;
+    let e: { stage?: string; worker?: string; pool?: string; replayed?: boolean; embeddingCalls?: number; embeddingTokens?: number };
+    try {
+      e = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (e.embeddingCalls || e.embeddingTokens) continue;
+    const worker = e.worker ?? 'this machine';
+    const pool = e.pool ?? (e.worker ? '?' : localPool);
+    const k = `${pool}\u0000${worker}`;
+    const row = by.get(k) ?? { pool, worker, calls: 0, sessions: 0, replayed: 0 };
+    if (e.replayed) row.replayed++;
+    else if (e.stage === 'agent') row.sessions++;
+    else row.calls++;
+    by.set(k, row);
+  }
+  return [...by.values()].sort((a, b) => a.pool.localeCompare(b.pool) || a.worker.localeCompare(b.worker));
 }
 
 function cell(values: number[], rate = false): Cell {
@@ -288,6 +320,7 @@ export function buildReportData(runDir: string): ReportData {
   return {
     run: store.meta(), packs, systems, usage, retrieval, emergence, generation, perQuery, tools, builds, breakEven, lists, efficiency, updates, pooled, paired, byType, typesByPack, typeDeltas,
     separation, costPerCorrect, variance, judgeUsage: { calls: judgeEvents, weightedTokens: 0, costUsd: 0 },
+    ranAt: ranAtOf(runDir, store.meta()?.work?.pool ?? 'local'),
   };
 }
 
@@ -503,6 +536,28 @@ function toolTable(tu: Record<string, ToolUse>): string[] {
   return out;
 }
 
+/** Where the work was published and who did it, and what was left stuck (docs/design/32). */
+function placementLines(d: ReportData): string[] {
+  const work = d.run?.work;
+  const ran = d.ranAt ?? [];
+  const stuck = d.run?.stuck ?? [];
+  if (!work && !ran.length && !stuck.length) return [];
+  const out = ['## Where the work ran', ''];
+  if (work) {
+    const local = work.local ? Object.entries(work.local).filter(([, n]) => n).map(([f, n]) => `${f}:${n}`).join(',') : '';
+    out.push(`- Published to ${work.broker === 'serve' ? `serve's broker (${work.serve ?? 'this machine'})` : "the run's own broker"}; this machine's slots: ${local ? `--local ${local}${work.legacy ? ' (an old command line: sized from --slots)' : ''}` : 'none'}; pool required: ${work.pool ?? 'any'}; wait limit: ${work.waitMinutes ? `${work.waitMinutes} min` : 'none'}.`);
+  }
+  if (ran.length) {
+    out.push('', mdTable(['pool', 'worker', 'model calls', 'agent sessions', 'replayed from cache'], ran.map((r) => [r.pool, r.worker, String(r.calls), String(r.sessions), String(r.replayed)])));
+  }
+  if (stuck.length) {
+    out.push('', `### Stuck: ${stuck.length} piece(s) left unanswered`, '', 'Three different workers could not serve each of these. The answer, build or scoring pass it belonged to was not recorded; a resume asks it again.', '');
+    out.push(mdTable(['piece', 'system', 'task', 'requires', 'workers', 'last error'], stuck.map((p) => [p.label, p.system ?? '—', p.task ?? '—', `${p.family} ${p.model || 'default'}${p.pool ? ` · pool ${p.pool}` : ''}${p.eligible === 'local' ? ' · this machine' : ''}`, p.workers.join(', '), p.lastError.slice(0, 160).replace(/\|/g, '/').replace(/\n/g, ' ')])));
+  }
+  out.push('');
+  return out;
+}
+
 export function renderReport(d: ReportData): string {
   const meta = d.run;
   const lines: string[] = [];
@@ -514,6 +569,7 @@ export function renderReport(d: ReportData): string {
     lines.push(`- Packs: ${d.packs.join(', ')}; systems: ${d.systems.join(', ')}; corpus fraction ${meta.fraction}, seed ${meta.seed}; git ${meta.gitSha?.slice(0, 10) ?? '?'}`);
     lines.push(`- Judge calls: ${d.judgeUsage.calls}`, '');
   }
+  lines.push(...placementLines(d));
   lines.push('Intervals are Wilson (rates) or bootstrap (means), 95%. Correctness is the judge score scaled to 0–1. "—" means not measured or not applicable (a system that does not cite has no citation score).', '');
 
   if (d.pooled.length) {

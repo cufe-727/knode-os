@@ -8,6 +8,7 @@ import { runAgentHere, setAgentStopping } from '../src/eval/agent.js';
 import { OwnQueue, PieceStuckError, RemoteEval, WaitLimitError } from '../src/eval/remote.js';
 import { eachWithin, runEval } from '../src/eval/run.js';
 import { RunStore } from '../src/eval/runstore.js';
+import { writeReport } from '../src/eval/report.js';
 import type { WorkerIdentity } from '../src/labeling/scheduler.js';
 import { WorkBroker } from '../src/work/broker.js';
 import type { WorkSource, WorkTask } from '../src/work/broker.js';
@@ -73,6 +74,12 @@ describe('waiting', () => {
     expect(answers.length).toBe(3);
     expect(new Set(answers.map((a) => a.worker ?? 'local'))).toEqual(new Set(['local']));
     expect(new RunStore(runDir).allScores().length).toBeGreaterThan(0);
+    // run.json says where its work went, and the report where it ran
+    expect(new RunStore(runDir).meta()!.work).toEqual({ broker: 'own', local: { codex: 4, claude: 4 }, pool: null, waitMinutes: 30, legacy: true });
+    const report = writeReport(runDir);
+    expect(fs.readFileSync(report.md, 'utf8')).toMatch(/## Where the work ran\n\n- Published to the run's own broker; this machine's slots: --local codex:4,claude:4 \(an old command line: sized from --slots\); pool required: any; wait limit: 30 min\./);
+    expect(report.data.ranAt!.map((r) => [r.pool, r.worker])).toEqual([['local', 'this machine']]);
+    expect(report.data.ranAt![0].calls).toBeGreaterThan(0);
   }, 120_000);
 
   it('waits with no limit at --wait-minutes 0', async () => {
@@ -265,6 +272,7 @@ describe('what a task requires', () => {
     // the run's own slots join its pool, so they take its pieces
     const res = await runEval({ ...common(), runDir: path.join(tmp, 'runs', 'pool-wait'), local: { codex: 1, claude: 1 }, pool: 'gateway' });
     expect(new RunStore(res.runDir).allAnswers()).toHaveLength(3);
+    expect(new RunStore(res.runDir).meta()!.work).toMatchObject({ broker: 'own', local: { codex: 1, claude: 1 }, pool: 'gateway', waitMinutes: 30, legacy: false });
   }, 60_000);
 });
 

@@ -16,6 +16,8 @@ export interface Placement {
   worker?: string;
   /** The CLI and model it ran on, as records keep it: `codex-cli:<model>`. */
   backend: string;
+  /** The pool of the worker that answered (docs/design/32 §2). */
+  pool?: string;
 }
 
 const remoteScope = new AsyncLocalStorage<unknown>();

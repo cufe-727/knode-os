@@ -89,7 +89,7 @@ export class Judge {
       // who answered (a remote worker, src/eval/remote.ts) is noted on the way and kept with the meter event
       const r = await captureEither(() => (this.opts.quota ? this.opts.quota.retryRefused(call, 72) : call()));
       const placed = r.placements.at(-1);
-      const where = { ...(placed?.worker ? { worker: placed.worker } : {}), backend: placed?.backend ?? this.opts.client.label };
+      const where = { ...(placed?.worker ? { worker: placed.worker } : {}), ...(placed?.pool ? { pool: placed.pool } : {}), backend: placed?.backend ?? this.opts.client.label };
       try {
         if ('error' in r && r.error !== undefined) throw r.error;
         reply = r.value!;

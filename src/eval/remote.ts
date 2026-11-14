@@ -729,7 +729,7 @@ export class PublishedChatBackend implements ChatBackend {
       return p.value;
     }
     const o = p.outcome;
-    if (o.outcome === 'answered') return { text: o.text.trim(), usage: o.usage, model: o.model, worker: o.worker, backend: o.backend };
+    if (o.outcome === 'answered') return { text: o.text.trim(), usage: o.usage, model: o.model, worker: o.worker, backend: o.backend, ...(o.pool ? { pool: o.pool } : {}) };
     throw Object.assign(new Error(`codex exec failed on ${o.worker}: ${o.error}`), { usage: o.usage });
   }
 }
@@ -752,7 +752,7 @@ export function remoteJudgeClient(client: LlmClient, remote: RemoteEval, judge: 
     }
     const o = p.outcome;
     if (o.usage) opts.onUsage?.(o.usage);
-    notePlacement({ worker: o.worker, backend: o.backend });
+    notePlacement({ worker: o.worker, backend: o.backend, ...(o.pool ? { pool: o.pool } : {}) });
     if (o.outcome === 'answered') return fromText(o.text);
     throw new Error(`${judge.family} CLI error on ${o.worker}: ${o.error}`);
   };
@@ -821,7 +821,7 @@ export async function publishAgent(scope: PackScope, opts: AgentRunOptions, here
   }
   const o = p.outcome;
   if (o.outcome !== 'answered' || !o.session) throw new Error(`the session failed on ${o.worker}: ${o.outcome === 'error' ? o.error : 'no session came back'}`);
-  return agentResultOf(o.session, opts, { worker: o.worker, backend: o.backend, usage: o.usage, ms: Date.now() - t0 });
+  return { ...agentResultOf(o.session, opts, { worker: o.worker, backend: o.backend, usage: o.usage, ms: Date.now() - t0 }), ...(o.pool ? { pool: o.pool } : {}) };
 }
 
 /** A worker's session parsed as `runAgentOnce` parses its own: the trace, the step cap, the leak audit (with the worker's folder and home). */

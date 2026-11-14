@@ -106,9 +106,9 @@ export function taggedEmbedder(env: Pick<SystemEnv, 'shim'>, tag: MeterTag): Emb
 }
 
 /** Record an agent session's usage (it ran Codex directly, not through the shim), and where it ran. */
-export function recordAgent(meter: Meter, tag: MeterTag, model: string, r: Pick<AgentRunResult, 'usage' | 'ms' | 'error'> & Partial<Pick<AgentRunResult, 'worker' | 'backend'>>): void {
+export function recordAgent(meter: Meter, tag: MeterTag, model: string, r: Pick<AgentRunResult, 'usage' | 'ms' | 'error'> & Partial<Pick<AgentRunResult, 'worker' | 'backend' | 'pool'>>): void {
   meter.record({
     ...tag, model: model || 'codex', ms: r.ms, ok: !r.error, replayed: false, usage: r.usage as CallUsage | null,
-    ...(r.worker ? { worker: r.worker } : {}), backend: r.backend ?? `codex-cli:${model || 'default'}`,
+    ...(r.worker ? { worker: r.worker } : {}), ...(r.pool ? { pool: r.pool } : {}), backend: r.backend ?? `codex-cli:${model || 'default'}`,
   });
 }

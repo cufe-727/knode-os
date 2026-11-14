@@ -54,6 +54,8 @@ export interface ChatResult {
   worker?: string;
   /** The CLI and model it ran on; absent = the backend's label. */
   backend?: string;
+  /** The pool of the worker that answered (docs/design/32 §2). */
+  pool?: string;
 }
 
 export interface ChatBackend {
@@ -414,7 +416,7 @@ export async function startShim(opts: ShimOptions): Promise<Shim> {
             const backend = r.backend ?? opts.backend.label;
             reply = { k: key, text: r.text, usage: r.usage, model: r.model, ms: Date.now() - t0, ...(r.worker ? { worker: r.worker } : {}), backend };
             replies.put(reply);
-            opts.meter.record({ ...tag, model: r.model, ms: reply.ms, ok: true, replayed: false, usage: r.usage, ...(r.worker ? { worker: r.worker } : {}), backend });
+            opts.meter.record({ ...tag, model: r.model, ms: reply.ms, ok: true, replayed: false, usage: r.usage, ...(r.worker ? { worker: r.worker } : {}), ...(r.pool ? { pool: r.pool } : {}), backend });
           } catch (err) {
             opts.meter.record({ ...tag, model: opts.backend.label, ms: Date.now() - t0, ok: false, replayed: false, usage: (err as { usage?: CallUsage | null }).usage ?? null, backend: opts.backend.label });
             if (attempt >= retries || !retryableFailure(err)) throw err;
