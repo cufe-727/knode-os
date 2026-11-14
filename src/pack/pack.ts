@@ -121,6 +121,8 @@ const liveCache = new Map<string, { expires: number; probe: Omit<PackProbe, 'cac
 
 export interface PackOptions {
   record?: boolean;
+  /** false: its search records no hits (src/stats/heat.ts). */
+  track?: boolean;
   asOf?: TimeInput;
   validAt?: TimeInput;
   /** Resolved envelope; wins over the loose `asOf` / `validAt` shorthand above. */
@@ -161,7 +163,7 @@ export async function buildContextPack(
   const retrievalK = Math.max(cfg.maxDocs, ...[...usedPlaybooks.values()].map((p) => p.retrieval.k), 0) || cfg.maxDocs;
   const retrievalMode = [...usedPlaybooks.values()][0]?.retrieval.mode ?? 'hybrid';
 
-  const docs = await collectDocs(ctx, utterance, entityIds, retrievalK, retrievalMode, t.txTime, f);
+  const docs = await collectDocs(ctx, utterance, entityIds, retrievalK, retrievalMode, t.txTime, f, opts.track);
   // the newest claims of the matched entities, then the ones that answer this utterance, spread over their sources
   const claims = annotateClaims(pickRelevant(utterance, await claimsForEntities(store, entityIds, PACK_CLAIM_POOL, { temporal: t, filter: f }), cfg.maxClaims, { named: () => true }));
 
@@ -318,6 +320,7 @@ async function collectDocs(
   mode: 'hybrid' | 'vector' | 'keyword' | 'sag',
   asOf?: TimeInput,
   filter: ResolvedScopeFilter = NO_FILTER,
+  track?: boolean,
 ): Promise<PackDoc[]> {
   const out = new Map<string, PackDoc>();
   const hits = await search(ctx.store, ctx.embedder, utterance, {
@@ -327,6 +330,7 @@ async function collectDocs(
     sag: ctx.config.retrieval.sag,
     asOf,
     filter,
+    track,
   });
   for (const h of hits) {
     out.set(h.chunkId, { path: h.path, title: h.title, chunkId: h.chunkId, content: trim(h.content), score: +h.score.toFixed(4) });

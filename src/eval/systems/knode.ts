@@ -311,7 +311,8 @@ export function knodeAsk(): SystemUnderTest {
       // ask retrieves with its question: give it the question alone, and the shared output rules to its model call
       const rules = prompt.startsWith(task.question) ? prompt.slice(task.question.length) : '';
       const llm = withAppendedRules(shimClient(env, { system: 'knode-ask', stage: 'answer', task: task.id }), rules);
-      const res = await ask(ctx.store, ctx.config, ctx.embedder, llm, task.question, { mode: 'hybrid' });
+      // against the index as built: an answer records no hits, so no question moves another's ranking (docs/design/31 D3)
+      const res = await ask(ctx.store, ctx.config, ctx.embedder, llm, task.question, { mode: 'hybrid', track: false });
       // ask's own [n] citations, and any [doc: path] the answer wrote under the shared output rules
       const docs = new Set(env.staged.docs.map((d) => d.path));
       const citations: Citation[] = [...new Set([...res.citations.flatMap((c) => toCorpus(s, c.path)), ...citationsIn(res.answer, docs).map((c) => c.doc)])].map((doc) => ({ doc }));

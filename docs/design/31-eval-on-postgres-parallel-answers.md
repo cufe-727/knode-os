@@ -1,6 +1,6 @@
 # 31 — Evaluation on PostgreSQL, and knode answers in parallel
 
-Status: being implemented (2026-11-14) on branch `claude/eval-postgres-parallel-a83957`, one commit per step: D2's harness half (single-flight open) done. The running 10× separation run is unaffected: it executes from its own checkout's build.
+Status: being implemented (2026-11-14) on branch `claude/eval-postgres-parallel-a83957`, one commit per step: D2's harness half (single-flight open) and D3 done. The running 10× separation run is unaffected: it executes from its own checkout's build.
 
 ## Problem
 

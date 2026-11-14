@@ -77,6 +77,8 @@ export interface ResolveOptions {
   budget?: Partial<Budget>;
   /** Skip writing a receipt (benchmarks, dry runs — it skews the learning loop). */
   record?: boolean;
+  /** false: the context pack's search records no hits (src/stats/heat.ts). */
+  track?: boolean;
   /** `ts-program` renders the plan as code instead of a node graph. */
   render?: Plan['render'];
   /**
@@ -124,7 +126,7 @@ export async function resolve(ctx: AppContext, query: string, opts: ResolveOptio
   ]);
 
   /* 4 ── local fill: everything the materialized layer can answer, answered here */
-  const pack = await buildContextPack(ctx, query, { record: false, temporal, filter });
+  const pack = await buildContextPack(ctx, query, { record: false, track: opts.track, temporal, filter });
   const claims = await claimsForEntities(ctx.store, entityIds, ctx.config.pack.maxClaims, { temporal, filter });
   const slotReports: SlotReport[] = [];
   const filledLocally = new Set<string>();
