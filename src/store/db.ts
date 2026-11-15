@@ -189,13 +189,34 @@ export class Store implements Queryable {
     return this;
   }
 
+  /** Statements and transactions sent to the backend and not answered yet. */
+  private readonly inFlight = new Set<Promise<void>>();
+  /** Set when `close` has let the last statements finish: nothing more is sent to the backend. */
+  private closed = false;
+
+  /**
+   * `sent`, counted as in flight until it settles — and refused once the
+   * store has closed. `close` waits for what is in flight: an embedded
+   * database's own close does not, and a statement its caller did not wait
+   * for then ran after the close had returned, on a directory that could be
+   * open again by then (see `close`).
+   */
+  private track<T>(send: () => Promise<T>): Promise<T> {
+    if (this.closed) return Promise.reject(new Error('this index is closed: nothing more can be asked of it'));
+    const sent = send();
+    const settled = sent.then(() => undefined, () => undefined);
+    this.inFlight.add(settled);
+    void settled.then(() => this.inFlight.delete(settled));
+    return sent;
+  }
+
   async query<T>(sql: string, params?: unknown[]): Promise<T[]> {
-    const res = await this.db.query<T>(sql, params);
+    const res = await this.track(() => this.db.query<T>(sql, params));
     return res.rows;
   }
 
   async exec(sql: string): Promise<void> {
-    await this.db.exec(sql);
+    await this.track(() => this.db.exec(sql));
   }
 
   /**
@@ -219,14 +240,14 @@ export class Store implements Queryable {
           throw err;
         });
       try {
-        return await this.db.transaction(async (tx) =>
+        return await this.track(() => this.db.transaction(async (tx) =>
           fn({
             query: async (sql, params) => (await watch(tx.query(sql, params))).rows as never,
             exec: async (sql) => {
               await watch(tx.exec(sql));
             },
           }),
-        );
+        ));
       } catch (err) {
         if (attempt >= TX_ATTEMPTS || !(conflict || isRetryableTxError(err))) throw err;
         console.warn(`[knode-os] transaction rolled back (${err instanceof Error ? err.message : err}); running it again, attempt ${attempt + 1} of ${TX_ATTEMPTS}`);
@@ -278,6 +299,13 @@ export class Store implements Queryable {
     await this.cleanup;
     await this.retype;
     await this.indexing;
+    // Whatever was sent and not waited for by its caller is waited for here, and nothing is taken after.
+    // Embedded PGlite closes under a statement still queued on it and runs the statement afterwards: a
+    // workspace closed and reopened at once then had two instances on one directory, and the second one's
+    // close never returned (a loop inside the database; tests/pglite-open-guard.test.ts hung on it when
+    // serve's open asked a question it did not wait for, 2026-11-15).
+    while (this.inFlight.size > 0) await Promise.all([...this.inFlight]);
+    this.closed = true;
     await this.db.close();
   }
 }
