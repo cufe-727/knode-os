@@ -34,7 +34,7 @@ const ATTRIBUTE_SYNONYMS: readonly string[][] = [
   ['progress', 'completion', 'percent complete', 'completion rate', 'completed'],
   ['在岗人数', '在岗', '在岗人员', '在岗人员数', '人数', '团队人数', '员工人数', '人员', '人员规模', '在职人数', '编制'],
   ['headcount', 'staff', 'team size', 'staff count', 'employees'],
-  ['负责人', '负责', '主负责人', '牵头人', '项目负责人', '责任人', 'owner'],
+  ['负责人', '负责', '主负责人', '牵头人', '项目负责人', '责任人', '跟进人', '跟进负责人', 'owner'],
   ['lead', 'owner', 'project lead'],
   ['状态', '现状', '当前状态', '项目状态'],
   ['status', 'state'],
@@ -52,6 +52,21 @@ const SYNONYM: ReadonlyMap<string, string> = (() => {
 
 /** Keys whose value is a text (a person, a stage), read from "<key>为<text>". */
 const TEXT_KEYS = new Set(['负责人', 'lead', '状态', 'status', '阶段', 'stage']);
+
+/**
+ * The object a series of `attribute` is kept apart by. A measure of a subject
+ * toward one object is a series per object (a holding in each company); the
+ * owner or the state of a subject is one series whatever the claim names
+ * besides: "R-03由赖艳负责，处于跟进中" and "R-03已关闭" are one state, and
+ * "负责人为廖欣" / "负责人为孙欣" — whose object is the value itself — one
+ * owner. Kept apart by object, a risk closed in week 19 stayed open beside it
+ * (108 of 120 risks on the 10× benchmark had two or more current states).
+ */
+export function seriesObject(attribute: string | null | undefined, objectId: string | null | undefined): string {
+  if (attribute && TEXT_KEYS.has(attribute)) return '';
+  return objectId ?? '';
+}
+
 
 /** Verbs and hedges between an attribute and its value, longest first. */
 const LINKS_ZH = ['更正为', '修正为', '调整为', '下降至', '提升至', '提高至', '增加至', '减少至', '维持在', '保持在', '仍然为', '约为', '应为', '可能为', '预计为', '达到了', '达到', '升至', '降至', '增至', '减至', '变为', '已达', '仍为', '依然为', '为', '是', '达', '约', '有', '：', ':', '='];

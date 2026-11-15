@@ -9,7 +9,7 @@ import { toDateString, toIso } from '../store/temporal.js';
 import { directJudge, JudgeCall, JudgeRunner, verdictMayDecide } from '../work/judge.js';
 import { applyClaimMerge, reanchorClaimGroups } from './claim-merge.js';
 import { pendingRekey, rekeyState, rekeyWeeklyReadings } from './claim-rekey.js';
-import { sameValue } from './claim-state.js';
+import { sameValue, seriesObject } from './claim-state.js';
 import { claimId, readingWeek } from './store.js';
 import { packSubjectBatches, SubjectBatch } from './subject-batches.js';
 import { alikeWording, Wording, wordingOf, wordingPrefixLength } from './wording.js';
@@ -684,7 +684,7 @@ export function seriesRelation(
   a: Pick<ClaimLite, 'subject' | 'object' | 'kind' | 'attribute' | 'value_num' | 'value_text' | 'unit' | 'eff'>,
   b: Pick<ClaimLite, 'subject' | 'object' | 'kind' | 'attribute' | 'value_num' | 'value_text' | 'unit' | 'eff'>,
 ): 'different_time' | 'same' | null {
-  if (!a.attribute || a.attribute !== b.attribute || a.subject !== b.subject || (a.object ?? '') !== (b.object ?? '') || a.kind !== b.kind) return null;
+  if (!a.attribute || a.attribute !== b.attribute || a.subject !== b.subject || seriesObject(a.attribute, a.object) !== seriesObject(b.attribute, b.object) || a.kind !== b.kind) return null;
   const da = toDateString(a.eff);
   const db = toDateString(b.eff);
   if (!da || !db) return null;

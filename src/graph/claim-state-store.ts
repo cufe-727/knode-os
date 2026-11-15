@@ -1,7 +1,7 @@
 import { breather } from '../pool.js';
 import { Store } from '../store/db.js';
 import { EvidenceAtRow, foldClaimEvidence, groupBy, toDateString, toIso } from '../store/temporal.js';
-import { CLAIM_STATE_VERSION, sameValue, unifyAttributeKeys } from './claim-state.js';
+import { CLAIM_STATE_VERSION, sameValue, seriesObject, unifyAttributeKeys } from './claim-state.js';
 import { packSubjectBatches } from './subject-batches.js';
 
 /**
@@ -184,7 +184,8 @@ export function seriesSupersession(series: StateRow[]): Map<string, string | nul
 
 /**
  * Supersession by attribute, in every domain: the series of a subject's
- * attribute (its canonical key, per object, facts and forecasts apart) runs
+ * attribute (its canonical key, per object unless it is an owner or a state —
+ * seriesObject —, facts and forecasts apart) runs
  * by effective date, and only the newest is current (seriesSupersession).
  * Disputed, absent, opinion and rumour claims take no part. Returns the
  * claims whose mark changed.
@@ -223,7 +224,7 @@ export async function supersedeByAttribute(store: Store, opts: { claimsPerBatch?
     );
     const ids: string[] = [];
     const marks: (string | null)[] = [];
-    for (const series of groupBy(rows, (r) => `${r.subject}\u0000${r.attribute}\u0000${r.object_id ?? ''}\u0000${r.kind}`).values()) {
+    for (const series of groupBy(rows, (r) => `${r.subject}\u0000${r.attribute}\u0000${seriesObject(r.attribute, r.object_id)}\u0000${r.kind}`).values()) {
       await pause();
       const want = seriesSupersession(series);
       for (const r of series) {

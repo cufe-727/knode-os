@@ -5,7 +5,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
 import { auditDuplicateClaims, seriesRelation } from '../src/graph/claim-dedupe.js';
-import { formatValue, normalizeAttribute, parseMeasure, unifyAttributeKeys } from '../src/graph/claim-state.js';
+import { formatValue, normalizeAttribute, parseMeasure, seriesObject, unifyAttributeKeys } from '../src/graph/claim-state.js';
 import { refreshClaimState, seriesSupersession, StateRow } from '../src/graph/claim-state-store.js';
 import { namesakeChoice, namesakeClusters, NamesakeDoc, renameIn, resolveEntityContext } from '../src/graph/entity-context.js';
 import { buildBatchExtractRequest, buildExtractRequest, RawExtractReply } from '../src/graph/llm-extract.js';
@@ -107,6 +107,15 @@ describe('a series of one attribute', () => {
     expect(marks.get('recap')).toBe('w30');
     expect(marks.get('w21')).toBe('w30');
     expect(marks.get('w30')).toBeNull();
+  });
+
+  it('keeps one owner and one state per subject whatever object a claim names, and a measure toward an object apart', () => {
+    expect(seriesObject('状态', '赖艳')).toBe('');
+    expect(seriesObject('负责人', '廖欣')).toBe(seriesObject('负责人', '孙欣'));
+    expect(normalizeAttribute('跟进人')).toBe('负责人');
+    expect(seriesObject('持股比例', 'company-a')).not.toBe(seriesObject('持股比例', 'company-b'));
+    const base = { subject: 'r-03', kind: 'fact', attribute: '状态', unit: null, value_num: null };
+    expect(seriesRelation({ ...base, object: '赖艳', value_text: '跟进中', eff: '2025-06-16' }, { ...base, object: null, value_text: '已关闭', eff: '2025-07-18' })).toBe('different_time');
   });
 
   it('settles pairs of one series without a model: other days are history, one day and one value are one claim', () => {
