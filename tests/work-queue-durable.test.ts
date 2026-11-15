@@ -7,7 +7,8 @@ import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { afterAll, describe, expect, it } from 'vitest';
 import { defaultConfig } from '../src/config.js';
-import { OwnQueue, RemoteEval, RunCancelledError, ServeQueue, ServeRefusedError } from '../src/eval/remote.js';
+import { dropQueuedRun, OwnQueue, RemoteEval, RunCancelledError, scopeOf, ServeQueue, ServeRefusedError } from '../src/eval/remote.js';
+import { MCP_TOKEN_FILE } from '../src/server/mcp-http.js';
 import type { WorkerIdentity } from '../src/labeling/scheduler.js';
 import { mountEvalProducer } from '../src/remote/eval-producer.js';
 import type { WorkTask } from '../src/work/broker.js';
@@ -465,6 +466,38 @@ describe('a run against serve\'s durable queue', () => {
     s.work.publish([call('dropme', 'piece-0020')]);
     expect(await (await fetch(`${s.url}/eval/v1/runs/dropme`, { method: 'DELETE', headers })).json()).toEqual({ removed: 1 });
     expect(s.work.store.ofRun('dropme')).toEqual([]);
+    await s.close();
+  });
+});
+
+describe('eval drop', () => {
+  it('drops a run\'s tasks and results through serve when it answers, and from the folder when it does not', async () => {
+    const root = newRoot();
+    fs.mkdirSync(path.join(root, '.knode'), { recursive: true });
+    fs.writeFileSync(path.join(root, MCP_TOKEN_FILE), TOKEN);
+    const runDir = path.join(tmp, 'runs', 'drop-me');
+    let s = await startServe(root);
+    const port = s.port;
+    const remote = (await connect(s.url, 'drop-me'))!;
+    void publishCall(remote, 'd0').catch(() => {});
+    await until(() => s.work.store.ofRun('drop-me').length === 1);
+    // another run directory of the same name keeps its tasks
+    s.work.publish([call('drop-me', 'other-dir-01')], { scope: 'cccccccccccc' });
+    const lines: string[] = [];
+    expect(await dropQueuedRun(runDir, root, { serveUrl: s.url, log: (m) => lines.push(m) })).toBe(1);
+    expect(lines).toEqual(['drop-me: dropped 1 task(s) and their results from serve\'s queue']);
+    expect(s.work.store.ofRun('drop-me').map((t) => t.key)).toEqual(['other-dir-01']);
+    remote.close();
+    await s.close();
+    // serve stopped: straight from the folder, the scoring's pieces too
+    const w = new EvalWork(root);
+    w.publish([call('drop-me-score', 'score-0001')], { scope: scopeOf(`${runDir}#score`) });
+    w.close();
+    expect(await dropQueuedRun(runDir, root, { serveUrl: `http://127.0.0.1:${port}` })).toBe(1);
+    const after = new EvalWork(root);
+    expect(after.store.ofRun('drop-me-score')).toEqual([]);
+    after.close();
+    s = await startServe(root, { port });
     await s.close();
   });
 });

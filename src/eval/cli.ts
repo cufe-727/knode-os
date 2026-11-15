@@ -328,14 +328,19 @@ export function registerEvalCommands(program: Command): void {
     });
   evalCmd
     .command('drop [runDir]')
-    .description("drop a run's knode indexes (its schemas in the evaluation database, or its embedded databases); its records stay. --orphaned: drop the evaluation schemas whose run directory is gone")
+    .description("drop a run's knode indexes (its schemas in the evaluation database, or its embedded databases) and the tasks and results serve keeps for it; its records stay. --orphaned: drop the evaluation schemas whose run directory is gone")
     .option('--database-url <url>', 'the evaluation database (default: what the run\'s workspaces name, or $KNODE_EVAL_DATABASE_URL)')
     .option('--config-from <workspace>', 'with --orphaned: the workspace whose server holds the evaluation database knode_eval')
     .option('--orphaned', 'drop evaluation schemas whose workspace directory no longer exists')
     .action(async (runDir: string | undefined, opts: { databaseUrl?: string; configFrom?: string; orphaned?: boolean }) => {
       const { defaultConfig, loadConfig } = await import('../config.js');
       const { describeDatabase, dropEvalSchema, dropRun, evalDatabase, orphanedEvalSchemas } = await import('./database.js');
-      if (runDir) await dropRun(runDir, { url: opts.databaseUrl, log: (m) => console.log(`  ${m}`) });
+      if (runDir) {
+        await dropRun(runDir, { url: opts.databaseUrl, log: (m) => console.log(`  ${m}`) });
+        // and what serve keeps of it (docs/design/32 §5): its tasks waiting and their results
+        const { dropQueuedRun } = await import('./remote.js');
+        await dropQueuedRun(runDir, resolveDataDir(program.opts().data), { log: (m) => console.log(`  ${m}`) });
+      }
       if (opts.orphaned) {
         const cfg = evalDatabase(opts.configFrom ? loadConfig(opts.configFrom).database : defaultConfig().database, { url: opts.databaseUrl });
         if (cfg.kind !== 'postgres') throw new Error('--orphaned: the evaluation database is PGlite here; its indexes live in the run directories');

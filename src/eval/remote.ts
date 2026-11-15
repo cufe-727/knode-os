@@ -578,6 +578,45 @@ export function localServe(dataRoot: string, serveUrl?: string): { serveUrl: str
 
 export { machineOf };
 
+/**
+ * `eval drop <run-dir>`: the run's tasks and results in serve's queue
+ * (docs/design/32 §5), for its answers and its scoring — through serve when it
+ * answers (it holds the store), straight from the data root's folder when no
+ * serve does. Says what it did, one line each.
+ */
+export async function dropQueuedRun(runDir: string, dataRoot: string, opts: { serveUrl?: string; log?: (m: string) => void } = {}): Promise<number> {
+  const { dropStoredRun } = await import('../work/eval-store.js');
+  const dir = path.resolve(runDir);
+  const name = path.basename(dir);
+  const parts = [{ run: queueRunId(name), scope: scopeOf(dir) }, { run: queueRunId(`${name}-score`), scope: scopeOf(`${dir}#score`) }];
+  let at: { serveUrl: string; token: string } | null = null;
+  try {
+    at = localServe(dataRoot, opts.serveUrl);
+  } catch {
+    // no serve was ever started on this data root: nothing holds its folder
+  }
+  let removed = 0;
+  for (const { run, scope } of parts) {
+    let n: number | null = null;
+    if (at) {
+      const res = await fetch(`${at.serveUrl}/eval/v1/runs/${encodeURIComponent(run)}?scope=${scope}`, { method: 'DELETE', headers: { authorization: `Bearer ${at.token}` }, signal: AbortSignal.timeout(10_000) }).catch(() => null);
+      if (res?.ok) n = ((await res.json()) as { removed?: number }).removed ?? 0;
+      else if (res && res.status >= 400) {
+        // serve answers but from before durable tasks: it keeps nothing of the run past its requests
+        const stale = res.status === 404;
+        if (!stale) throw new Error(`serve refused to drop ${run}'s tasks (${res.status}): ${(await res.text()).slice(0, 200)}`);
+        n = 0;
+      }
+    }
+    // serve is not answering: the folder, unless a serve still holds it
+    n ??= dropStoredRun(dataRoot, run, scope);
+    if (n === null) throw new Error(`a serve holds the evaluation queue of ${dataRoot} but does not answer: start it again and drop the run, or stop it first`);
+    if (n) opts.log?.(`${run}: dropped ${n} task(s) and their results from serve's queue`);
+    removed += n;
+  }
+  return removed;
+}
+
 /** What a piece came back as: run by one of the run's own slots (its value or what it threw), or by a worker. */
 export type Published<T> =
   | { local: true; value: T }
