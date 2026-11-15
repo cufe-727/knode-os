@@ -7,7 +7,7 @@ import { defaultConfig, isCliProvider, KnodeConfig, LlmEffort, loadConfig } from
 import { createEmbeddingProvider, EmbeddingProvider } from '../ingest/embeddings.js';
 import { createConfiguredEmbeddingProvider } from '../ingest/embedding-router.js';
 import { LlmClient } from '../llm/client.js';
-import { Judge, JUDGE_SYSTEM } from './judge.js';
+import { AUDIT_DEFAULT_SHARE, Judge, JUDGE_SYSTEM, type JudgeAudit } from './judge.js';
 import { ModelChain, parseChain, SpendLedger } from './chain.js';
 import { setAgentRouting, setAgentStopping } from './agent.js';
 import { Meter } from './meter.js';
@@ -33,7 +33,7 @@ import { removeHeldTempDirs, sweepStaleTempDirs } from './tmp.js';
 import { boundedTrace } from './trace.js';
 import { SystemEnv, SystemUnderTest, taggedEmbedder } from './systems/types.js';
 import { extractFinalAnswer } from './metrics/text.js';
-import { AnswerRecord, BuildRecord, emptyUsage, ScoreRecord, Suite, SUITES, Task, TaskType } from './types.js';
+import { AnswerRecord, BuildRecord, emptyUsage, ScoreRecord, Suite, SUITES, Task, TaskType, Usage } from './types.js';
 
 /**
  * `knode-os eval run` (docs/design/23 §7). For each pack: stage the corpus,
@@ -156,10 +156,23 @@ export interface RunOptions {
    * `--judge-model` for the judge); a pack with a `private:` source never does.
    */
   remote?: { serveUrl: string; token: string; refreshMs?: number } | null;
+  /**
+   * Share of judge verdicts judged a second time, in a call of their own, for
+   * how often the judge disagrees with itself (default 0.05, at least 20 a
+   * pass; 0: off). Recorded in the run's `judge-audit.jsonl`.
+   */
+  judgeAudit?: number;
   /** Answer each task this many times, for run-to-run variance (default 1: today's keys). */
   repeat?: number;
   /** The systems answered `repeat` times (default: every system that answers). */
   repeatSystems?: string[];
+  /**
+   * With `repeat`: repeats after the first answer only a seeded sample of
+   * this many tasks per pack (and per update batch), stratified by task type
+   * and the same for every repeated system — run-to-run spread for a part of
+   * the cost. Unset: every task is repeated.
+   */
+  repeatSample?: number;
   /** Cancels the run: what is out with workers is withdrawn and their session tokens revoked. */
   signal?: AbortSignal;
   /**
@@ -259,6 +272,17 @@ export function selectTasks(tasks: Task[], suites: Set<string>, limit: number | 
     if (!added) break;
   }
   return out;
+}
+
+/**
+ * The tasks repeats after the first ask (`--repeat-sample`): `n` of `pool`,
+ * stratified by task type as `selectTasks` samples (round-robin across types,
+ * primary tasks first), under a seed of its own so the sample is not simply
+ * the first tasks of the run's own order. Null: no sample, every task repeats.
+ */
+export function repeatSampleOf(pool: Task[], n: number | undefined, seed: string | number): Set<string> | null {
+  if (!n || n <= 0) return null;
+  return new Set(selectTasks(pool, new Set(pool.map((t) => t.suite)), Math.trunc(n), `${seed}|repeat`).map((t) => t.id));
 }
 
 const isAgent = (s: SystemUnderTest) => s.kind === 'agent' || s.id.startsWith('agent-');
@@ -429,6 +453,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     }
     const judge = new Judge({ client: judgeClient, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl') });
     const models = { model: opts.model ?? '', buildEffort: opts.buildEffort ?? 'low', answerEffort: opts.answerEffort ?? 'medium' };
+    judge.audit(judgeAuditFor(opts.judgeAudit, seed, store));
 
     if (opts.reuseBuildsFrom) {
       const groups = new Set(makeSystems(opts.systems).map((sys) => sys.group).filter((g) => !opts.rebuild?.includes(g)));
@@ -483,7 +508,9 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     };
     const repeat = Math.max(1, Math.trunc(opts.repeat ?? 1));
     const repeatsOf = (s: SystemUnderTest) => (repeat > 1 && (!opts.repeatSystems?.length || opts.repeatSystems.includes(s.id)) ? repeat : 1);
-    if (repeat > 1) meta.repeat = { n: repeat, systems: opts.repeatSystems?.length ? opts.repeatSystems : opts.systems };
+    if (repeat > 1) meta.repeat = { n: repeat, systems: opts.repeatSystems?.length ? opts.repeatSystems : opts.systems, ...(opts.repeatSample ? { sample: opts.repeatSample } : {}) };
+    // the tasks a repeat after the first asks: all of them, or the seeded sample (`--repeat-sample`)
+    const repeatedTasks = (tasks: Task[], r: number, sample: Set<string> | null) => (r === 1 || !sample ? tasks : tasks.filter((t) => sample.has(t.id)));
     if (remote.where === 'serve') meta.remote = { serve: opts.remote!.serveUrl, calls: callsLeave, judge: Boolean(judgeLeaves && !anyPrivate) };
     // where its work goes, as this start of the run has it (docs/design/32): a resume with other slots says so here
     meta.work = {
@@ -565,6 +592,11 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       const typed = opts.types?.length ? staged.tasks.filter((t) => opts.types!.includes(t.type)) : staged.tasks;
       const allTasks = selectTasks(typed.filter((t) => !t.afterUpdate), suites, opts.limit, seed);
       const updateTasks = suites.has('update') ? typed.filter((t) => t.afterUpdate) : [];
+      // the repeat sample: drawn from the tasks every repeated system answers (an agent answers its own subset), so pairs compare
+      const agentTasks = selectTasks(allTasks, suites, opts.agentLimit ?? 30, seed);
+      const repeated = systems.filter((s) => s.answers && repeatsOf(s) > 1);
+      const repeatPool = repeated.some(isAgent) ? agentTasks : allTasks;
+      const repeatSample = repeatSampleOf(repeatPool, opts.repeatSample, seed);
 
       for (const [group, members] of groups) {
         const env: SystemEnv = {
@@ -585,8 +617,8 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
         }
         for (const s of members) {
           for (const other of members) if (other !== s) await other.release?.(env);
-          const tasks = isAgent(s) ? selectTasks(allTasks, suites, opts.agentLimit ?? 30, seed) : allTasks;
-          for (let r = 1; r <= repeatsOf(s); r++) await answerAll(store, meter, env, s, tasks, fraction, seed, concurrencyFor(s, leaves), progress, undefined, r, stop.signal);
+          const tasks = isAgent(s) ? agentTasks : allTasks;
+          for (let r = 1; r <= repeatsOf(s); r++) await answerAll(store, meter, env, s, repeatedTasks(tasks, r, repeatSample), fraction, seed, concurrencyFor(s, leaves), progress, undefined, r, stop.signal);
           await retrieveAll(store, env, s, allTasks, fraction, seed, stop.signal);
         }
         // generated knowledge, once per build
@@ -643,8 +675,9 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
             // nothing to update, or a resumed run that updated already: reopen on the staged corpus as it now is
             for (const s of members) await s.reopen?.(env).catch(() => {});
           }
+          const batchSample = repeatSampleOf(tasks, opts.repeatSample, seed);
           for (const s of members) {
-            for (let r = 1; r <= repeatsOf(s); r++) await answerAll(store, meter, env, s, tasks, fraction, seed, concurrencyFor(s, leaves), progress, batch, r, stop.signal);
+            for (let r = 1; r <= repeatsOf(s); r++) await answerAll(store, meter, env, s, repeatedTasks(tasks, r, batchSample), fraction, seed, concurrencyFor(s, leaves), progress, batch, r, stop.signal);
           }
           for (const s of members) await s.release?.(env);
         }
@@ -814,7 +847,7 @@ function where(p: Placed | null): { worker?: string; backend?: string } {
  * its records and the packs it names — with no model of its own running, so
  * only while the run itself is stopped.
  */
-export async function scoreRun(runDir: string, opts: { judgeProvider?: string; judgeModel?: string; onProgress?: (m: string) => void; remote?: RunOptions['remote']; local?: RunOptions['local']; slots?: number; waitMinutes?: number; waitCheckMs?: number; pool?: string } = {}): Promise<number> {
+export async function scoreRun(runDir: string, opts: { judgeProvider?: string; judgeModel?: string; judgeAudit?: number; onProgress?: (m: string) => void; remote?: RunOptions['remote']; local?: RunOptions['local']; slots?: number; waitMinutes?: number; waitCheckMs?: number; pool?: string } = {}): Promise<number> {
   const store = new RunStore(runDir);
   const meta = store.meta();
   if (!meta) throw new Error(`not a run directory: ${runDir}`);
@@ -861,11 +894,47 @@ export async function scoreRun(runDir: string, opts: { judgeProvider?: string; j
       for (const batch of pack.updates) for (const f of listFiles(path.join(pack.dir, 'updates', batch))) docs.add(f);
       corpusDocs.set(pack.manifest.id, docs);
     }
+    judge.audit(judgeAuditFor(opts.judgeAudit, meta!.seed, store));
     const citing = new Set(makeSystems(meta!.systems).filter((s) => s.answers && s.kind !== 'reference' && s.cites !== false).map((s) => s.id));
     // the scoring's own slots start last: anything above that throws leaves none behind
     if (placement.local) remote.startLocal(placement.local);
     return scoreAnswers(store, judge, { tasks, corpusDocs, citing }, opts.onProgress, meter);
   }
+}
+
+/**
+ * `--judge-audit`: the share of the judge's verdicts asked a second time
+ * (default 5%, at least 20 a pass), every pair written to the run's
+ * `judge-audit.jsonl`; 0 turns it off.
+ */
+export function judgeAuditFor(share: number | undefined, seed: string | number, store: RunStore): JudgeAudit | null {
+  const s = share ?? AUDIT_DEFAULT_SHARE;
+  if (!Number.isFinite(s) || s < 0 || s > 1) throw new Error('--judge-audit: a share between 0 and 1');
+  return s > 0 ? { share: s, seed, record: (r) => store.putJudgeAudit(r) } : null;
+}
+
+/** Usages added field by field. */
+function addUsage(a: Usage, b: Usage): Usage {
+  const out = { ...a };
+  for (const [k, v] of Object.entries(b) as [keyof Usage, number][]) if (typeof v === 'number') out[k] = ((out[k] as number | undefined) ?? 0) + v;
+  return out;
+}
+
+/**
+ * A resumed build's record (`resumed` in its notes): the earlier attempt's
+ * time and cost counted with this one's, since both went into the build, and
+ * what that attempt ended with.
+ */
+export function withEarlierAttempt(rec: BuildRecord, earlier: BuildRecord | null): BuildRecord {
+  const own = (rec.notes?.resumed && typeof rec.notes.resumed === 'object' ? rec.notes.resumed : {}) as Record<string, unknown>;
+  const resumed = { ...own, ...(earlier ? { earlier: { at: earlier.at, error: earlier.error ?? null, ms: earlier.ms, weightedTokens: earlier.usage.weightedTokens, embeddingTokens: earlier.usage.embeddingTokens } } : { earlier: null }) };
+  if (!earlier) return { ...rec, notes: { ...rec.notes, resumed } };
+  const stages = { ...earlier.stages };
+  for (const [k, u] of Object.entries(rec.stages)) stages[k] = stages[k] ? addUsage(stages[k], u) : u;
+  return {
+    ...rec, ms: rec.ms + earlier.ms, usage: addUsage(earlier.usage, rec.usage), stages,
+    peakRssBytes: Math.max(rec.peakRssBytes ?? 0, earlier.peakRssBytes ?? 0) || undefined, notes: { ...rec.notes, resumed },
+  };
 }
 
 async function buildGroup(store: RunStore, meter: Meter, env: SystemEnv, group: string, members: SystemUnderTest[], fraction: number, seed: string | number, progress: (m: string) => void, signal?: AbortSignal): Promise<boolean> {
@@ -888,7 +957,11 @@ async function buildGroup(store: RunStore, meter: Meter, env: SystemEnv, group: 
       store.log('reused build rebuilt', { pack: env.pack.manifest.id, group, from, reason });
     }
   }
-  progress(`[${env.pack.manifest.id}/${group}] building`);
+  // an earlier attempt of this build that stopped or failed, which the builder continues from: its cost is the build's too
+  const resuming = Boolean(builder.resumable?.(env));
+  const earlier = resuming && done && !done.ok ? done : null;
+  progress(`[${env.pack.manifest.id}/${group}] ${resuming ? 'resuming the build' : 'building'}`);
+  if (resuming) store.log('build resumed', { pack: env.pack.manifest.id, group, ...(earlier ? { earlierError: earlier.error, earlierAt: earlier.at } : {}) });
   const mark = meter.mark();
   const t0 = Date.now();
   let peak = process.memoryUsage().rss;
@@ -914,7 +987,8 @@ async function buildGroup(store: RunStore, meter: Meter, env: SystemEnv, group: 
   } finally {
     clearInterval(sampler);
   }
-  // a cancelled run writes no record of what it stopped: a resumed run builds it whole
+  if (resuming) rec = withEarlierAttempt(rec, earlier);
+  // a cancelled run writes no record of what it stopped: a resumed run builds it again (knode continues what it left)
   if (signal?.aborted) throw new RunCancelledError();
   // nor a build one of whose pieces is stuck: the group waits for a resume, and the run goes on without it
   if (remote?.stuckFor(stuckMark, group).length || (!rec.ok && rec.error && /^cancelled:/.test(rec.error))) {

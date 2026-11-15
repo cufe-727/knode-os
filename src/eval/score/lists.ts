@@ -23,9 +23,18 @@ import { judgeItemKey, repeatOf, scoreKey } from './keys.js';
 const CJK_CLASS = '㐀-䶿一-鿿぀-ヿ가-힯';
 const SPACE_BY_CJK = new RegExp(`\\s+(?=[${CJK_CLASS}])|(?<=[${CJK_CLASS}])\\s+`, 'gu');
 
-/** Normalized for matching: NFKC, lower case, punctuation folded; no spaces next to CJK, none between a number and its unit. */
+/**
+ * Thousands separators dropped: "1,000" and "1,347,307.69" as the digits
+ * they are. Only a well-formed group (one to three digits, then groups of
+ * exactly three) is folded, so "3,4" and "第1,2周" keep their comma.
+ */
+export function foldThousands(s: string): string {
+  return s.normalize('NFKC').replace(/(?<![\d.,])\d{1,3}(?:,\d{3})+(?![\d]|,\d)/g, (m) => m.replace(/,/g, ''));
+}
+
+/** Normalized for matching: NFKC, lower case, thousands separators and punctuation folded; no spaces next to CJK, none between a number and its unit. */
 export function matchForm(s: string): string {
-  return normalizeAnswer(s).replace(SPACE_BY_CJK, '').replace(/(?<=\d)\s+(?=[a-z%])/g, '').replace(/(?<=\d)\s+(?=\d)/g, ' ');
+  return normalizeAnswer(foldThousands(s)).replace(SPACE_BY_CJK, '').replace(/(?<=\d)\s+(?=[a-z%])/g, '').replace(/(?<=\d)\s+(?=\d)/g, ' ');
 }
 
 const isDigit = (c: string | undefined) => c !== undefined && c >= '0' && c <= '9';
@@ -64,6 +73,53 @@ export function matchByAlias(predicted: string[], gold: GoldItem[]): [number, nu
     out.push([pi, gi]);
   }
   return out.sort((a, b) => a[0] - b[0]);
+}
+
+/** Where a label that lists several things divides: 、 , ; / | and the words for "and" / "or", outside brackets. */
+const LIST_SEPARATOR = /^(?:[、,;/|]|以及|和|与|及|或|\s+(?:and|or)\s+)/i;
+const OPEN = '(（[【「『“';
+const CLOSE = ')）]】」』”';
+
+/** A label's parts at its top-level list separators (thousands separators kept), trimmed, empty ones dropped. */
+export function listParts(label: string): string[] {
+  const s = foldThousands(label);
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (OPEN.includes(c)) depth++;
+    else if (CLOSE.includes(c) && depth > 0) depth--;
+    else if (depth === 0) {
+      const sep = s.slice(i).match(LIST_SEPARATOR);
+      if (sep) {
+        parts.push(s.slice(start, i));
+        i += sep[0].length - 1;
+        start = i + 1;
+      }
+    }
+  }
+  parts.push(s.slice(start));
+  return parts.map((p) => p.trim()).filter(Boolean);
+}
+
+/**
+ * An entry that lists several gold items in one label ("九部平台组、九部支付组
+ * （归属不唯一）") stands for its parts, each counted as an item the answer
+ * gave: it is a list written in one string, and scored as if written out, so
+ * it can match one gold item per part, and a part that names nothing in the
+ * gold lowers precision as a separate wrong entry would. Only when two or more
+ * parts each name a different gold item: an entry that merely mentions two
+ * names in one phrase ("九部平台组调往九部支付组") is one claim, and a label
+ * whose parts name at most one gold item keeps its form (its precision does
+ * not change for being written with a comma).
+ */
+export function splitListedItems<T extends { label: string }>(items: T[], gold: GoldItem[]): T[] {
+  return items.flatMap((it) => {
+    const parts = listParts(it.label);
+    if (parts.length < 2 || matchByAlias(parts, gold).length < 2) return [it];
+    return parts.map((label) => ({ ...it, label }));
+  });
 }
 
 /** Pairs [predicted, gold] where the predicted label names every field of the gold item (one term of each group), each used once. */
@@ -188,7 +244,9 @@ export async function scoreLists(input: ListInput, judge: Judge): Promise<ScoreR
     const t = input.tasks.get(`${a.pack}|${a.taskId}`);
     if (!t || !t.list || t.scoring !== 'set' || !t.items?.length || a.leaked?.length) continue;
     const spec = listSpec(t);
-    const items = parseStructured(a.text).items.slice(0, spec.maxItems);
+    const given = parseStructured(a.text).items.slice(0, spec.maxItems);
+    // matched by name: an entry that lists several gold items counts as its parts
+    const items = spec.match === 'alias' ? splitListedItems(given, t.items) : given;
     put(a, t, 'items_returned', items.length);
     if (spec.match === 'judge' && items.length) {
       toJudge.push({ id: judgeItemKey('list', a), a, t, items });

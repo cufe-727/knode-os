@@ -83,6 +83,23 @@ function poolOption(opts: { pool?: string }): string | undefined {
   return opts.pool;
 }
 
+/** `--repeat-sample`: how many tasks per pack repeats after the first ask; needs --repeat 2 or more. */
+function repeatSampleOption(opts: { repeatSample?: string; repeat?: string }): number | undefined {
+  if (opts.repeatSample === undefined) return undefined;
+  const n = Number(opts.repeatSample);
+  if (!Number.isInteger(n) || n < 1) throw new Error('--repeat-sample: a whole number of tasks, 1 or more');
+  if (!(Number(opts.repeat) > 1)) throw new Error('--repeat-sample: needs --repeat 2 or more');
+  return n;
+}
+
+/** `--judge-audit`: the share of judge verdicts judged a second time (none given: 5%; 0: off). */
+function judgeAuditOption(opts: { judgeAudit?: string }): number | undefined {
+  if (opts.judgeAudit === undefined) return undefined;
+  const n = Number(opts.judgeAudit);
+  if (!Number.isFinite(n) || n < 0 || n > 1) throw new Error('--judge-audit: a share between 0 and 1, e.g. 0.05 (0 turns the audit off)');
+  return n;
+}
+
 /** A run the wait limit stopped: its report so far, the message, and a non-zero exit. */
 async function waitedOut(run: typeof runEval, opts: Parameters<typeof runEval>[0]): Promise<Awaited<ReturnType<typeof runEval>> | null> {
   try {
@@ -235,6 +252,8 @@ export function registerEvalCommands(program: Command): void {
     .option('--pool <name>', "every piece of the run requires this pool: only workers started with --pool <name> (default: their token's name) take it, and this run's --local slots, which join it")
     .option('--repeat <n>', 'answer each task n times, for run-to-run variance (repeat 1 keeps the usual record keys)', '1')
     .option('--repeat-systems <list>', 'with --repeat: only these systems (default: every system that answers)')
+    .option('--judge-audit <share>', 'judge this share of the verdicts a second time, in calls of their own with the items in another order, and list where the two disagree (default 0.05, at least 20 a pass; 0 = off)')
+    .option('--repeat-sample <n>', 'with --repeat: repeat only a seeded sample of n tasks per pack, stratified by task type and the same for every repeated system (the first answer still covers every task)')
     .action(async (opts) => {
       const remote = remoteOption(program, opts);
       const res = await waitedOut(runEval, {
@@ -244,6 +263,8 @@ export function registerEvalCommands(program: Command): void {
         pool: poolOption(opts),
         repeat: Number(opts.repeat),
         repeatSystems: csv(opts.repeatSystems),
+        repeatSample: repeatSampleOption(opts),
+        judgeAudit: judgeAuditOption(opts),
         packs: csv(opts.pack)!.map(resolvePack),
         systems: csv(opts.systems) ?? DEFAULT_SYSTEMS,
         suites: (csv(opts.suites) as Suite[] | undefined) ?? [...SUITES],
@@ -377,10 +398,11 @@ export function registerEvalCommands(program: Command): void {
     .option('--offer-seconds <s>', 'no longer applies: a call waits until a slot takes it (see --wait-minutes)')
     .option('--wait-minutes <n>', 'stop cleanly (non-zero) when a call has waited this long while no slot online takes it; 0 = no limit', '30')
     .option('--pool <name>', 'the judge\'s calls require this pool (workers started with --pool <name>, and --local slots)')
+    .option('--judge-audit <share>', 'judge this share of the verdicts a second time, in calls of their own with the items in another order, and list where the two disagree (default 0.05, at least 20 a pass; 0 = off)')
     .action(async (runDir: string, opts) => {
       let n: number;
       try {
-        n = await scoreRun(path.resolve(runDir), { judgeProvider: opts.judge, judgeModel: opts.judgeModel, onProgress: (m) => console.log(`  ${m}`), remote: remoteOption(program, opts), ...localOption(opts), waitMinutes: waitMinutesOption(opts), pool: poolOption(opts) });
+        n = await scoreRun(path.resolve(runDir), { judgeProvider: opts.judge, judgeModel: opts.judgeModel, onProgress: (m) => console.log(`  ${m}`), remote: remoteOption(program, opts), ...localOption(opts), waitMinutes: waitMinutesOption(opts), pool: poolOption(opts), judgeAudit: judgeAuditOption(opts) });
       } catch (err) {
         if (!(err instanceof RunStoppedError)) throw err;
         console.error(`\n${err.message}`);

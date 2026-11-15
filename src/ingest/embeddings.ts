@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { EmbeddingConfig, resolveSecret } from '../config.js';
 import { EMBED_INPUT_CHARS } from '../constants.js';
 import { pluginRegistry } from '../plugins/registry.js';
+import { fetchRetrying, NETWORK_RETRY } from '../llm/network.js';
 
 /**
  * What the Index stage, the duplicate audits and search embed with. The
@@ -115,11 +116,12 @@ export class ArkMultimodalEmbeddingProvider implements EmbeddingProvider {
   }
 }
 
-/** POST JSON with exponential backoff on rate limits / transient 5xx. */
+/** POST JSON with exponential backoff on rate limits / transient 5xx, and on a dropped connection. */
 async function postWithRetry(url: string, apiKey: string, body: unknown): Promise<unknown> {
   const MAX_ATTEMPTS = 5;
   for (let attempt = 1; ; attempt++) {
-    const res = await fetch(url, {
+    // a connection dropped before any response is tried again there (src/llm/network.ts); a status is handled below
+    const res = await fetchRetrying(url, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -133,7 +135,7 @@ async function postWithRetry(url: string, apiKey: string, body: unknown): Promis
     if (!retryable || attempt >= MAX_ATTEMPTS) {
       throw new Error(`embedding request failed (${res.status}): ${text.slice(0, 300)}`);
     }
-    await new Promise((r) => setTimeout(r, Math.min(30_000, 1000 * 2 ** attempt)));
+    await new Promise((r) => setTimeout(r, Math.min(NETWORK_RETRY.maxMs, NETWORK_RETRY.baseMs * 2 ** attempt)));
   }
 }
 

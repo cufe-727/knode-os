@@ -331,6 +331,9 @@ export interface Shim {
   close: () => Promise<void>;
 }
 
+/** How long the shim keeps an idle connection open: past any client's own idle timeout (undici's is 4 s, or the hint less 2 s). */
+export const KEEP_ALIVE_MS = 120_000;
+
 const ANSWER_STAGES = new Set(['answer', 'agent', 'query', 'emergence']);
 
 /**
@@ -374,6 +377,8 @@ export async function startShim(opts: ShimOptions): Promise<Shim> {
   const retries = opts.retries ?? 5;
   const embedder = opts.embedder ? new MeteredEmbedder(opts.embedder, vectors, opts.meter, () => ({ system: 'unknown', stage: 'embed' }), cap, opts.embeddingBudget ?? null) : null;
 
+  // requests being answered now, by cache key: an identical one joins the call instead of making another
+  const inflight = new Map<string, Promise<CachedReply>>();
   const chat = async (req: http.IncomingMessage, res: http.ServerResponse) => {
     const body = JSON.parse((await readBody(req)) || '{}') as Record<string, unknown>;
     const modelName = typeof body.model === 'string' ? body.model : '';
@@ -410,7 +415,20 @@ export async function startShim(opts: ShimOptions): Promise<Shim> {
       let reply = replies.get(key);
       if (reply) {
         opts.meter.record({ ...tag, model: reply.model, ms: reply.ms, ok: true, replayed: true, usage: reply.usage, ...(reply.worker ? { worker: reply.worker } : {}), backend: reply.backend ?? opts.backend.label });
+      } else if (inflight.has(key)) {
+        // the same request is being answered already (a client that lost its connection and asked again): one call for both
+        reply = await inflight.get(key)!;
       } else {
+        const answered = askBackend();
+        inflight.set(key, answered);
+        try {
+          reply = await answered;
+        } finally {
+          inflight.delete(key);
+        }
+      }
+      async function askBackend(): Promise<CachedReply> {
+        let reply: CachedReply | undefined;
         for (let attempt = 0; !reply; attempt++) {
           const t0 = Date.now();
           try {
@@ -425,6 +443,7 @@ export async function startShim(opts: ShimOptions): Promise<Shim> {
             await new Promise((resolve) => setTimeout(resolve, Math.min(5 * 60_000, retryBase * 2 ** attempt)));
           }
         }
+        return reply;
       }
       const usage = { prompt_tokens: reply.usage?.inputTokens ?? 0, completion_tokens: reply.usage?.outputTokens ?? 0, total_tokens: (reply.usage?.inputTokens ?? 0) + (reply.usage?.outputTokens ?? 0) };
       if (stream) {
@@ -482,6 +501,9 @@ export async function startShim(opts: ShimOptions): Promise<Shim> {
   });
   server.requestTimeout = 0;
   server.headersTimeout = 0;
+  // an idle connection is closed by the client, not under it: Node's 5 s default raced the workspace's clients, which
+  // reuse a connection idle for a few seconds, and lost a request to ECONNRESET now and then (the 10× build's end)
+  server.keepAliveTimeout = KEEP_ALIVE_MS;
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const port = (server.address() as AddressInfo).port;
   const url = `http://127.0.0.1:${port}`;
