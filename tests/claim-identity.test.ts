@@ -246,13 +246,17 @@ describe('months a statement names without a year', () => {
     expect(monthsApart(claim('4月月报列示四部支付组在岗人数为7人。'), claim('10月月报列示四部支付组在岗人数为8人。'))).toBe(true);
     expect(monthsApart(claim('9月月报列示四部平台组在岗人数为6人。'), claim('9月月报中四部平台组在岗6人。'))).toBe(false);
     // against a week inside one month
-    expect(monthsApart(claim('4月月报列示在岗人数为7人。'), claim('本周在岗7人', 'fact', ['2025-06-16T00:00:00Z', '2025-06-20T23:59:59Z']))).toBe(true);
+    expect(monthsApart(claim('4月月报列示在岗人数为7人。'), claim('本周在岗8人', 'fact', ['2025-06-16T00:00:00Z', '2025-06-20T23:59:59Z']))).toBe(true);
+    expect(monthsApart(claim('4月月报列示在岗人数为7人。'), claim('本周在岗7人', 'fact', ['2025-06-16T00:00:00Z', '2025-06-20T23:59:59Z']))).toBe(false);
     expect(monthsApart(claim('4月月报列示在岗人数为7人。'), claim('本周在岗7人', 'fact', ['2025-04-14T00:00:00Z', '2025-04-18T23:59:59Z']))).toBe(false);
     expect(monthsApart(claim('4月月报列示在岗人数为7人。'), claim('本周在岗7人', 'fact', ['2025-04-28T00:00:00Z', '2025-05-02T23:59:59Z']))).toBe(false);
     // the report's month is not the time of what the report says
     expect(monthsApart(claim('5月月报列示Orion已于第18周上线', 'fact', null, null), claim('6月月报列示Orion已于第18周上线', 'fact', null, null))).toBe(false);
     expect(monthsApart(claim('4月月报列示一季度营收为3亿元', 'fact', null, '营收'), claim('5月月报列示一季度营收为3.2亿元', 'fact', null, '营收'))).toBe(false);
     expect(monthsApart(claim('3月期Shibor为1.8%', 'fact', null, 'Shibor'), claim('6月期Shibor为1.9%', 'fact', null, 'Shibor'))).toBe(false);
+    // a report's month for a figure two reports give alike says nothing of when it held: registered capital stays put
+    expect(monthsApart(claim('4月月报列示注册资本为5000万元', 'fact', null, '注册资本'), claim('5月月报列示注册资本为5000万元', 'fact', null, '注册资本'))).toBe(false);
+    expect(monthsApart(claim('9月月报列示四部平台组在岗人数为6人。'), claim('10月月报列示四部平台组在岗人数为6人。'))).toBe(false);
     // the same forecast in two monthly reports is one forecast
     expect(monthsApart(claim('6月月报预计Orion于第32周上线。', 'prediction'), claim('5月月报预计Orion于第32周上线。', 'prediction'))).toBe(false);
     // and not by its kind alone: it names week 32, the report's month is not its time
