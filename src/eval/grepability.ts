@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { LoadedPack } from './pack.js';
 import { lexicalTokens } from './packs/separation.js';
+import { Bm25 } from './retrieval.js';
 import type { Task } from './types.js';
 
 /**
@@ -17,6 +18,11 @@ import type { Task } from './types.js';
  * of the corpus holds it (5% by default), since a word in every report narrows
  * nothing. Gold documents are the set items' documents where items name them,
  * else `meta.goldDocs`, else the evidence.
+ *
+ * Beside the two shares, a ranking that does not depend on a threshold: the
+ * share of questions whose gold documents all, and whose first-step document,
+ * are among the ten documents a BM25 search on the question's text ranks
+ * first (the harness's own index, whole documents).
  */
 
 const ZH_FUNCTION = /[的了是个起在有和这那也就都与着或被把给从到对为以之其几么吗呢里一]/;
@@ -42,7 +48,7 @@ export function familyFor(t: Task): string {
   }
 }
 
-export interface GrepRow { family: string; n: number; allGold: number; firstStep: number }
+export interface GrepRow { family: string; n: number; allGold: number; firstStep: number; top10All: number; top10First: number }
 export interface GrepResult { pack: string; docs: number; share: number; rows: GrepRow[] }
 
 export function grepability(pack: LoadedPack, share = 0.05): GrepResult {
@@ -83,7 +89,8 @@ export function grepability(pack: LoadedPack, share = 0.05): GrepResult {
     if (!enTokens.has(doc)) enTokens.set(doc, lexicalTokens('en', text));
     return enTokens.get(doc)!.has(x);
   };
-  const by = new Map<string, { n: number; all: number; first: number }>();
+  const bm25 = new Bm25(pack.docs.map((d) => d.path), (p) => texts.get(p) ?? '');
+  const by = new Map<string, { n: number; all: number; first: number; tAll: number; tFirst: number }>();
   for (const t of tasks) {
     const l = lang(t);
     const narrow = terms.get(t.id)!.filter((x) => (df.get(x) ?? 0) > 0 && (df.get(x) ?? 0) <= limit);
@@ -92,29 +99,33 @@ export function grepability(pack: LoadedPack, share = 0.05): GrepResult {
     const gold = [...new Set(itemDocs.length ? itemDocs : metaDocs.length ? metaDocs : t.evidence.map((e) => e.doc))].filter((d) => texts.has(d));
     const first = t.evidence.map((e) => e.doc).find((d) => texts.has(d));
     if (!gold.length && !first) continue;
-    const row = by.get(familyFor(t)) ?? by.set(familyFor(t), { n: 0, all: 0, first: 0 }).get(familyFor(t))!;
+    const row = by.get(familyFor(t)) ?? by.set(familyFor(t), { n: 0, all: 0, first: 0, tAll: 0, tFirst: 0 }).get(familyFor(t))!;
     row.n++;
     if (gold.length && gold.every((d) => narrow.some((x) => holds(d, x, l)))) row.all++;
     if (first && narrow.some((x) => holds(first, x, l))) row.first++;
+    const top = new Set(bm25.search(t.question, 10).map((h) => h.item));
+    if (gold.length && gold.every((d) => top.has(d))) row.tAll++;
+    if (first && top.has(first)) row.tFirst++;
   }
-  const rows = [...by].map(([family, r]) => ({ family, n: r.n, allGold: r.all / r.n, firstStep: r.first / r.n })).sort((a, b) => a.family.localeCompare(b.family));
+  const rows = [...by].map(([family, r]) => ({ family, n: r.n, allGold: r.all / r.n, firstStep: r.first / r.n, top10All: r.tAll / r.n, top10First: r.tFirst / r.n })).sort((a, b) => a.family.localeCompare(b.family));
   return { pack: pack.manifest.id, docs: N, share, rows };
 }
 
 export function formatGrepability(rs: GrepResult[]): string {
   const families = [...new Set(rs.flatMap((r) => r.rows.map((x) => x.family)))].sort();
-  const head = `| family | ${rs.map((r) => `${r.pack}: n · all gold · first step`).join(' | ')} |`;
+  const head = `| family | ${rs.map((r) => `${r.pack}: n · all gold · first step · BM25@10 all · BM25@10 first`).join(' | ')} |`;
   const lines = [head, `| --- | ${rs.map(() => '---').join(' | ')} |`];
   for (const f of families) {
     lines.push(`| ${f} | ${rs.map((r) => {
       const x = r.rows.find((y) => y.family === f);
-      return x ? `${x.n} · ${(x.allGold * 100).toFixed(0)}% · ${(x.firstStep * 100).toFixed(0)}%` : '—';
+      const pc = (v: number) => `${(v * 100).toFixed(0)}%`;
+      return x ? `${x.n} · ${pc(x.allGold)} · ${pc(x.firstStep)} · ${pc(x.top10All)} · ${pc(x.top10First)}` : '—';
     }).join(' | ')} |`);
   }
-  const tot = (r: GrepResult, k: 'allGold' | 'firstStep') => {
+  const tot = (r: GrepResult, k: 'allGold' | 'firstStep' | 'top10All' | 'top10First') => {
     const n = r.rows.reduce((a, x) => a + x.n, 0);
     return n ? (r.rows.reduce((a, x) => a + x[k] * x.n, 0) / n) * 100 : 0;
   };
-  lines.push(`| all | ${rs.map((r) => `${r.rows.reduce((a, x) => a + x.n, 0)} · ${tot(r, 'allGold').toFixed(0)}% · ${tot(r, 'firstStep').toFixed(0)}%`).join(' | ')} |`);
+  lines.push(`| all | ${rs.map((r) => `${r.rows.reduce((a, x) => a + x.n, 0)} · ${tot(r, 'allGold').toFixed(0)}% · ${tot(r, 'firstStep').toFixed(0)}% · ${tot(r, 'top10All').toFixed(0)}% · ${tot(r, 'top10First').toFixed(0)}%`).join(' | ')} |`);
   return lines.join('\n');
 }
