@@ -85,6 +85,66 @@ INC-020-D3T3（P1）活动页白屏，吴婷修复。
   });
 });
 
+describe('back-references to the previous report', () => {
+  it('reads what a statement refers back to, and nothing when it names an identifier', async () => {
+    const { backReferenceIn } = await import('../src/graph/backrefs.js');
+    expect(backReferenceIn('上周那起缓存击穿已由方杰修复，根因是参数填反了')).toBe('缓存击穿');
+    expect(backReferenceIn('方杰已修复上周发生的配置下发失败。')).toBe('配置下发失败');
+    expect(backReferenceIn('上周发生的登录失败事故已由贾洋修复。')).toBe('登录失败');
+    expect(backReferenceIn('上周发生的缓存击穿问题根因是一处空指针。')).toBe('缓存击穿');
+    expect(backReferenceIn('上周发生了一起推送重复事故。')).toBe('推送重复');
+    expect(backReferenceIn('十部增长组上周的登录失败事故根因是机器资源不足。')).toBe('登录失败');
+    expect(backReferenceIn("Last week's cache stampede was fixed by Fang Jie")).toBe('cache stampede');
+    expect(backReferenceIn('上周那起INC-001-T1已由方杰修复')).toBeNull();
+    expect(backReferenceIn('方杰本周完成接口评审')).toBeNull();
+  });
+
+  it('links the fixer to the one identified incident of that description in the same series the period before', async () => {
+    const report = (team: string, date: string, body: string, fm: string) => `---\ntitle: ${team}周报\ndate: ${date}\n${fm}---\n${body}\n`;
+    const ctx = await workspace('backrefs', {
+      'raw/docs/周报/平台组/w05.md': report('平台组', '2025-02-03', 'INC-001-T1（P1）缓存击穿；INC-002-T1（P3）数据延迟', `entities:
+  - { name: INC-001-T1, type: event }
+  - { name: INC-002-T1, type: event }
+claims:
+  - { subject: INC-001-T1, statement: INC-001-T1为P1级缓存击穿事故, type: event }
+  - { subject: INC-002-T1, statement: INC-002-T1为P3级数据延迟事故, type: event }
+`),
+      'raw/docs/周报/平台组/w06.md': report('平台组', '2025-02-10', '上周那起缓存击穿已由方杰修复；上周那起数据延迟已由廖欣修复', `entities:
+  - { name: 方杰, type: person }
+  - { name: 廖欣, type: person }
+claims:
+  - { subject: 方杰, statement: 方杰已修复上周发生的缓存击穿, type: event }
+  - { subject: 廖欣, statement: 上周那起数据延迟已由廖欣修复, type: event }
+`),
+      // another team's incident of the same title, and a week whose report has two of them
+      'raw/docs/周报/支付组/w05.md': report('支付组', '2025-02-03', 'INC-003-T2（P1）缓存击穿；INC-004-T2（P1）缓存击穿', `entities:
+  - { name: INC-003-T2, type: event }
+  - { name: INC-004-T2, type: event }
+claims:
+  - { subject: INC-003-T2, statement: INC-003-T2为P1级缓存击穿事故, type: event }
+  - { subject: INC-004-T2, statement: INC-004-T2为P1级缓存击穿事故, type: event }
+`),
+      'raw/docs/周报/支付组/w06.md': report('支付组', '2025-02-10', '上周那起缓存击穿已由郭军修复', `entities:
+  - { name: 郭军, type: person }
+claims:
+  - { subject: 郭军, statement: 上周那起缓存击穿已由郭军修复, type: event }
+`),
+    });
+    const { linkBackReferences } = await import('../src/graph/backrefs.js');
+    const stats = await linkBackReferences(ctx.store);
+    expect(stats).toMatchObject({ references: 3, resolved: 2, linked: 2, disposed: 0 });
+    const links = await ctx.store.query<{ source_id: string; target_id: string }>(
+      `SELECT source_id, target_id FROM relations WHERE tx_to IS NULL AND target_id LIKE 'inc-%' ORDER BY source_id`,
+    );
+    expect(links).toEqual([{ source_id: '廖欣', target_id: 'inc-002-t1' }, { source_id: '方杰', target_id: 'inc-001-t1' }]);
+    // a second run keeps them; once the reading no longer holds, the link goes
+    expect(await linkBackReferences(ctx.store)).toMatchObject({ resolved: 2, disposed: 0 });
+    await ctx.store.query(`UPDATE documents SET doc_date = doc_date - interval '30 days' WHERE path = 'raw/docs/周报/平台组/w05.md'`);
+    expect(await linkBackReferences(ctx.store)).toMatchObject({ resolved: 0, disposed: 2 });
+    expect(await ctx.store.query(`SELECT 1 FROM relations WHERE tx_to IS NULL AND target_id LIKE 'inc-%'`)).toEqual([]);
+  });
+});
+
 describe('a title several incidents carry', () => {
   it('resolves to none of them', async () => {
     const ctx = await workspace('shared-title', {
