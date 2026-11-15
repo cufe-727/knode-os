@@ -35,6 +35,8 @@ export const TASK_TYPES = [
   'connection',
   // an existing question asked in other words (cross-lingual covers another language)
   'paraphrase',
+  // design 33 §3: an entity asked by a name the corpus states once and then drops (an old name, a nickname, a code)
+  'alias',
 ] as const;
 export type TaskType = (typeof TASK_TYPES)[number];
 
@@ -89,6 +91,11 @@ export const PackManifestSchema = z.object({
   stats: z.object({ documents: z.number(), chars: z.number(), tasks: z.number(), facts: z.number(), paddingDocuments: z.number(), paddingChars: z.number() }).partial().optional(),
   /** What the holdout holds and why no system may see it. */
   holdout: z.string().optional(),
+  /**
+   * What `eval pack lint` holds the pack to (docs/design/33 §4): the fewest questions per family
+   * (`meta.family`) and per stratum (`meta.stratum`, the hops' lengths).
+   */
+  lint: z.object({ families: z.record(z.string(), z.number()).default({}), strata: z.record(z.string(), z.number()).default({}) }).optional(),
 });
 export type PackManifest = z.infer<typeof PackManifestSchema>;
 

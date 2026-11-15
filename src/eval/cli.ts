@@ -6,6 +6,7 @@ import { LlmClient } from '../llm/client.js';
 import { exportAudit, importAudit } from './audit.js';
 import { installExternal } from './install.js';
 import { QuotaGuard, withRefusalRetry } from './quota.js';
+import { formatLint, lintBeforeRun, lintPack } from './lint.js';
 import { loadPack, packsDir, validatePack } from './pack.js';
 import { listRecipes, recipe } from './packs/index.js';
 import { extendPack } from './packs/extend.js';
@@ -195,6 +196,18 @@ export function registerEvalCommands(program: Command): void {
       if (issues.errors.length) process.exitCode = 1;
     });
 
+  pack
+    .command('lint <dirs...>')
+    .description('check packs for what makes a benchmark measure its own artifacts (docs/design/33 §4): one-class words, ambiguous subjects, file-name answers, family minimums, duplicate questions, hop shortcuts')
+    .option('--examples <n>', 'findings shown per rule', '5')
+    .option('--json <file>', 'write every finding as JSON')
+    .action((dirs: string[], opts) => {
+      const results = dirs.map((d) => lintPack(loadPack(resolvePack(d))));
+      for (const r of results) console.log(formatLint(r, Number(opts.examples)));
+      if (opts.json) fs.writeFileSync(opts.json, JSON.stringify(results, null, 1) + '\n');
+      if (results.some((r) => r.findings.length)) process.exitCode = 1;
+    });
+
   const systems = evalCmd.command('systems').description('systems under test');
   systems
     .command('list')
@@ -263,7 +276,16 @@ export function registerEvalCommands(program: Command): void {
     .option('--repeat-systems <list>', 'with --repeat: only these systems (default: every system that answers)')
     .option('--judge-audit <share>', 'judge this share of the verdicts a second time, in calls of their own with the items in another order, and list where the two disagree (default 0.05, at least 20 a pass; 0 = off)')
     .option('--repeat-sample <n>', 'with --repeat: repeat only a seeded sample of n tasks per pack, stratified by task type and the same for every repeated system (the first answer still covers every task)')
+    .option('--no-lint', 'run even when `eval pack lint` finds something in a pack (it runs first otherwise, and a finding stops the run before anything is spent)')
     .action(async (opts) => {
+      if (opts.lint !== false) {
+        const gate = lintBeforeRun(csv(opts.pack)!.map(resolvePack).map((d) => loadPack(d)));
+        if (!gate.ok) {
+          console.error(gate.report);
+          process.exitCode = 1;
+          return;
+        }
+      }
       const remote = remoteOption(program, opts);
       const res = await waitedOut(runEval, {
         remote,
