@@ -102,6 +102,15 @@ describe('reading a claim as attribute + value', () => {
     expect(m.get('初始对账批次间隔')?.canonical).toBe('初始间隔');
   });
 
+  it('reads a severity as one key however it is called', () => {
+    expect(normalizeAttribute('事故等级')).toBe('级别');
+    const m = unifyAttributeKeys([
+      { attribute: '事故级别', count: 3, units: [''] },
+      { attribute: '事故等级', count: 2, units: [''] },
+    ]);
+    expect(m.get('事故等级')?.canonical).toBe('事故级别');
+  });
+
   it('reads one week however a value spells it', () => {
     const v = (valueNum: number | null, valueText: string | null, unit: string | null = null) => ({ valueNum, valueText, unit });
     expect(sameValue(v(null, '2025-W25'), v(null, '2025年第25周'))).toBe(true);

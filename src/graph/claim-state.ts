@@ -42,6 +42,8 @@ const ATTRIBUTE_SYNONYMS: readonly string[][] = [
   ['stage', 'phase'],
   ['计划上线', '上线时间', '计划上线时间', '预计上线', '预计上线时间', '上线计划', '计划上线日期'],
   ['planned launch', 'launch date', 'go-live', 'go live'],
+  ['级别', '等级', '严重级别', '严重等级', '严重程度', '事故级别', '事故等级', '故障级别', '故障等级', '风险等级', '风险级别'],
+  ['severity', 'severity level', 'incident severity'],
 ];
 
 const SYNONYM: ReadonlyMap<string, string> = (() => {
@@ -403,9 +405,12 @@ export function unifyAttributeKeys(uses: AttributeUse[], spellings: readonly str
     const unit = unitOf(use);
     const qualifiers = keyQualifiers(use.attribute);
     const self = namesSubject(use.attribute, spellings);
+    const synonym = SYNONYM.get(fold(use.attribute));
     const group = groups.find((g) => {
       if (g.unit !== unit || g.qualifiers !== qualifiers) return false;
       if (self && g.self) return true;
+      // keys a synonym group holds (事故级别 / 事故等级) are one key, however they were read when written
+      if (synonym && g.members.some((m) => SYNONYM.get(fold(m.attribute)) === synonym)) return true;
       return g.members.some((m) => {
         const [s, l] = m.attribute.length <= use.attribute.length ? [m.attribute, use.attribute] : [use.attribute, m.attribute];
         return (s.length >= 2 && l.includes(s)) || dice(m.attribute, use.attribute) >= 0.67;
