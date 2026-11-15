@@ -563,8 +563,9 @@ describe('what a weekly reading is (review of df45ee5)', () => {
   });
 
   it('takes its week from the source\'s own calendar day, the document\'s date when it states none, and none without either', () => {
-    // local midnight east of UTC is the day before in UTC
-    expect(w('本周可用性为99.92%', { validFrom: '2025-06-15T16:00:00.000Z', validTo: '2025-06-20T15:59:59.999Z' })).toBe('2025-W25');
+    // a local midnight east of UTC is stored as the day before in UTC, and no offset is kept to read it back
+    // (store.ts calendarDay): a week written that way spans two UTC weeks and keys nothing
+    expect(w('本周可用性为99.92%', { validFrom: '2025-06-15T16:00:00.000Z', validTo: '2025-06-20T15:59:59.999Z' })).toBeNull();
     expect(w('本周可用性为99.92%', { observedAt: '2025-06-18T00:00:00.000Z' })).toBe('2025-W25');
     expect(w('两周前可用性为99.92%', { observedAt: '2025-06-18T00:00:00.000Z' })).toBe('2025-W23');
     // a model that dated "两周前" with the report's own week: the statement says which week it is
@@ -689,5 +690,37 @@ describe('moving an older workspace (review of df45ee5)', () => {
     expect(await canon(claimId('平台组', duty, weekOf(1)))).toBeNull();
     expect(resumed.listed).toBe(1);
     expect(await ctx.store.query(`SELECT status FROM suggestions WHERE payload->>'claimId' = $1 AND status = 'pending'`, [claimId('平台组', duty, weekOf(1))])).toEqual([{ status: 'pending' }]);
+  });
+});
+
+describe('what a weekly reading is (review of 4ec34fd)', () => {
+  const w = (statement: string, dates: Record<string, string | null>) => readingWeek({ statement, ...dates });
+  const week25 = { validFrom: '2025-06-16T00:00:00.000Z', validTo: '2025-06-20T23:59:59.999Z' };
+
+  it('2: reads a stored instant by its own calendar date, a Sunday evening included', () => {
+    // 2025-06-22T20:30+08:00, stored as UTC: still Sunday the 22nd, week 25
+    expect(w('本周可用性为99.92%', { eventAt: '2025-06-22T12:30:00.000Z' })).toBe('2025-W25');
+    expect(w('本周可用性为99.92%', { eventAt: '2025-06-22T23:59:00.000Z' })).toBe('2025-W25');
+    expect(w('本周可用性为99.92%', { eventAt: '2025-06-23T00:00:00.000Z' })).toBe('2025-W26');
+  });
+
+  it('3: dates the model gave the named week are not shifted again, from a weekday or a weekend report', () => {
+    // a recap of last week, dated Mon–Fri of it, in Sunday's and in Monday's report: one week
+    expect(w('上周可用性为99.92%', { ...week25, observedAt: '2025-06-22T00:00:00.000Z' })).toBe('2025-W25');
+    expect(w('上周可用性为99.92%', { ...week25, observedAt: '2025-06-23T00:00:00.000Z' })).toBe('2025-W25');
+    // a weekday report that gave "上周" its own week: the statement says it was the week before
+    expect(w('上周可用性为99.92%', { validFrom: '2025-06-23T00:00:00.000Z', validTo: '2025-06-27T23:59:59.999Z', observedAt: '2025-06-25T00:00:00.000Z' })).toBe('2025-W25');
+  });
+
+  it('reads these as weekly readings too', () => {
+    expect(w('截至上周五累计完成87%', { ...week25 })).toBe('2025-W25');
+    expect(w('上周末客流为12万人次', { validFrom: '2025-06-21T00:00:00.000Z', validTo: '2025-06-22T23:59:59.999Z' })).toBe('2025-W25');
+    expect(w('综合本周数据，转化率为3.2%', { ...week25 })).toBe('2025-W25');
+    expect(w('本周当前年化收益率为2.1%', { ...week25 })).toBe('2025-W25');
+  });
+
+  it('does not settle a change of plan as two times', () => {
+    const c = (statement: string) => ({ statement, kind: 'fact', attribute: null, valid_from: null, valid_to: null });
+    expect(monthsApart(c('Atlas计划于6月上线'), c('Atlas上线推迟至8月'))).toBe(false);
   });
 });

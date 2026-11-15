@@ -289,15 +289,15 @@ export function claimId(subjectId: string, statement: string, at?: string | null
  * 两周前, 3周前, "two weeks ago"). Each is a word: 本周 inside 资本周转率 or
  * 日本周三, a cycle (本周期, 上周期) and a word ending in 上 (早上周会) are none.
  */
-const BEFORE_BEN = '资日成版样基根文剧课账读原副脚范标摹底蓝话绘稿刊抄拓选珍孤善刻写足残节合记笔';
-const BEFORE_SHANG = '马早晚路线网身手桌以之向至往加爱赶遇碰';
+const BEFORE_BEN = '资日成版样基根文剧课账读原副脚范标摹底蓝话绘稿刊抄拓选珍孤善刻写足残节记笔';
+const BEFORE_SHANG = '马早晚路线网身手桌之向往加爱赶遇碰';
 const BEFORE_DANG = '相应适得正妥';
 const CN_COUNT: Record<string, number> = { 一: 1, 两: 2, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
 const EN_COUNT: Record<string, number> = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
 const WEEK_WORD = new RegExp([
   `(?<![${BEFORE_BEN}])(?:本|这)周(?![期年刊岁])`,
   `(?<![${BEFORE_DANG}])当周(?![期年刊岁])`,
-  `(?<![${BEFORE_SHANG}上])上上?一?周(?![期年刊岁末])`,
+  `(?<![${BEFORE_SHANG}上])上上?一?周(?![期年刊岁])`,
   String.raw`(?<![\d.])([一两二三四五六七八九十]|\d{1,2})\s*个?\s*(?:周|星期|礼拜)前`,
   String.raw`\bthis week\b|\blast week\b|\bthe week before last\b|\b(one|two|three|four|five|six|seven|eight|nine|ten|\d{1,2}) weeks? ago\b`,
 ].join('|'), 'gi');
@@ -332,7 +332,7 @@ const COMPARISON = /(?:较|比|相比|相较|对比|环比|同比|比起|高于|
  * (18日, 18号, 今日 — not 7日年化, 3号线, 5日均线).
  */
 const OTHER_TIME = new RegExp([
-  String.raw`\d{4}\s*(?:年|财年|-\d{1,2})|\bfy\s*'?\d{2,4}\b|\b(?:in|of|for|since|during|until)\s+(?:19|20)\d{2}\b|[去今明前上本]年|年[初中底末]`,
+  String.raw`\d{4}\s*(?:年|财年|-\d{1,2})|\bfy\s*'?\d{2,4}\b|\b(?:in|of|for|since|during|until)\s+(?:19|20)\d{2}\b|[去今明上本]年|(?<![当目此之提日])前年|年[初中底末]`,
   String.raw`\bq[1-4]\b|q[1-4](?=\d|[^a-z]|$)|(?<![\d.])[1-4]\s*q(?=\d|[^a-z]|$)|[一二三四1-4]\s*季(?:度|报)|[上下本]季度|季报|年报|半年报|中报|\bh[12]\b|(?<![a-z])h[12](?=[^a-z\d]|$)|(?<![\d.])[12]\s*h(?=\d|[^a-z]|$)|[上下]半年`,
   String.raw`\bw\d{1,2}\b|(?<![a-z])w\d{1,2}(?=\D|$)|第\s*\d{1,3}\s*周|下下?一?周|[一两二三四五六七八九十\d]{1,2}\s*个?\s*周后|\bnext week\b`,
   String.raw`\d{1,2}\s*月(?!期)|[一二三四五六七八九十]{1,2}月(?!期)|[上下本]个?月|月[初中底末]|\b(?:january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov|dec)\b`,
@@ -344,10 +344,19 @@ function hasFigure(text: string): boolean {
   return /\d/.test(text.replace(/[a-z]+[-_]?\d+(?:[-_][a-z0-9]+)*/gi, ' ').replace(/\d{4}-\d{1,2}(?:-\d{1,2})?/g, ' '));
 }
 
-/** The calendar day an instant stands for: the one whose midnight is nearest, as a date written at local midnight anywhere from UTC−12 to UTC+12 means. */
-function calendarDay(iso: string, end = false): number {
-  const t = Date.parse(iso) + (end ? 1 : 0);
-  return Math.round(t / 86_400_000) * 86_400_000 - (end ? 86_400_000 : 0);
+/**
+ * The calendar day a stored instant stands for: its date as stored. Dates are
+ * stored as UTC instants, and what the extractor writes is a date without a
+ * time (YYYY-MM-DD, YYYY-Www) or the document's date, each its own UTC
+ * midnight, so the stored date is the date written; a timestamp with a time of
+ * day is read by the date it carries (2025-06-22T20:30+08:00 is stored as
+ * 12:30Z on the 22nd: Sunday the 22nd). The writer keeps no offset, so a local
+ * midnight written with one ahead of UTC (2025-06-16T00:00+08:00) is read as
+ * the UTC day before; reading it as written needs the raw value, which only
+ * the extraction path has (src/graph/llm-extract.ts, src/store/dates.ts).
+ */
+function calendarDay(iso: string): number {
+  return Math.floor(Date.parse(iso) / 86_400_000) * 86_400_000;
 }
 
 /** ISO week of a UTC instant (its UTC day): "2025-W24". */
@@ -374,11 +383,12 @@ const isoOf = (t: string | Date | null | undefined): string | null => {
  * (WEEK_WORD; a comparison beside it, 较上周, is not its period) that names no
  * other time (OTHER_TIME). Its week is
  *   - the week of the date the source gives the claim (a window inside one
- *     ISO week, an open window from a day of it, or an event in it), read as
- *     the calendar day whose midnight is nearest; but when the statement says
- *     N weeks back and that date is the report's own week (the extractor gave
- *     the report's dates), N weeks before it;
- *   - else N weeks before the week of the document's date (`observedAt`);
+ *     ISO week, an open window from a day of it, or an event in it), by its
+ *     stored calendar date (calendarDay); but when the statement says N weeks
+ *     back, the report is dated on a weekday and that date is the report's own
+ *     week (the extractor gave the report's dates), N weeks before it;
+ *   - else N weeks before the week of the document's date (`observedAt`),
+ *     counted from the document's own ISO week, a weekend's included;
  *   - else none: a reading no date places stays one claim, as on main.
  * When a document's date changes, its relative readings change week and id:
  * src/graph/claim-rekey.ts (rekeyClaims) moves them with what was decided.
@@ -404,8 +414,16 @@ export function readingWeek(c: {
   if (from) {
     const start = calendarDay(from);
     const to = isoOf(c.validFrom) ? isoOf(c.validTo) : null;
-    if (to && isoWeekOf(calendarDay(to, true)) !== isoWeekOf(start)) return null;
-    return n > 0 && doc && isoWeekOf(calendarDay(doc)) === isoWeekOf(start) ? weekBefore(start) : isoWeekOf(start);
+    if (to && isoWeekOf(calendarDay(to)) !== isoWeekOf(start)) return null;
+    // dates the extractor gave the week the word names are taken as they are; only a weekday
+    // report that gave "上周" / "两周前" its own week is read N weeks back. A report written on a
+    // weekend may call the week it closes 上周, so its own week stands there too
+    if (n > 0 && doc) {
+      const docDay = calendarDay(doc);
+      const weekday = new Date(docDay).getUTCDay();
+      if (weekday >= 1 && weekday <= 5 && isoWeekOf(docDay) === isoWeekOf(start)) return weekBefore(start);
+    }
+    return isoWeekOf(start);
   }
   return doc ? weekBefore(calendarDay(doc)) : null;
 }
