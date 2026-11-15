@@ -6,7 +6,7 @@ import { bootstrapMean, holm, mean, minimumDetectableEffect, pairedBootstrap, ro
 import { RunStore } from './runstore.js';
 import { judgeItemKey } from './score/keys.js';
 import { SYSTEMS } from './systems/index.js';
-import { toolUse, type ToolUse } from './trace.js';
+import { toolsOf, toolUse, type ToolUse } from './trace.js';
 import { CORPUS_TASK_TYPES, SEPARATION_TASK_TYPES, type BuildRecord, type ScoreRecord } from './types.js';
 
 /**
@@ -96,6 +96,73 @@ export interface RepeatPair {
   noise: number;
   /** The difference is within the run-to-run spread: the per-repeat differences change sign, or |diff| ≤ 2 × noise. */
   withinSpread: boolean;
+}
+
+/**
+ * The five differences declared before a run (docs/design/33 §2), each the
+ * later arm minus the earlier: what the addition between them buys.
+ */
+export const LADDER_DIFFERENCES = [
+  { name: 'B − A', a: 'agent-rag', b: 'agent-grep', measures: 'semantic search over the sources' },
+  { name: 'C − A', a: 'agent-knode-wiki-sources', b: 'agent-grep', measures: 'the wiki itself' },
+  { name: 'D − C', a: 'agent-knode-full', b: 'agent-knode-wiki-sources', measures: "knode's retrieval: hybrid search, graph, claims, SQL" },
+  { name: 'D − A', a: 'agent-knode-full', b: 'agent-grep', measures: 'the product as a whole' },
+  { name: 'D − B', a: 'agent-knode-full', b: 'agent-rag', measures: 'the product against an agent with plain RAG' },
+] as const;
+
+/** What the ladder compares, per answer: correctness, then what the answer cost. */
+export const LADDER_METRICS = ['correctness', 'tokens', 'usd', 'seconds', 'toolCalls'] as const;
+export type LadderMetric = (typeof LADDER_METRICS)[number];
+
+export interface LadderCell {
+  /** Mean of a − b over the paired questions, its bootstrap interval and p. */
+  diff: number;
+  ci: [number, number];
+  p: number;
+  /** The smallest difference this many pairs could detect (α 0.05, power 0.8), in the metric's units. */
+  mde: number;
+  /** After Holm's correction across the rows shown, for this metric. */
+  significant: boolean;
+  /** Each arm's mean over the same questions. */
+  meanA: number;
+  meanB: number;
+}
+
+export interface LadderRow {
+  name: string;
+  a: string;
+  b: string;
+  measures: string;
+  /** Questions both arms answered and were scored on (first answers; repeats are their own systems). */
+  n: number;
+  metrics: Record<LadderMetric, LadderCell>;
+}
+
+export interface DiscriminationCounts {
+  /** Questions every agent system was scored on. */
+  n: number;
+  /** Every one of them fully right (correctness 1). */
+  allRight: number;
+  /** None of them fully right. */
+  noneRight: number;
+  /** Some fully right and some not: the questions that can tell them apart. */
+  rest: number;
+}
+
+export interface Discrimination {
+  systems: string[];
+  overall: DiscriminationCounts;
+  byType: Record<string, DiscriminationCounts>;
+}
+
+export interface KnodeToolRow {
+  tool: string;
+  /** Calls of the tool over the system's traced answers, and per traced answer. */
+  calls: number;
+  perAnswer: number;
+  /** Answers that called it at least once and their mean correctness; the same for those that did not. */
+  used: Cell;
+  unused: Cell;
 }
 
 export interface JudgeAuditSummary {
@@ -207,6 +274,12 @@ export interface ReportData {
   typeDeltas?: Record<string, Record<string, Record<string, Paired>>>;
   /** Stale answers, confident wrong answers, look-alike items and citation precision, per pack and system, over the separation families and over everything. */
   separation?: Record<string, Record<string, Record<string, Cell>>>;
+  /** The ladder's declared differences (docs/design/33 §2), pooled over packs, for the rows whose arms the run has. */
+  ladder?: LadderRow[];
+  /** Questions every agent system got fully right, none did, and the rest (docs/design/33 §5). */
+  discrimination?: Discrimination;
+  /** Per pack and system that called knode's tools: calls per tool, and correctness with and without each. */
+  knodeTools?: Record<string, Record<string, KnodeToolRow[]>>;
   /** What one correct answer costs: weighted tokens and USD over the sum of correctness, per pack and system. */
   costPerCorrect?: Record<string, Record<string, { tokens: number | null; usd: number | null; correct: number; n: number; toolCalls: number }>>;
   /** Run-to-run variance where a system answered the same tasks more than once (`eval run --repeat`). */
@@ -407,6 +480,9 @@ export function buildReportData(runDir: string): ReportData {
   }
   const separation = separationOf(scores);
   const costPerCorrect = costPerCorrectOf(answers, scores);
+  const ladder = ladderOf(answers, correctness);
+  const discrimination = discriminationOf(systems.filter(isAgentSystem), correctness, typeOf);
+  const knodeTools = knodeToolsOf(answers, correctness);
   const variance = varianceOf(answers, scores);
   const repeatPairs = repeatPairsOf(answers, scores);
 
@@ -415,12 +491,139 @@ export function buildReportData(runDir: string): ReportData {
     : 0;
   return {
     run: store.meta(), packs, systems, usage, retrieval, emergence, generation, perQuery, tools, builds, breakEven, lists, efficiency, updates, pooled, paired, byType, typesByPack, typeDeltas,
-    separation, costPerCorrect, variance, repeatPairs, judgeUsage: { calls: judgeEvents, weightedTokens: 0, costUsd: 0 }, judgeAudit: judgeAuditOf(store),
+    separation, costPerCorrect, ...(ladder.length ? { ladder } : {}), ...(discrimination ? { discrimination } : {}), ...(Object.keys(knodeTools).length ? { knodeTools } : {}),
+    variance, repeatPairs, judgeUsage: { calls: judgeEvents, weightedTokens: 0, costUsd: 0 }, judgeAudit: judgeAuditOf(store),
     ranAt: ranAtOf(runDir, store.meta()?.work?.pool ?? 'local'),
   };
 }
 
 const SEPARATION_TYPES = new Set<string>(SEPARATION_TASK_TYPES);
+
+/** An agent system: one that answers with an agent session (the ladder's arms, the diagnostics, the llm-wiki agents). */
+function isAgentSystem(system: string): boolean {
+  try {
+    return SYSTEMS[system]?.().kind === 'agent';
+  } catch {
+    return false;
+  }
+}
+
+type Answers = ReturnType<RunStore['allAnswers']>;
+
+/** A first answer's cost on one question, in the ladder's units. */
+function costOf(a: Answers[number]): Record<Exclude<LadderMetric, 'correctness'>, number> {
+  return { tokens: a.usage.weightedTokens, usd: a.usage.costUsd, seconds: a.ms / 1000, toolCalls: a.toolCalls };
+}
+
+/**
+ * The ladder table's rows (docs/design/33 §2, §5): for each declared
+ * difference whose two arms the run answered with, the paired difference over
+ * the questions both were scored on (all packs pooled, a question per pack and
+ * task), for correctness and for cost — weighted tokens, USD at API prices,
+ * latency, tool calls — each with its bootstrap interval, p, minimum
+ * detectable difference, and significance after Holm's correction across the
+ * rows shown, metric by metric.
+ */
+export function ladderOf(answers: Answers, correctness: ReadonlyMap<string, number>): LadderRow[] {
+  const first = new Map<string, Answers[number]>();
+  for (const a of answers) if (!a.repeat && !a.cancelled) first.set(`${a.system}\u0000${a.pack}\u0000${a.taskId}`, a);
+  const answered = new Set([...first.values()].map((a) => a.system));
+  const rows = LADDER_DIFFERENCES.filter((d) => answered.has(d.a) && answered.has(d.b)).map((d) => {
+    const pairs: { a: Record<LadderMetric, number>; b: Record<LadderMetric, number> }[] = [];
+    for (const [k, ra] of first) {
+      const [sys, pack, task] = k.split('\u0000');
+      if (sys !== d.a) continue;
+      const rb = first.get(`${d.b}\u0000${pack}\u0000${task}`);
+      const ca = correctness.get(`${d.a}\u0000${pack}\u0000${task}`);
+      const cb = correctness.get(`${d.b}\u0000${pack}\u0000${task}`);
+      if (!rb || ca === undefined || cb === undefined) continue;
+      pairs.push({ a: { correctness: ca, ...costOf(ra) }, b: { correctness: cb, ...costOf(rb) } });
+    }
+    return { d, pairs };
+  }).filter((r) => r.pairs.length > 0);
+  const cells = rows.map(({ pairs }) => Object.fromEntries(LADDER_METRICS.map((m) => {
+    const xa = pairs.map((p) => p.a[m]);
+    const xb = pairs.map((p) => p.b[m]);
+    const r = pairedBootstrap(xa, xb);
+    return [m, { diff: r.diff, ci: r.ci, p: r.p, mde: minimumDetectableEffect(xa.map((x, i) => x - xb[i])), significant: false, meanA: mean(xa), meanB: mean(xb) }];
+  })) as Record<LadderMetric, LadderCell>);
+  for (const m of LADDER_METRICS) {
+    const sig = holm(cells.map((c) => c[m].p));
+    cells.forEach((c, i) => (c[m].significant = sig[i]));
+  }
+  return rows.map(({ d, pairs }, i) => ({ name: d.name, a: d.a, b: d.b, measures: d.measures, n: pairs.length, metrics: cells[i] }));
+}
+
+/**
+ * Which questions can tell the agents apart (docs/design/33 §0, §5): over the
+ * questions every agent system of the run was scored on, those all of them
+ * got fully right, those none did, and the rest — overall and per task type.
+ * Null with fewer than two agent systems.
+ */
+export function discriminationOf(agents: string[], correctness: ReadonlyMap<string, number>, typeOf: ReadonlyMap<string, string>): Discrimination | null {
+  if (agents.length < 2) return null;
+  const byQuestion = new Map<string, Map<string, number>>();
+  for (const [k, v] of correctness) {
+    const [sys, pack, task] = k.split('\u0000');
+    if (!agents.includes(sys)) continue;
+    const q = `${pack}\u0000${task}`;
+    (byQuestion.get(q) ?? byQuestion.set(q, new Map()).get(q)!).set(sys, v);
+  }
+  const empty = (): DiscriminationCounts => ({ n: 0, allRight: 0, noneRight: 0, rest: 0 });
+  const overall = empty();
+  const byType: Record<string, DiscriminationCounts> = {};
+  for (const [q, vs] of byQuestion) {
+    if (vs.size < agents.length) continue;
+    const right = [...vs.values()].filter((v) => v >= 1).length;
+    const kind = right === agents.length ? 'allRight' : right === 0 ? 'noneRight' : 'rest';
+    for (const c of [overall, (byType[typeOf.get(q) ?? 'untyped'] ??= empty())]) {
+      c.n++;
+      c[kind]++;
+    }
+  }
+  return overall.n ? { systems: [...agents].sort(), overall, byType } : null;
+}
+
+/**
+ * knode's tools as an agent used them (docs/design/33 §2), per pack and every
+ * agent system whose traces call one: calls per tool, and the correctness of
+ * the answers that called it against those that did not. From the bounded
+ * traces on the first answers (50 entries each, so in practice all calls).
+ */
+export function knodeToolsOf(answers: Answers, correctness: ReadonlyMap<string, number>): Record<string, Record<string, KnodeToolRow[]>> {
+  const out: Record<string, Record<string, KnodeToolRow[]>> = {};
+  const groups = new Map<string, Answers>();
+  for (const a of answers) {
+    if (a.repeat || !Array.isArray(a.commands)) continue;
+    const k = `${a.pack}\u0000${a.system}`;
+    (groups.get(k) ?? groups.set(k, []).get(k)!).push(a);
+  }
+  for (const [k, as] of groups) {
+    const [pack, system] = k.split('\u0000');
+    const usesOf = as.map((a) => {
+      const m = new Map<string, number>();
+      for (const c of a.commands!) for (const t of toolsOf(c)) if (t.startsWith('knode_')) m.set(t, (m.get(t) ?? 0) + 1);
+      return m;
+    });
+    const tools = [...new Set(usesOf.flatMap((m) => [...m.keys()]))].sort();
+    if (!tools.length) continue;
+    const scored = (i: number) => correctness.get(`${system}\u0000${pack}\u0000${as[i].taskId}`);
+    const rows = tools.map((tool) => {
+      const used: number[] = [];
+      const unused: number[] = [];
+      let calls = 0;
+      usesOf.forEach((m, i) => {
+        calls += m.get(tool) ?? 0;
+        const c = scored(i);
+        if (c !== undefined) (m.has(tool) ? used : unused).push(c);
+      });
+      return { tool, calls, perAnswer: calls / as.length, used: cell(used), unused: cell(unused) };
+    });
+    rows.sort((x, y) => y.calls - x.calls || x.tool.localeCompare(y.tool));
+    (out[pack] ??= {})[system] = rows;
+  }
+  return out;
+}
 
 /**
  * The separation metrics per pack and system: each over the separation
@@ -682,6 +885,77 @@ function toolTable(tu: Record<string, ToolUse>): string[] {
   return out;
 }
 
+const signed = (x: number, digits: number) => `${x >= 0 ? '+' : ''}${x.toFixed(digits)}`;
+const LADDER_COST: [Exclude<LadderMetric, 'correctness'>, string, number][] = [['tokens', 'weighted tokens', 0], ['usd', 'USD (API prices)', 4], ['seconds', 'latency (s)', 1], ['toolCalls', 'tool calls', 1]];
+
+/**
+ * The ladder (docs/design/33 §2, §5): each declared difference the run has
+ * both arms for, paired over the same questions, for correctness and then for
+ * cost, each with its minimum detectable difference. A tie in correctness at
+ * lower cost is a result.
+ */
+function ladderLines(rows: LadderRow[] | undefined): string[] {
+  if (!rows?.length) return [];
+  const out = ['## The ladder', ''];
+  out.push(`Each row is the later arm minus the earlier (A agent-grep, B agent-rag, C agent-knode-wiki-sources, D agent-knode-full), paired over the questions both were scored on, all packs pooled; first answers only. Intervals are paired bootstrap, 95%; "significant" is after Holm's correction across the ${rows.length} row(s) shown, metric by metric. MDE is the smallest difference this many pairs could detect (α 0.05, power 0.8): a |Δ| below it does not show the arms are the same. Rows whose arms the run does not have are left out (${LADDER_DIFFERENCES.length - rows.length} of ${LADDER_DIFFERENCES.length}).`, '');
+  out.push('### Correctness', '');
+  out.push(mdTable(['difference', 'measures', 'questions', 'later', 'earlier', 'Δ correctness', '95% CI', 'p', 'MDE', 'significant'], rows.map((r) => {
+    const c = r.metrics.correctness;
+    return [`${r.name} (${r.a} − ${r.b})`, r.measures, r.n, c.meanA.toFixed(3), c.meanB.toFixed(3), signed(c.diff, 3), `[${round(c.ci[0], 3)}, ${round(c.ci[1], 3)}]`, round(c.p, 4).toString(), fmtMde(c.mde), c.significant ? 'yes' : 'no'];
+  })), '');
+  out.push('### Cost', '');
+  out.push('Per answer: Δ of the mean (later − earlier), its MDE in parentheses, * where significant after Holm.', '');
+  out.push(mdTable(['difference', 'questions', ...LADDER_COST.map(([, h]) => `Δ ${h}`), ...LADDER_COST.map(([, h]) => `${h}: later / earlier`)], rows.map((r) => [
+    r.name, r.n,
+    ...LADDER_COST.map(([m, , d]) => {
+      const c = r.metrics[m];
+      return `${signed(c.diff, d)} (${Number.isFinite(c.mde) ? c.mde.toFixed(d) : '—'})${c.significant ? ' *' : ''}`;
+    }),
+    ...LADDER_COST.map(([m, , d]) => `${r.metrics[m].meanA.toFixed(d)} / ${r.metrics[m].meanB.toFixed(d)}`),
+  ])), '');
+  return out;
+}
+
+/** The discrimination table: questions every agent got fully right, none did, and the rest, overall and per type. */
+function discriminationLines(d: Discrimination | undefined): string[] {
+  if (!d) return [];
+  const pct = (x: number, n: number) => (n ? `${x} (${((x / n) * 100).toFixed(0)}%)` : '0');
+  const row = (label: string, c: DiscriminationCounts) => [label, c.n, pct(c.allRight, c.n), pct(c.noneRight, c.n), pct(c.rest, c.n)];
+  const types = Object.keys(d.byType).sort((a, b) => Number(SEPARATION_TYPES.has(b)) - Number(SEPARATION_TYPES.has(a)) || a.localeCompare(b));
+  const out = ['## Which questions tell the agents apart', ''];
+  out.push(`Over the questions every agent system of the run was scored on (${d.systems.join(', ')}; first answers, all packs pooled): all of them fully right (correctness 1), none of them fully right, and the rest — the only questions on which they can differ. A family whose questions are mostly in the first two columns cannot show a difference between the arms whatever its size.`, '');
+  out.push(mdTable(['task type', 'questions', 'all fully right', 'none fully right', 'the rest'], [row('**all**', d.overall), ...types.map((t) => row(t, d.byType[t]))]), '');
+  return out;
+}
+
+/** knode's tools per agent that called them: calls, and correctness of the answers that used each against the rest. */
+function knodeToolLines(rows: Record<string, KnodeToolRow[]> | undefined): string[] {
+  if (!rows || !Object.keys(rows).length) return [];
+  const out = ['### knode tools and correctness', ''];
+  out.push('Per agent that called knode\'s tools (arm D, and the MCP-only diagnostic): each tool\'s calls over its traced answers and per traced answer, then the mean correctness of the scored answers that called it at least once against the scored answers that did not. Descriptive: an agent picks a tool for a kind of question, so the two groups differ in their questions too.', '');
+  for (const [system, rs] of Object.entries(rows).sort()) {
+    out.push(mdTable(['system', 'tool', 'calls', 'per answer', 'scored answers using it', 'correctness using it', 'scored answers not using it', 'correctness not using it', 'Δ'], rs.map((r) => [
+      system, r.tool, r.calls, r.perAnswer.toFixed(2), r.used.n, fmt(r.used), r.unused.n, fmt(r.unused),
+      r.used.value !== null && r.unused.value !== null ? signed(r.used.value - r.unused.value, 2) : '—',
+    ])), '');
+  }
+  return out;
+}
+
+/** The per-system answering table, with what a correct answer costs beside correctness. */
+function usageTable(rows: Record<string, Record<string, Cell>>, cpc: NonNullable<ReportData['costPerCorrect']>[string] | undefined): string {
+  const systems = Object.keys(rows).sort();
+  const used = USAGE_METRICS.filter((m) => systems.some((s) => rows[s][m]));
+  if (!used.length) return '';
+  const at = used.indexOf('correctness') + 1;
+  const headers = ['system', ...used.slice(0, at), ...(at ? ['USD / correct', 'tokens / correct'] : []), ...used.slice(at), 'n'];
+  return mdTable(headers, systems.map((s) => {
+    const cells = used.map((m) => fmt(rows[s][m]));
+    const cost = at ? [cpc?.[s]?.usd === null || cpc?.[s]?.usd === undefined ? '—' : cpc[s].usd!.toFixed(4), fmtNum(cpc?.[s]?.tokens)] : [];
+    return [s, ...cells.slice(0, at), ...cost, ...cells.slice(at), String(Math.max(...used.map((m) => rows[s][m]?.n ?? 0)))];
+  }));
+}
+
 /** Where the work was published and who did it, and what was left stuck (docs/design/32). */
 function placementLines(d: ReportData): string[] {
   const work = d.run?.work;
@@ -717,6 +991,8 @@ export function renderReport(d: ReportData): string {
   }
   lines.push(...placementLines(d));
   lines.push('Intervals are Wilson (rates) or bootstrap (means), 95%. Correctness is the judge score scaled to 0–1. "—" means not measured or not applicable (a system that does not cite has no citation score).', '');
+  lines.push(...ladderLines(d.ladder));
+  lines.push(...discriminationLines(d.discrimination));
 
   if (d.pooled.length) {
     lines.push(`## Pooled correctness against ${BASELINE}`, '');
@@ -737,7 +1013,7 @@ export function renderReport(d: ReportData): string {
       lines.push(mdTable(['system', 'Δ correctness', '95% CI', 'p', 'MDE', 'paired tasks', '|Δ| ≥ MDE'], [...pr].sort((a, b) => b.diff - a.diff).map((c) => [c.system, round(c.diff, 3).toFixed(3), `[${round(c.ci[0], 3)}, ${round(c.ci[1], 3)}]`, round(c.p, 4).toString(), fmtMde(c.mde), String(c.n), Number.isFinite(c.mde) && Math.abs(c.diff) >= c.mde ? 'yes' : 'no'])), '');
     }
     const u = d.usage[pack];
-    if (u) lines.push('### Use: answering', '', table(u, USAGE_METRICS), '');
+    if (u) lines.push('### Use: answering', '', 'USD and tokens per correct answer divide all of a system\'s answer cost by its summed correctness (a half-right answer is half an answer).', '', usageTable(u, d.costPerCorrect?.[pack]), '');
     const sep = d.separation?.[pack];
     const cpc = d.costPerCorrect?.[pack];
     if (sep || cpc) lines.push(...separationTable(sep ?? {}, cpc ?? {}));
@@ -775,6 +1051,7 @@ export function renderReport(d: ReportData): string {
     }
     const tu = d.tools[pack];
     if (tu) lines.push(...toolTable(tu));
+    lines.push(...knodeToolLines(d.knodeTools?.[pack]));
     const l = d.lists[pack];
     if (l) lines.push('### Use: corpus-level lists (aggregate, timeline, contradiction, profile)', '', 'Correctness here is set F1 (recall where the gold is a sample), times order accuracy for a timeline; em is a count\'s exact number.', '', table(l, LIST_METRICS), '');
     const eff = d.efficiency[pack];
