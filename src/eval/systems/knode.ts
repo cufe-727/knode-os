@@ -632,7 +632,7 @@ export function agentKnode(): SystemUnderTest {
           ...citationsIn(r.text, docs).map((c) => c.doc),
           ...[...r.text.matchAll(/wiki\/[^\s)\]'"`，。]+\.md/g)].flatMap((m) => toCorpus(s, m[0])),
         ])].map((doc) => ({ doc }));
-        return { text: r.text, citations, toolCalls: r.toolCalls, commands: r.commands, capped: r.capped, leaked: r.leaked, error: r.error };
+        return { text: r.text, citations, toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs, capped: r.capped, leaked: r.leaked, error: r.error };
       } finally {
         tmp.cleanup();
       }
@@ -661,7 +661,7 @@ export function agentKnodeWiki(): SystemUnderTest {
           text: r.text,
           citations: citationsIn(r.text, docs),
           retrieved: [...new Set(viaPages)],
-          toolCalls: r.toolCalls, commands: r.commands,
+          toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs,
           capped: r.capped,
           leaked: r.leaked,
           error: r.error,
@@ -694,7 +694,7 @@ export function agentKnodeWikiSources(): SystemUnderTest {
           text: r.text,
           citations: citationsIn(r.text, docs),
           retrieved: [...new Set(r.filesTouched.flatMap((f) => toCorpus(s, f)))],
-          toolCalls: r.toolCalls, commands: r.commands,
+          toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs,
           capped: r.capped,
           leaked: r.leaked,
           error: r.error,

@@ -278,6 +278,13 @@ export interface Answer {
    * Absent on non-agent systems and on records written before traces were kept.
    */
   commands?: string[];
+  /**
+   * What each entry of `commands` returned, at the same index: the first
+   * 2,000 characters and the full length (src/eval/trace.ts `ToolOutput`),
+   * null where nothing came back. Absent on records written before outputs
+   * were kept (2026-11-15) and on sessions a worker ran without sending them.
+   */
+  outputs?: ({ text: string; chars: number; failed?: boolean } | null)[];
   /** An agent stopped at its step cap. */
   capped?: boolean;
   /** An agent touched a path outside its corpus copy: the answer is void. */

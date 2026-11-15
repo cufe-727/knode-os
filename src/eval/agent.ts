@@ -11,6 +11,7 @@ import { currentRemote } from './placement.js';
 import { PackScope, publishAgent } from './remote.js';
 import { evalTempDir } from './tmp.js';
 import { AGENT_MCP_TOKEN_ENV } from './toolhost.js';
+import { toolOutput, type ToolOutput } from './trace.js';
 
 /**
  * One Codex agent session over a folder (docs/design/23 §3): the grep
@@ -95,6 +96,8 @@ export interface AgentRunResult {
   usage: CallUsage | null;
   /** Command lines the agent ran, in order. */
   commands: string[];
+  /** What each of `commands` returned, entry for entry (null: no output came back — the session stopped first). */
+  outputs: (ToolOutput | null)[];
   toolCalls: number;
   capped: boolean;
   /** Paths outside the folder that lead into benchmark files. */
@@ -200,11 +203,44 @@ export function touchedFiles(command: string, cwd: string): string[] {
 }
 
 interface CodexItem {
+  id?: string;
   type?: string;
   command?: string;
   server?: string;
   tool?: string;
   arguments?: unknown;
+  /** A finished command's stdout and stderr. */
+  aggregated_output?: string;
+  exit_code?: number | null;
+  status?: string;
+  /** A finished MCP call's result or error. */
+  result?: { content?: unknown[]; structured_content?: unknown } | null;
+  error?: { message?: string } | null;
+  /** The output's full length when a worker cut it to its head (worker/knode-worker.mjs). */
+  knode_output_chars?: number;
+}
+
+/** The text an MCP call returned: its text content blocks, else its structured content, else its error. */
+function mcpText(item: CodexItem): { text: string; failed: boolean } {
+  if (item.error?.message) return { text: item.error.message, failed: true };
+  const blocks = Array.isArray(item.result?.content) ? item.result!.content : [];
+  const texts = blocks.map((b) => (b && typeof b === 'object' && typeof (b as { text?: unknown }).text === 'string' ? (b as { text: string }).text : JSON.stringify(b)));
+  const text = texts.length ? texts.join('\n') : item.result?.structured_content !== undefined ? JSON.stringify(item.result.structured_content) : '';
+  return { text, failed: item.status === 'failed' };
+}
+
+/** What a finished command or MCP call returned, as the trace keeps it; null for any other item. */
+export function itemOutput(item: CodexItem): ToolOutput | null {
+  const chars = typeof item.knode_output_chars === 'number' ? item.knode_output_chars : undefined;
+  if (item.type === 'command_execution') {
+    const failed = item.status === 'failed' || (typeof item.exit_code === 'number' && item.exit_code !== 0);
+    return toolOutput(typeof item.aggregated_output === 'string' ? item.aggregated_output : '', { chars, failed });
+  }
+  if (item.type === 'mcp_tool_call') {
+    const r = mcpText(item);
+    return toolOutput(r.text, { chars, failed: r.failed });
+  }
+  return null;
 }
 
 /**
@@ -216,7 +252,12 @@ interface CodexItem {
  */
 export class AgentTrace {
   readonly commands: string[] = [];
+  /** Entry for entry with `commands`: what each returned, once its item completed (docs/design/33 D7). */
+  readonly outputs: (ToolOutput | null)[] = [];
   readonly leaked: string[] = [];
+  /** Started items by Codex's id, and those of each kind still waiting for their output (events without ids). */
+  private readonly byId = new Map<string, number>();
+  private readonly open = new Map<string, number[]>();
   readonly touched = new Set<string>();
   steps = 0;
   capped = false;
@@ -231,22 +272,43 @@ export class AgentTrace {
     } catch {
       return;
     }
-    if (ev.type !== 'item.started' || !ev.item) return;
+    if (!ev.item) return;
+    if (ev.type === 'item.completed') return this.completed(ev.item);
+    if (ev.type !== 'item.started') return;
     const item = ev.item;
     if (item.type === 'command_execution' && typeof item.command === 'string') {
       this.steps++;
+      this.began(item);
       this.commands.push(item.command);
       const command = this.opts.rewrite ? this.opts.rewrite(item.command) : item.command;
       this.leaked.push(...leakedPaths(command, this.opts.cwd, this.opts.allowRoots, this.opts.home));
       for (const f of touchedFiles(command, this.opts.cwd)) this.touched.add(f);
     } else if (item.type === 'mcp_tool_call') {
       this.steps++;
+      this.began(item);
       this.commands.push(`mcp:${item.server ?? ''}.${item.tool ?? ''} ${JSON.stringify(item.arguments ?? {}).slice(0, 300)}`);
     }
     if (this.steps > this.opts.maxSteps && !this.capped) {
       this.capped = true;
       this.opts.onCap?.();
     }
+  }
+
+  private began(item: CodexItem): void {
+    const i = this.commands.length;
+    this.outputs.push(null);
+    if (item.id) this.byId.set(item.id, i);
+    else (this.open.get(item.type!) ?? this.open.set(item.type!, []).get(item.type!)!).push(i);
+  }
+
+  /** A finished item: its output goes beside the entry its start made (by id, else the oldest of its kind still open). */
+  private completed(item: CodexItem): void {
+    const out = itemOutput(item);
+    if (!out) return;
+    let i = item.id !== undefined ? this.byId.get(item.id) : undefined;
+    if (i === undefined) i = this.open.get(item.type!)?.shift();
+    if (i === undefined || this.outputs[i]) return;
+    this.outputs[i] = out;
   }
 }
 
@@ -342,6 +404,7 @@ async function runAgentOnce(opts: AgentRunOptions, api?: { baseUrl: string; apiK
       text,
       usage: events.usage,
       commands: trace.commands,
+      outputs: trace.outputs,
       toolCalls: trace.steps,
       capped: trace.capped,
       leaked: [...new Set(trace.leaked)],

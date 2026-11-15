@@ -31,7 +31,7 @@ export function agentGrep(): SystemUnderTest {
           prompt: `${AGENT_BRIEF('The current directory holds the source documents.')}\n\n${prompt}`,
         });
         recordAgent(env.meter, { system: 'agent-grep', stage: 'agent', task: task.id }, env.models.model, r);
-        return { text: r.text, retrieved: r.filesTouched, toolCalls: r.toolCalls, commands: r.commands, capped: r.capped, leaked: r.leaked, error: r.error };
+        return { text: r.text, retrieved: r.filesTouched, toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs, capped: r.capped, leaked: r.leaked, error: r.error };
       } finally {
         copy.cleanup();
       }

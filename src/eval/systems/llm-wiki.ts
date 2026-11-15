@@ -161,7 +161,7 @@ export function llmWiki(): SystemUnderTest {
           prompt: `${AGENT_BRIEF('The current directory is a wiki compiled from the documents: start from index.md. The source documents themselves are not here; pages cite them as raw/<path> — cite those paths.')}\n\n${prompt}`,
         });
         recordAgent(env.meter, { system: 'agent-wiki', stage: 'agent', task: task.id }, env.models.model, r);
-        return { text: r.text, citations: citationsIn(r.text, new Set(env.staged.docs.map((d) => d.path))), toolCalls: r.toolCalls, commands: r.commands, capped: r.capped, leaked: r.leaked, error: r.error };
+        return { text: r.text, citations: citationsIn(r.text, new Set(env.staged.docs.map((d) => d.path))), toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs, capped: r.capped, leaked: r.leaked, error: r.error };
       } finally {
         copy.cleanup();
       }
@@ -248,7 +248,7 @@ export function llmWikiSources(): SystemUnderTest {
         recordAgent(env.meter, { system: 'agent-wiki-sources', stage: 'agent', task: task.id }, env.models.model, r);
         const docs = new Set(env.staged.docs.map((d) => d.path));
         const opened = r.filesTouched.filter((f) => f.startsWith('raw/')).map((f) => f.slice('raw/'.length)).filter((f) => docs.has(f));
-        return { text: r.text, citations: citationsIn(r.text, docs), retrieved: [...new Set(opened)], toolCalls: r.toolCalls, commands: r.commands, capped: r.capped, leaked: r.leaked, error: r.error };
+        return { text: r.text, citations: citationsIn(r.text, docs), retrieved: [...new Set(opened)], toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs, capped: r.capped, leaked: r.leaked, error: r.error };
       } finally {
         copy.cleanup();
       }

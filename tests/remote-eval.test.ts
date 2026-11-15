@@ -241,6 +241,10 @@ describe('an evaluation run with remote workers', () => {
     expect(answers.filter((a) => a.error)).toEqual([]);
     expect(new Set(answers.map((a) => a.worker))).toEqual(new Set(['local']));
     expect(new Set(answers.map((a) => a.backend))).toEqual(new Set(['codex-cli:gpt-test']));
+    // a session on the run's own slot keeps what its commands returned, as a worker's does
+    const grep = answers.find((a) => a.system === 'agent-grep')!;
+    expect(grep.outputs?.map((o) => o?.chars)).toEqual([grep.outputs![0]!.text.length, expect.any(Number)]);
+    expect(grep.outputs![1]!.text.length).toBe(2000);
     expect(store.meta()!.remote).toEqual({ serve: base, calls: true, judge: true });
     expect(store.allScores().some((s) => s.worker === 'local' && s.backend === 'claude-cli:claude-test')).toBe(true);
     // published to serve and taken there by the run's own slots: one path either way
@@ -277,6 +281,11 @@ describe('an evaluation run with remote workers', () => {
     expect(grep.leaked ?? []).toEqual([]);
     expect(grep.usage.calls).toBe(1);
     expect(answers.find((a) => a.system === 'agent-knode')!.commands).toEqual(['mcp:knode.knode_resolve {"query":"林晓的岗位"}']);
+    // what each command returned, beside it (docs/design/33 D7): the worker sent the long one cut to its head, with its length
+    expect(grep.outputs![0]).toEqual({ text: 'email/2026-03-05.md:3:林晓将入职澜舟科技\n', chars: 'email/2026-03-05.md:3:林晓将入职澜舟科技\n'.length });
+    expect(grep.outputs![1]!.text.length).toBe(2000);
+    expect(grep.outputs![1]!.chars).toBeGreaterThan(5000);
+    expect(answers.find((a) => a.system === 'agent-knode')!.outputs).toEqual([{ text: '{"entities":[{"name":"林晓"}]}', chars: 28 }]);
     // the judge's calls went to the worker's claude slot
     const scored = store.allScores().filter((s) => s.worker);
     expect(scored.length).toBeGreaterThan(0);
