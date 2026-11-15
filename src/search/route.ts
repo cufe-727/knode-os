@@ -36,8 +36,8 @@ export interface QuestionRoute {
 }
 
 const TIMELINE = [
-  /时间线|时间轴|从早到晚|从晚到早|按时间(顺序)?|先后顺序|历次|演变|变迁|历程|沿革/,
-  /\btimeline\b|\bchronolog|\bhistory of\b|\bin (chronological )?order\b|\bover time\b|\bevolv(e|ed|ing)\b|\bhow has .+ changed\b|\bsequence of\b/i,
+  /时间线|时间轴|从早到晚|从晚到早|按时间(顺序)?|先后顺序|历次|演变|变迁|历程|沿革|最早.{0,30}最后|首次.{0,30}(?:最后|最终)/,
+  /\bfirst\b[^?]*\b(?:last|finally)\b[^?]*\b(?:when|which week|who)\b|\bwhen\b[^?]*\bfirst\b[^?]*\b(?:last|finally)\b|\btimeline\b|\bchronolog|\bhistory of\b|\bin (chronological )?order\b|\bover time\b|\bevolv(e|ed|ing)\b|\bhow has .+ changed\b|\bsequence of\b/i,
 ];
 
 const AGGREGATE = [
