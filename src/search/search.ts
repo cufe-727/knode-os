@@ -550,29 +550,38 @@ interface SideSizes {
   generated: number;
 }
 
-const wholeSides = new WeakMap<object, SideSizes & { cap: number; at: number }>();
+/** The most a side is ever counted to: the ceiling of `sideBudget`. */
+const SIDE_COUNT_MAX = 20_000;
+
+const wholeSides = new WeakMap<object, SideSizes & { at: number }>();
 
 /**
  * How many chunks each side of this search can return, counted as far as
  * `cap` + 1: what the search's own conditions leave (`searchable`), so a
  * side its filter empties, or the index holds nothing answerable of, counts
- * none. A search without a filter is the whole index, counted at most once a
- * minute per store; a filtered one is counted for the search (a side past
- * the cap costs 3 to 8 ms on 200,400 chunks, a small one 1 ms).
+ * none. A filtered search is counted for itself, as far as its own cap (a
+ * side past the cap costs 3 to 8 ms on 200,400 chunks, a small one 1 ms).
+ *
+ * A search without a filter counts the whole index, which is the same
+ * whatever the search asks for: it is counted as far as the largest budget
+ * there is and kept a minute per store, for every cap. Kept under the cap it
+ * was made for, it was counted again whenever the budget changed — a search
+ * for 8 and a walk's direct route for 12 have different budgets on a large
+ * index, and take turns.
  */
 async function sideSizes(store: Store, sides: SideSql, cap: number, asOf?: TimeInput, filter: ResolvedScopeFilter = NO_FILTER): Promise<SideSizes> {
   const whole = !toIso(asOf) && isEmptyFilter(filter);
   const hit = whole ? wholeSides.get(store) : undefined;
-  if (hit && hit.cap === cap && Date.now() - hit.at < 60_000) return hit;
+  if (hit && Date.now() - hit.at < 60_000) return hit;
   const p = new Params();
   const cond = searchable('d', p, sides, asOf, filter);
-  const most = p.add(cap + 1);
+  const most = p.add((whole ? SIDE_COUNT_MAX : cap) + 1);
   const side = (generated: boolean) => `(SELECT count(*)::int FROM (
        SELECT 1 FROM documents d JOIN chunks c ON c.document_id = d.id
        WHERE ${cond} AND ${generated ? '' : 'NOT '}${sides.generated('d')} LIMIT ${most}) held)`;
   const [row] = await store.query<SideSizes>(`SELECT ${side(false)} AS sources, ${side(true)} AS generated`, p.list);
   const sizes = { sources: row?.sources ?? 0, generated: row?.generated ?? 0 };
-  if (whole) wholeSides.set(store, { ...sizes, cap, at: Date.now() });
+  if (whole) wholeSides.set(store, { ...sizes, at: Date.now() });
   return sizes;
 }
 

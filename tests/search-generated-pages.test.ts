@@ -189,6 +189,24 @@ describe('generated pages in search results', () => {
     expect(generatedPlaces(8, 1)).toBe(8);
   });
 
+  it('counts the sides of the whole index once, whatever each search asks for', async () => {
+    const counts: string[] = [];
+    const fresh = Object.create(store) as Store;
+    const query = store.query.bind(store);
+    fresh.query = ((sql: string, params?: unknown[]) => {
+      if (/SELECT count\(\*\)::int FROM \(\s*SELECT 1 FROM documents d JOIN chunks c/.test(sql)) counts.push(sql);
+      return query(sql, params);
+    }) as typeof store.query;
+    // a search for 8 asks each channel for 24 and a walk's direct route for 36: on a large index two budgets,
+    // and the count was kept under the budget it was made for (here the budgets are given, the index being small)
+    for (const exactSide of [100, 300, 100, 5000, 300]) await search(fresh, embedder, QUESTION, { k: 8, mode: 'vector', track: false, current: false, exactSide });
+    await search(fresh, embedder, QUESTION, { k: 8, mode: 'sag', track: false, current: false });
+    expect(counts).toHaveLength(1);
+    // a filtered search is counted for itself, each time
+    for (const k of [8, 12]) await search(fresh, embedder, QUESTION, { k, mode: 'vector', track: false, current: false, filter: resolveScopeFilter({ kinds: ['doc'] }) });
+    expect(counts).toHaveLength(3);
+  });
+
   it('gives a side a budget of rows that grows with the root of the index', () => {
     expect(sideBudget(24, 8016)).toBe(2000);
     expect(sideBudget(24, 200_400)).toBe(6203);
