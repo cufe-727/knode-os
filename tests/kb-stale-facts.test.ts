@@ -217,3 +217,13 @@ describe('a rename between a project and a product', () => {
     expect(old.canonical_id).toBe('心宿方案');
   });
 });
+
+describe('the extraction prompt', () => {
+  it('asks for the setting as the subject, the other party as the object, and a decision in effect as a fact', async () => {
+    const { buildExtractRequest } = await import('../src/graph/llm-extract.js');
+    const system = String(buildExtractRequest({ path: 'a.md', title: 'a' }, '平台组周报', {}).messages[0].content);
+    expect(system).toContain('not the team or document that reports it');
+    expect(system).toContain('the customer who escalated it');
+    expect(system).toContain('决定改回原来的30天');
+  });
+});
