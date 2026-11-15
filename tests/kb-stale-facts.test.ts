@@ -106,3 +106,34 @@ describe('a title several incidents carry', () => {
     expect(row.subject_id).toBe('inc-005-t3');
   });
 });
+
+describe('a setting named by its code alone', () => {
+  it('joins the entity a coded split labelled with that code', async () => {
+    const { splitEntities } = await import('../src/graph/entity-context.js');
+    const { slugify } = await import('../src/graph/store.js');
+    const parted = '日志保留天数（七部平台组 · D7T1-C2）';
+    const ctx = await workspace('coded', {
+      // the code alone, applied before the report that introduces it
+      'raw/docs/a0.md': `---\ntitle: 七部平台组周报\nentities:\n  - { name: D7T1-C2, type: other }\nclaims:\n  - { subject: D7T1-C2, statement: D7T1-C2调整为45天, type: other }\n---\nD7T1-C2调整为45天\n`,
+      'raw/docs/c1.md': `---\ntitle: 七部平台组周报\nentities:\n  - { name: ${parted}, type: other, aliases: ["保留期"] }\nclaims:\n  - { subject: ${parted}, statement: 日志保留天数定为30天, type: other }\n---\n日志保留天数（D7T1-C2）定为30天\n`,
+    });
+    // what a coded split leaves on record: the parted entity and its rule
+    const id = slugify(parted);
+    expect((await ctx.store.query(`SELECT id FROM entities WHERE id = $1 AND tx_to IS NULL`, [id])).length).toBe(1);
+    await ctx.store.query(
+      `INSERT INTO entity_namesakes (id, base_id, name, label, anchors, base_anchors, documents, reason)
+       VALUES ($1, '日志保留天数', '日志保留天数', 'D7T1-C2', '["七部平台组"]'::jsonb, '[]'::jsonb, '["raw/docs/c1.md"]'::jsonb, 'test')`, [id],
+    );
+    // the merge is the coded split's companion: a workspace that turned the split on
+    ctx.config.review.identity = 'context';
+    await splitEntities(ctx.store, { config: ctx.config });
+    const [code] = await ctx.store.query<{ canonical_id: string | null }>(`SELECT canonical_id FROM entities WHERE id = 'd7t1-c2'`);
+    expect(code.canonical_id).toBe(id);
+    // undone by a person, it is not made again
+    const { unmergeEntity } = await import('../src/graph/merge.js');
+    await unmergeEntity(ctx.store, 'd7t1-c2');
+    await splitEntities(ctx.store, { config: ctx.config });
+    const [after] = await ctx.store.query<{ canonical_id: string | null }>(`SELECT canonical_id FROM entities WHERE id = 'd7t1-c2'`);
+    expect(after.canonical_id).toBeNull();
+  });
+});
