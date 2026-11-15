@@ -117,6 +117,18 @@ describe('weekly reports v3: the corpus', () => {
     expect(co.filter((t) => /事业部|division/i.test(t.question))).toEqual([]);
   });
 
+  it('draws a hundred divisions with every customer, project and person id its own', () => {
+    for (const lang of ['zh', 'en'] as const) {
+      const w = makeV3World(lang, 0, 100);
+      const customers = w.divisions.flatMap((s) => s.customers.map((c) => c.name));
+      expect(new Set(customers).size).toBe(customers.length);
+      const projects = w.divisions.flatMap((s) => s.projects.flatMap((p) => [p.name, ...(p.rename ? [p.rename.to] : [])]));
+      expect(new Set(projects).size).toBe(projects.length);
+      const teams = w.divisions.flatMap((s) => s.teams.map((t) => t.name));
+      expect(teams.filter((t) => teams.some((u) => u !== t && u.includes(t)))).toEqual([]);
+    }
+  });
+
   it('builds the same pack from the same seed', async () => {
     const again = await build('zh-again', 'synthetic-reports-zh', { version: 3 });
     for (const f of ['corpus.jsonl', 'tasks/usage.jsonl', 'tasks/update.jsonl', 'gold/aliases.jsonl']) expect(fileHash(again, f)).toBe(fileHash(packs.zh, f));

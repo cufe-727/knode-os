@@ -58,6 +58,12 @@ export function goldKey(t: Task): string {
   return JSON.stringify([t.scoring, t.answer ?? null, [...(t.answers ?? [])].sort(), (t.items ?? []).map((i) => i.label).sort(), t.choices ?? null]);
 }
 
+/** A line holds an answer form: a number only as a whole number ("20" is not in "R-2032"). */
+function holdsForm(line: string, form: string): boolean {
+  if (!/^\d+(?:\.\d+)?$/.test(form)) return line.includes(form);
+  return new RegExp(`(?<![\\w.-])${form.replace('.', '\\.')}(?![\\w.])`).test(line);
+}
+
 /** The forms an answer gives its gold in: the answer, its variants, set items' labels. */
 function answerForms(t: Task): string[] {
   return [t.answer ?? '', ...(t.answers ?? [])].map((x) => x.trim()).filter((x) => x.length >= 2);
@@ -248,7 +254,7 @@ export function lintPack(pack: LoadedPack): LintResult {
     let hit: { tok: string; doc: string } | undefined;
     for (const tok of rareToks) {
       for (const i of corpus.df.get(tok)!.docs) {
-        const l = linesOf(i).find((x) => lexicalTokens(langOf(t, pack), x).has(tok) && forms.some((f) => x.includes(f)));
+        const l = linesOf(i).find((x) => lexicalTokens(langOf(t, pack), x).has(tok) && forms.some((f) => holdsForm(x, f)));
         if (l) {
           hit = { tok, doc: corpus.paths[i] };
           break;

@@ -164,8 +164,9 @@ const PROJECT_POOL: Record<Lang, { head: string[]; tail: string[] }> = {
 };
 
 /** Customers: a brand and an industry. Industries are described without their words (the hops' anchors). */
-const CUSTOMER_POOL: Record<Lang, { a: string[]; b: string[]; near: Record<string, string>; industry: string[]; industryDesc: string[] }> = {
+const CUSTOMER_POOL: Record<Lang, { a: string[]; b: string[]; c: string[]; near: Record<string, string>; industry: string[]; industryDesc: string[] }> = {
   zh: {
+    c: ['安', '达', '通', '利', '康', '宁', '丰', '德', '兴', '隆', '昌', '茂', '嘉', '祥', '瑞', '欣', '恒', '远', '宏', '广'],
     a: ['华', '青', '星', '易', '恒', '远', '云', '北', '海', '启', '东', '南', '金', '白', '嘉', '万', '瑞', '安', '博', '永'],
     b: ['鼎', '禾', '联', '信', '景', '杉', '辰', '岳', '航', '帆', '泰', '澜', '源', '盛', '明', '和', '川', '峰', '晟', '程'],
     near: { 鼎: '顶', 禾: '河', 联: '连', 信: '新', 景: '境', 杉: '珊', 辰: '晨', 岳: '悦', 航: '杭', 帆: '凡', 泰: '太', 澜: '岚', 源: '元', 盛: '胜', 明: '鸣', 和: '合', 川: '穿', 峰: '锋', 晟: '胜', 程: '诚' },
@@ -173,6 +174,7 @@ const CUSTOMER_POOL: Record<Lang, { a: string[]; b: string[]; near: Record<strin
     industryDesc: ['开连锁超市的', '办培训班的', '送快递的', '做网约车的', '卖保单的', '放贷款的', '卖药的', '拍短视频的'],
   },
   en: {
+    c: ['dale', 'crest', 'more', 'ford', 'wick', 'stead', 'ton', 'by', 'ley', 'worth', 'mere', 'shaw', 'holm', 'combe', 'garth', 'thorpe', 'well', 'side', 'land', 'moor'],
     a: ['Bright', 'Green', 'Stellar', 'Swift', 'Harbor', 'Vista', 'Cedar', 'Polar', 'Summit', 'Voyage', 'Hearth', 'Breeze', 'Granite', 'Maple', 'River', 'Silver', 'Golden', 'North', 'Ocean', 'Meadow'],
     b: ['mart', 'field', 'line', 'way', 'point', 'crest', 'wood', 'stone', 'light', 'view', 'port', 'ridge', 'haven', 'brook', 'vale', 'hill', 'works', 'bay', 'gate', 'star'],
     near: { mart: 'mark', field: 'feld', line: 'lyne', way: 'wey', point: 'pointe', crest: 'crist', wood: 'wode', stone: 'ston', light: 'lite', view: 'vue', port: 'porte', ridge: 'rigde', haven: 'havn', brook: 'brooke', vale: 'vail', hill: 'hyll', works: 'werks', bay: 'baye', gate: 'gait', star: 'starr' },
@@ -216,7 +218,7 @@ export const CAUSES: Record<Lang, string[][]> = {
 export const RISKS: Record<Lang, string[][]> = {
   zh: [
     ['核心依赖年底停止维护', '底层组件明年不再有补丁', '所用框架即将停更'],
-    ['关键岗位只有一人', '某个模块仅一位工程师熟悉', '人员单点，请假即停摆'],
+    ['关键岗位只有一人', '某个模块仅一位工程师熟悉', '人员单点，请假就无人接得住'],
     ['供应商合同到期', '外包协议快要失效', '采购的服务年中续约未定'],
     ['压测环境不足', '没有地方做性能演练', '缺少仿真流量的机器'],
   ],
@@ -323,9 +325,10 @@ function buildDivision(lang: Lang, r: () => number, d: number, pools: Pools): V3
   const C = CUSTOMER_POOL[lang];
   const customers: V3Customer[] = [];
   const { usedCustomers } = pools;
+  // two-part brands while they last (400 of them, enough for the first fifty divisions); a third part after that
   const brand = () => {
-    for (;;) {
-      const a = pick(C.a);
+    for (let i = 0; ; i++) {
+      const a = i < 200 ? pick(C.a) : `${pick(C.a)}${pick(C.c)}`;
       const b = pick(C.b);
       if (!usedCustomers.has(`${a}${b}`) && !usedCustomers.has(`${a}${C.near[b]}`)) {
         usedCustomers.add(`${a}${b}`);
