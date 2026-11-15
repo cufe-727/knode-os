@@ -137,3 +137,19 @@ describe('a setting named by its code alone', () => {
     expect(after.canonical_id).toBeNull();
   });
 });
+
+describe('a rename between a project and a product', () => {
+  it('merges the old name into the new when the extraction typed the two differently', async () => {
+    const { renameTypes, resolveEntityContext } = await import('../src/graph/entity-context.js');
+    expect(renameTypes('project', 'product')).toBe(true);
+    expect(renameTypes('organization', 'product')).toBe(false);
+    const ctx = await workspace('rename-types', {
+      'raw/docs/a.md': `---\ntitle: 五部平台组周报\nentities:\n  - { name: 箕宿系统, type: product }\n  - { name: 心宿方案, type: project }\nclaims:\n  - { subject: 箕宿系统, object: 心宿方案, statement: 箕宿系统自本周起更名为心宿方案, type: event }\n---\n心宿方案完成度72%（箕宿系统自本周起更名为心宿方案）\n`,
+      'raw/docs/b.md': `---\ntitle: 五部平台组周报\nentities:\n  - { name: 箕宿系统, type: product }\nclaims:\n  - { subject: 箕宿系统, statement: 箕宿系统完成度为65%, type: other }\n---\n箕宿系统完成度65%\n`,
+    });
+    const stats = await resolveEntityContext(ctx.store, { config: ctx.config, splits: false });
+    expect(stats.merged).toBe(1);
+    const [old] = await ctx.store.query<{ canonical_id: string | null }>(`SELECT canonical_id FROM entities WHERE id = '箕宿系统'`);
+    expect(old.canonical_id).toBe('心宿方案');
+  });
+});

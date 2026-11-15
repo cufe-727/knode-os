@@ -303,6 +303,18 @@ async function ownNamed(q: Queryable, names: string[]): Promise<(spelling: strin
   };
 }
 
+/**
+ * Types a renamed thing may carry under its two names: the same, or a project
+ * and a product — an extraction types "箕宿系统" a product and the "心宿方案" it
+ * became a project (1 of 25 stated renames on the 10× benchmark stayed two
+ * entities for that alone).
+ */
+export function renameTypes(a: string, b: string): boolean {
+  if (a === b) return true;
+  const pair = new Set([a, b]);
+  return pair.has('project') && pair.has('product');
+}
+
 /** The stop lists a rename's names are held against: `stop` with the corpus-frequent terms, `linkStop` the generic words alone (tier0Known). */
 export interface RenameStops {
   stop: ReadonlySet<string>;
@@ -325,7 +337,7 @@ export async function renameMergeFor(q: Queryable, claim: RenameClaim, stops: Re
   const first = (list: string[]) => list.map(named).find((found) => found.length > 0) ?? [];
   const olds = first(rename.old).filter((e) => !generic(e, stops.stop));
   const news = first(rename.renamed).filter((e) => !generic(e, stops.linkStop));
-  const pairs = olds.flatMap((from) => news.filter((to) => to.id !== from.id && to.type === from.type).map((to) => ({ from, to })));
+  const pairs = olds.flatMap((from) => news.filter((to) => to.id !== from.id && renameTypes(from.type, to.type)).map((to) => ({ from, to })));
   if (pairs.length !== 1) return null;
   const [{ from, to }] = pairs;
   const filedUnder = [claim.subject, claim.object];
