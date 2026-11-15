@@ -63,8 +63,18 @@ The other recipes were checked for the same bug:
 - **Native scale.** `size` sets the number of divisions. Each division is the whole 1× structure, generated from the
   same script code: three teams, twins, renames, transfers, PMO summaries and settings. Names are unique
   company-wide: more surnames, then three-character or initialled names. Project names for later divisions come
-  from a pool in which no name contains another. At `size > 1`, questions name their division ("（第二事业部）…").
+  from a pool in which no name contains another. At `size > 1`, questions say which division they ask about in the
+  words the weekly reports name teams with (pack version 3, 2026‑11‑14): by a team they name ("二部平台组…"), else
+  by the division's scope in front ("（二部）…", "二部的三个组"; "一部" for the first division, whose teams carry no
+  prefix; in English the three team names, "(Platform 2, Payments 2 and Growth 2) …"). Version 2 opened every
+  question with the PMO's name for the division ("（第二事业部）…"), which is in the monthly summaries and in no
+  weekly report: a keyword search then ranked the summaries first (the harness's BM25 over the 1,409 usage
+  questions of the 10× pack: hit@5 0.02, and 0.45 with the scope; the top five all summaries for 89% of them, and 18%).
   Task ids of division *d* > 1 are prefixed `d<d>-`. The pack id gains `-x<size>`.
+- **Deep hops are sampled by chain.** Each deep hop names its chain in `meta.stratum` (`h4`, `h5`, `h5r`), and a
+  limited run takes a type's tasks in proportion to their strata (`selectTasks`). Before, primaries went first and
+  the four-hop chains have none: the 10× run at a limit of 300 took 8 `h5`, 10 `h5r` and no `h4`, the unlimited 1×
+  run 2, 2 and 3.
 - **Padding** (`scale`, `padTeams`) is unchanged. Padding teams still name nothing a closed-world task lists.
   Padding reports now use the new phrasings.
 
