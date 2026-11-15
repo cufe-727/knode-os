@@ -400,8 +400,14 @@ export class WorkspaceContextRegistry {
     // a workspace's config is a copy of the root's: a plugin it names by a
     // relative path lives beside the root config, not in every workspace
     const ctx = await createContext(dataDir, { pluginRoots: [this.rootDataDir] });
-    // which way this workspace's vector searches are answered, once, where an operator reads it
-    void describeVectorScan(ctx.store).then((line) => this.log(`[${path.relative(this.rootDataDir, dataDir) || '.'}] ${line}`)).catch(() => {});
+    // Which way this workspace's vector searches are answered, once, where an operator reads it. Waited
+    // for: asked without waiting, the query was still on its way when a workspace opened and closed at
+    // once was closing, and the close never finished (tests/pglite-open-guard.test.ts hung on it).
+    try {
+      this.log(`[${path.relative(this.rootDataDir, dataDir) || '.'}] ${await describeVectorScan(ctx.store)}`);
+    } catch {
+      // the line is for the log: an open does not fail for it
+    }
     const cleanup = await this.options.onCreate?.(ctx, scope);
     if (cleanup) this.cleanups.set(dataDir, cleanup);
     return ctx;
