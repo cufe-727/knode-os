@@ -94,6 +94,21 @@ describe('a series of one attribute', () => {
     expect(marks.get('w3')).toBeNull();
   });
 
+  it('lets a claim whose window covers the next reading be replaced by the first reading after its window', () => {
+    const marks = seriesSupersession([
+      // a weekly reading (Monday to Saturday) and a recap dated inside its week
+      row('w20', '2025-05-12', 29, { valid_to: '2025-05-17T23:59:59.999Z' }),
+      row('recap', '2025-05-16', 31, { valid_to: '2025-05-21T23:59:59.999Z' }),
+      row('w21', '2025-05-19', 33, { valid_to: '2025-05-24T23:59:59.999Z' }),
+      row('w30', '2025-07-21', 60, { valid_to: '2025-07-26T23:59:59.999Z' }),
+    ]);
+    // the recap does not replace the reading whose week it falls in; the next week's does
+    expect(marks.get('w20')).toBe('w21');
+    expect(marks.get('recap')).toBe('w30');
+    expect(marks.get('w21')).toBe('w30');
+    expect(marks.get('w30')).toBeNull();
+  });
+
   it('settles pairs of one series without a model: other days are history, one day and one value are one claim', () => {
     const base = { subject: 's', object: null, kind: 'fact', attribute: '进度', unit: '%', value_text: null };
     expect(seriesRelation({ ...base, value_num: 40, eff: '2025-03-03' }, { ...base, value_num: 50, eff: '2025-03-10' })).toBe('different_time');

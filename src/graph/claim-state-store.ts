@@ -145,8 +145,8 @@ export interface StateRow {
 /**
  * Which claim supersedes which within one (subject, attribute, object, kind)
  * series, oldest effective date first: each claim by the claims of the next
- * later day (the first of them), unless its own stated window still covers
- * that day; claims of one day with different values supersede none of each
+ * later day (the first of them) — or, when its own stated window still
+ * covers that day, by the first claim after its window; claims of one day with different values supersede none of each
  * other (a disagreement stays visible). A correction supersedes the newest
  * claim up to its date whose value differs from its own — the report it
  * corrects — whatever the order says. Exported for tests.
@@ -159,10 +159,15 @@ export function seriesSupersession(series: StateRow[]): Map<string, string | nul
     const older = sorted[i];
     const d = day(older);
     if (!d) continue;
-    const next = sorted.slice(i + 1).find((r) => day(r) > d);
-    if (!next) continue;
+    // a claim whose stated window still covers a later reading stands beside it; the first
+    // reading after its window replaces it. It used to look at the next reading only and,
+    // when the window covered that one, at none: a weekly reading (window to the Saturday)
+    // with a recap dated inside its week ("一个月前…" read as a day of that week) stayed
+    // current for ever (61 of 164 series with several current values on the 10× benchmark).
     const to = toDateString(older.valid_to);
-    if (to && to >= day(next)) continue;
+    const after = to && to > d ? to : d;
+    const next = sorted.slice(i + 1).find((r) => day(r) > after);
+    if (!next) continue;
     out.set(older.id, next.id);
   }
   for (const c of sorted.filter((r) => r.correction)) {
