@@ -724,3 +724,102 @@ describe('what a weekly reading is (review of 4ec34fd)', () => {
     expect(monthsApart(c('Atlas计划于6月上线'), c('Atlas上线推迟至8月'))).toBe(false);
   });
 });
+
+describe('carrying decisions (review of 4ec34fd)', () => {
+  const opened: AppContext[] = [];
+  afterAll(async () => {
+    for (const ctx of opened) {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+  const s9991 = '平台组本周服务可用性为99.91%。';
+  const s9992 = '平台组本周服务可用性为99.92%。';
+  const s9993 = '平台组本周服务可用性为99.93%。';
+  const release = '平台组本周发布2次。';
+  const goodRelease = '平台组发布情况良好。';
+  const goodDuty = '平台组值班安排正常。';
+  const weekOf = (k: number) => isoWeekOf(monday(k));
+  const id = (s: string, k?: number) => claimId('平台组', s, k === undefined ? undefined : weekOf(k));
+  const canon = async (ctx: AppContext, c: string) => (await ctx.store.query<{ canonical_id: string | null }>(`SELECT canonical_id FROM claims WHERE id = $1`, [c]))[0]?.canonical_id;
+
+  async function legacy(name: string): Promise<AppContext> {
+    const ctx = await build(name, (k) => [
+      ...(k === 0 || k === 2 ? [{ subject: '平台组', statement: release, type: 'other', status: 'fact', kind: 'fact', attribute: '发布次数', value: 2, startDate: monday(k), endDate: friday(k) }] : []),
+      // two claims with no figure in week 3's report: not readings, they keep their ids
+      ...(k === 2 ? [goodRelease, goodDuty].map((statement) => ({ subject: '平台组', statement, type: 'other', status: 'fact', kind: 'fact', startDate: monday(k), endDate: friday(k) })) : []),
+    ]);
+    opened.push(ctx);
+    for (const c of await ctx.store.query<{ id: string; subject_id: string; statement: string }>(`SELECT id, subject_id, statement FROM claims`)) {
+      const old = claimId(c.subject_id, c.statement);
+      if (old === c.id) continue;
+      await ctx.store.query(
+        `INSERT INTO claims (id, subject_id, object_id, type, statement, status, kind, valid_from, valid_to, tx_from)
+         SELECT $2, subject_id, object_id, type, statement, status, kind, valid_from, valid_to, tx_from FROM claims WHERE id = $1 ON CONFLICT (id) DO NOTHING`,
+        [c.id, old],
+      );
+      await ctx.store.query(`UPDATE evidence SET target_id = $2 WHERE kind = 'claim' AND target_id = $1`, [c.id, old]);
+      await ctx.store.query(`DELETE FROM claims WHERE id = $1`, [c.id]);
+    }
+    await recountAll(ctx.store, new Date().toISOString(), foldOptions(ctx.dataDir));
+    await ctx.store.query(`DELETE FROM meta WHERE key = 'claim_identity'`);
+    return ctx;
+  }
+  const refuse = (ctx: AppContext, a: string, b: string) => ctx.store.query(
+    `INSERT INTO suggestions (id, kind, title, body, status, payload) VALUES ($1, 'claim-merge', '合并', '', 'rejected', $2::jsonb)`,
+    [claimPairId(a, b), JSON.stringify({ claimId: a, canonicalId: b, kind: 'same_as' })],
+  );
+  const judge = (ctx: AppContext, a: string, b: string, relation: string) => ctx.store.query(
+    `INSERT INTO claim_pair_verdicts (pair_id, a_id, b_id, relation, confidence, reason, model) VALUES ($1, $2, $3, $4, 0.9, '测试', 'judge')`,
+    [claimPairId(a, b), a, b, relation],
+  );
+  const status = async (ctx: AppContext, a: string, b: string) => (await ctx.store.query<{ status: string }>(`SELECT status FROM suggestions WHERE id = $1`, [claimPairId(a, b)]))[0]?.status;
+  const verdict = async (ctx: AppContext, a: string, b: string) => (await ctx.store.query<{ relation: string }>(`SELECT relation FROM claim_pair_verdicts WHERE pair_id = $1`, [claimPairId(a, b)]))[0]?.relation;
+  const untilDone = async (ctx: AppContext) => { for (;;) if ((await rekeyWeeklyReadings(ctx.store, { limit: 100 })).done) return; };
+
+  it('1: a refusal and a verdict between two claims that both move land on the claims they became', async () => {
+    const ctx = await legacy('both-move');
+    await refuse(ctx, id(s9991), id(s9993));
+    await judge(ctx, id(s9991), id(s9993), 'unrelated');
+    // and one claim that splits against one that moves whole
+    await refuse(ctx, id(s9992), id(s9993));
+    await untilDone(ctx);
+    expect(await status(ctx, id(s9991, 1), id(s9993, 3))).toBe('rejected');
+    expect(await verdict(ctx, id(s9991, 1), id(s9993, 3))).toBe('unrelated');
+    expect(await status(ctx, id(s9992, 0), id(s9993, 3))).toBe('rejected');
+    expect(await status(ctx, id(s9992, 2), id(s9993, 3))).toBe('rejected');
+  });
+
+  it('4: a carry cut short between undoing and redoing a link redoes the link', async () => {
+    const ctx = await legacy('relink-crash');
+    await applyClaimMerge(ctx.store, { claimId: id(s9991), canonicalId: id(s9993), reason: '同一件事', actor: 'user' });
+    await rekeyWeeklyReadings(ctx.store, { limit: 100, carry: false });
+    await expect(drainCarry(ctx.store, { interruptAfterUnlink: true })).rejects.toThrow(/interrupted/);
+    await drainCarry(ctx.store);
+    expect(await canon(ctx, id(s9991, 1))).toBe(id(s9993, 3));
+  });
+
+  it('5: a person\'s merge with a claim that split stays on the week the other claim\'s dates fall in, and lists the rest once', async () => {
+    const ctx = await legacy('accepted-split');
+    // the release figure (weeks 1 and 3) into a week-3 claim; a week-3 claim into the 99.92% figure (weeks 1 and 3)
+    await applyClaimMerge(ctx.store, { claimId: id(release), canonicalId: id(goodRelease), reason: '同一件事', actor: 'user' });
+    await applyClaimMerge(ctx.store, { claimId: id(goodDuty), canonicalId: id(s9992), reason: '同一件事', actor: 'user' });
+    const lines: string[] = [];
+    let listed = 0;
+    for (;;) {
+      const st = await rekeyWeeklyReadings(ctx.store, { limit: 100, onProgress: (m) => lines.push(m) });
+      listed += st.listed;
+      if (st.done) break;
+    }
+    expect(await canon(ctx, id(release, 2))).toBe(id(goodRelease));
+    expect(await canon(ctx, id(release, 0))).toBeNull();
+    expect(await canon(ctx, id(goodDuty))).toBe(id(s9992, 2));
+    // the release figure's week 1 is listed once, as from a person's accepted merge
+    expect(listed).toBe(1);
+    const [s] = await ctx.store.query<{ status: string; payload: { carriedFrom?: { accepted: boolean } } }>(`SELECT status, payload FROM suggestions WHERE id = $1`, [claimPairId(id(release, 0), id(goodRelease))]);
+    expect(s).toMatchObject({ status: 'pending', payload: { carriedFrom: { accepted: true } } });
+    expect(lines.filter((l) => l.includes('accepted merge'))).toHaveLength(1);
+  });
+
+
+});

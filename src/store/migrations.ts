@@ -981,6 +981,8 @@ CREATE TABLE IF NOT EXISTS claim_rekey_moves (
   week     TEXT,
   whole    BOOLEAN NOT NULL,
   carried  BOOLEAN NOT NULL DEFAULT false,
+  -- the links to undo and redo, written with the carried rows, so a carry cut short redoes them
+  plan     JSONB,
   moved_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (old_id, new_id)
 );

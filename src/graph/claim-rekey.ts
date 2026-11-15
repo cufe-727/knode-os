@@ -7,7 +7,7 @@ import { Store } from '../store/db.js';
 import { Queryable } from '../store/migrations.js';
 import { claimPairId } from './claim-dedupe.js';
 import { applyClaimMerge, unmergeClaim } from './claim-merge.js';
-import { claimId, readingWeek, speaksOfAWeek, WEEK_WORD_HINTS } from './store.js';
+import { claimId, isoWeekOf, readingWeek, speaksOfAWeek, WEEK_WORD_HINTS } from './store.js';
 
 /**
  * The move of a workspace's claims to weekly-reading identity (claimId's
@@ -184,23 +184,51 @@ async function moveClaim(store: Store, id: string): Promise<Moved | 'unmoved' | 
   });
 }
 
-interface MoveRow { old_id: string; new_id: string; week: string | null; whole: boolean }
+interface MoveRow { old_id: string; new_id: string; week: string | null; whole: boolean; plan: CarryPlan | null }
 
-/** What a claim of a moved old claim is now: its successors with their weeks, and itself while it lives. */
-async function successorsOf(q: Queryable, id: string): Promise<{ id: string; week: string | null }[]> {
-  const moved = await q.query<{ new_id: string; week: string | null }>(`SELECT new_id, week FROM claim_rekey_moves WHERE old_id = $1`, [id]);
+/** The links a carry undoes and redoes, kept on the moves so a carry cut short redoes them. */
+interface CarryPlan {
+  unlink: string[];
+  relinks: { claimId: string; canonicalId: string; actor: string; reason: string; kind: string; confidence: number | null }[];
+  listed: number;
+}
+
+/**
+ * What a claim is now: the claims it moved to with their weeks (`single` when
+ * it moved whole to one), itself while it lives and never moved, nothing when
+ * it is gone.
+ */
+async function currentOf(q: Queryable, id: string): Promise<{ claims: { id: string; week: string | null }[]; single: boolean }> {
+  const moved = await q.query<{ new_id: string; week: string | null; whole: boolean }>(`SELECT new_id, week, whole FROM claim_rekey_moves WHERE old_id = $1`, [id]);
   const [self] = await q.query<{ tx_to: string | null }>(`SELECT tx_to FROM claims WHERE id = $1`, [id]);
-  const out = moved.map((m) => ({ id: m.new_id, week: m.week }));
-  if (self && !self.tx_to) out.push({ id, week: null });
+  const alive = Boolean(self && !self.tx_to);
+  const claims = moved.map((m) => ({ id: m.new_id, week: m.week }));
+  if (alive) claims.push({ id, week: null });
+  return { claims, single: claims.length === 1 && (moved.length === 0 || (moved[0].whole && !alive)) };
+}
+
+/** The ISO weeks a claim's own dates cover (its window, else its event or document date), at most 60. */
+async function weeksOfClaim(q: Queryable, id: string): Promise<Set<string>> {
+  const [c] = await q.query<{ valid_from: Date | string | null; valid_to: Date | string | null; event_at: Date | string | null; observed_at: Date | string | null }>(
+    `SELECT valid_from, valid_to, event_at, observed_at FROM claims WHERE id = $1`, [id],
+  );
+  const out = new Set<string>();
+  if (!c) return out;
+  const t = (v: Date | string | null) => (v === null ? null : new Date(v).getTime());
+  const from = t(c.valid_from) ?? t(c.event_at) ?? t(c.observed_at);
+  if (from === null) return out;
+  const to = c.valid_from !== null ? t(c.valid_to) ?? from : from;
+  for (let d = from, n = 0; d <= to && n < 60; d += 7 * 86_400_000, n++) out.add(isoWeekOf(d));
+  out.add(isoWeekOf(to));
   return out;
 }
 
 type SuggestionRow = { id: string; kind: string; title: string; body: string; evidence: unknown; status: string; payload: Record<string, unknown> };
 
-/** Copy a suggestion naming `from` for `to`, status and all; the copy's id follows its pair, as the audit keys it. */
-async function copySuggestion(q: Queryable, s: SuggestionRow, from: string, to: string): Promise<void> {
+/** Copy a suggestion with its claims renamed (`rename`), status and all; the copy's id follows its pair, as the audit keys it. */
+async function copySuggestion(q: Queryable, s: SuggestionRow, rename: Map<string, string>): Promise<void> {
   const p = { ...s.payload };
-  for (const k of ['claimId', 'canonicalId', 'a', 'b']) if (p[k] === from) p[k] = to;
+  for (const k of ['claimId', 'canonicalId', 'a', 'b']) if (typeof p[k] === 'string' && rename.has(p[k] as string)) p[k] = rename.get(p[k] as string);
   const conflict = p.kind === 'claim-conflict';
   const [x, y] = conflict ? [String(p.a), String(p.b)] : [String(p.claimId), String(p.canonicalId)];
   if (x === y) return;
@@ -212,24 +240,36 @@ async function copySuggestion(q: Queryable, s: SuggestionRow, from: string, to: 
   );
   await q.query(
     `INSERT INTO deps (artifact_kind, artifact_id, input_kind, input_id, required)
-     SELECT artifact_kind, $2, input_kind, CASE WHEN input_kind = 'claim' AND input_id = $3 THEN $4 ELSE input_id END, required
-     FROM deps WHERE artifact_kind = 'suggestion' AND artifact_id = $1 ON CONFLICT DO NOTHING`,
-    [s.id, id, from, to],
+     SELECT d.artifact_kind, $2, d.input_kind, COALESCE(r.new_id, d.input_id), d.required
+     FROM deps d LEFT JOIN unnest($3::text[], $4::text[]) AS r(old_id, new_id) ON d.input_kind = 'claim' AND d.input_id = r.old_id
+     WHERE d.artifact_kind = 'suggestion' AND d.artifact_id = $1 ON CONFLICT DO NOTHING`,
+    [s.id, id, [...rename.keys()], [...rename.values()]],
   );
 }
 
 /**
  * Carry over what was decided about the old claims whose moves are not
- * carried yet: in batches, through the indexes migration 21 adds, each piece
- * idempotent, so a drain cut short does it again.
+ * carried yet, in batches through the indexes migration 21 adds.
+ *
+ * A pair names two claims, and both may have moved: each side is read as
+ * what it is now (currentOf). Between two claims that each became one claim,
+ * everything is carried; where either split, what holds for every week (a
+ * person's refusal, the judge's unrelated / different_time) is carried to
+ * every pair of their claims. The rows and the plan for the links are
+ * written in one transaction; the links, scopes of their own, are then undone
+ * and redone from the plan, each step a no-op once done, and only then are
+ * the moves marked carried — a carry cut short anywhere redoes what is left.
  */
-export async function drainCarry(store: Store, opts: { actor?: string; batch?: number; onProgress?: (msg: string) => void } = {}): Promise<{ carried: number; listed: number }> {
+export async function drainCarry(
+  store: Store,
+  opts: { actor?: string; batch?: number; onProgress?: (msg: string) => void; /** For tests: stop between undoing and redoing links. */ interruptAfterUnlink?: boolean } = {},
+): Promise<{ carried: number; listed: number }> {
   const actor = opts.actor ?? 'claim-rekey';
   const out = { carried: 0, listed: 0 };
   const failed = new Set<string>();
   for (;;) {
     const rows = await store.query<MoveRow>(
-      `SELECT old_id, new_id, week, whole FROM claim_rekey_moves
+      `SELECT old_id, new_id, week, whole, plan FROM claim_rekey_moves
        WHERE old_id IN (SELECT DISTINCT old_id FROM claim_rekey_moves WHERE NOT carried AND NOT (old_id = ANY($2::text[])) ORDER BY old_id LIMIT $1)`,
       [opts.batch ?? 500, [...failed]],
     );
@@ -250,86 +290,105 @@ export async function drainCarry(store: Store, opts: { actor?: string; batch?: n
       `SELECT claim_id, canonical_id, actor, reason, kind, confidence FROM claim_links WHERE tx_to IS NULL AND (claim_id = ANY($1::text[]) OR canonical_id = ANY($1::text[]))`, [olds],
     );
     for (const [old, moves] of byOld) {
-      const one = moves.length === 1 && moves[0].whole ? moves[0].new_id : null;
-      const mine = moves.map((m) => ({ id: m.new_id, week: m.week }));
-      const relinks: { claimId: string; canonicalId: string; actor: string; reason: string; kind: string; confidence: number | null }[] = [];
-      const unlink = new Set<string>();
-      const listed: { member: string; rep: string; reason: string }[] = [];
-      await store.tx(async (q) => {
-        await lockLedger(q);
-        // judged pairs: all of them for a claim that moved whole; for one that split, what holds for every week
-        for (const v of verdicts.filter((v) => v.a_id === old || v.b_id === old)) {
-          if (!one && v.relation !== 'unrelated' && v.relation !== 'different_time') continue;
-          for (const t of one ? [one] : mine.map((m) => m.id)) {
-            const a = v.a_id === old ? t : v.a_id;
-            const b = v.b_id === old ? t : v.b_id;
-            if (a === b) continue;
-            await q.query(
-              `INSERT INTO claim_pair_verdicts (pair_id, a_id, b_id, relation, confidence, reason, model, judged_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz) ON CONFLICT (pair_id) DO NOTHING`,
-              [claimPairId(a, b), a, b, v.relation, v.confidence, v.reason, v.model, v.judged_at],
-            );
-          }
-        }
-        // suggestions: all for a whole move; a refusal goes to every week of a split one
-        for (const s of suggestions.filter((s) => [s.payload.claimId, s.payload.canonicalId, s.payload.a, s.payload.b].includes(old))) {
-          if (one) await copySuggestion(q, s, old, one);
-          else if (s.status === 'rejected') for (const m of mine) await copySuggestion(q, s, old, m.id);
-        }
-        if (one) {
-          await q.query(`UPDATE disputes SET claim_id = $2 WHERE claim_id = $1`, [old, one]);
-          await q.query(`UPDATE disputes SET against_id = $2 WHERE against_id = $1`, [old, one]);
-        }
-        // the merge group, link by link from its member's side: each of the member's weeks joins the
-        // representative's same week. A member that moved itself is carried when its own moves are.
-        for (const l of links.filter((l) => l.claim_id === old || l.canonical_id === old)) {
-          if (l.canonical_id === old && (await q.query(`SELECT 1 FROM claim_rekey_moves WHERE old_id = $1 LIMIT 1`, [l.claim_id])).length) continue;
-          const person = !MACHINES.has(l.actor ?? '');
-          const members = l.claim_id === old ? mine : await successorsOf(q, l.claim_id);
-          const reps = l.canonical_id === old ? mine : await successorsOf(q, l.canonical_id);
-          const carry = (claimId: string, canonicalId: string) => relinks.push({ claimId, canonicalId, actor: l.actor ?? actor, reason: l.reason, kind: l.kind, confidence: l.confidence });
-          unlink.add(l.claim_id);
-          if (members.length === 1 && reps.length === 1) {
-            carry(members[0].id, reps[0].id);
-            continue;
-          }
-          if (!person) continue; // the audit decides each week anew
-          for (const m of members) {
-            const match = reps.find((r) => r.week !== null && r.week === m.week);
-            if (match) carry(m.id, match.id);
-            else if (reps.length) {
-              listed.push({ member: m.id, rep: reps[0].id, reason: `${l.actor ?? '有人'}曾将这两条断言合并（${l.claim_id} → ${l.canonical_id}）；按周拆分后 ${m.week ?? '它'} 在另一方没有同一周，请确认是否仍合并` });
+      let plan = moves.find((m) => m.plan)?.plan ?? null;
+      if (!plan) {
+        plan = await store.tx(async (q) => {
+          await lockLedger(q);
+          const mine = await currentOf(q, old);
+          const refusal = (relation: string) => relation === 'unrelated' || relation === 'different_time';
+          // judged pairs, both sides as they are now
+          for (const v of verdicts.filter((v) => v.a_id === old || v.b_id === old)) {
+            const other = await currentOf(q, v.a_id === old ? v.b_id : v.a_id);
+            if (!(mine.single && other.single) && !refusal(v.relation)) continue;
+            for (const a of mine.claims) for (const b of other.claims) {
+              if (a.id === b.id) continue;
+              const [x, y] = v.a_id === old ? [a.id, b.id] : [b.id, a.id];
+              await q.query(
+                `INSERT INTO claim_pair_verdicts (pair_id, a_id, b_id, relation, confidence, reason, model, judged_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz) ON CONFLICT (pair_id) DO NOTHING`,
+                [claimPairId(x, y), x, y, v.relation, v.confidence, v.reason, v.model, v.judged_at],
+              );
             }
           }
-        }
-        for (const x of listed) {
-          await q.query(
-            `INSERT INTO suggestions (id, kind, title, body, evidence, status, payload) VALUES ($1, 'claim-merge', $2, $3, '[]'::jsonb, 'pending', $4::jsonb) ON CONFLICT (id) DO NOTHING`,
-            [claimPairId(x.member, x.rep), '合并重复断言（按周拆分后待确认）', x.reason, JSON.stringify({ claimId: x.member, canonicalId: x.rep, kind: 'same_as', reason: x.reason })],
-          );
-        }
-      });
-      // links are scopes of their own: after the rows above, before the moves are marked carried,
-      // and each a no-op when it is already so — a drain cut short here runs them again
+          // suggestions: everything between two single claims; a refusal to every pair of their claims
+          for (const s of suggestions.filter((s) => [s.payload.claimId, s.payload.canonicalId, s.payload.a, s.payload.b].includes(old))) {
+            const otherId = [s.payload.claimId, s.payload.canonicalId, s.payload.a, s.payload.b].find((x) => typeof x === 'string' && x !== old) as string | undefined;
+            if (!otherId) continue;
+            const other = await currentOf(q, otherId);
+            if (!(mine.single && other.single) && s.status !== 'rejected') continue;
+            for (const a of mine.claims) for (const b of other.claims) await copySuggestion(q, s, new Map([[old, a.id], [otherId, b.id]]));
+          }
+          if (mine.single) {
+            await q.query(`UPDATE disputes SET claim_id = $2 WHERE claim_id = $1`, [old, mine.claims[0].id]);
+            await q.query(`UPDATE disputes SET against_id = $2 WHERE against_id = $1`, [old, mine.claims[0].id]);
+          }
+          // the merge group, link by link from its member's side
+          const p: CarryPlan = { unlink: [], relinks: [], listed: 0 };
+          const lists: { member: string; rep: string; link: (typeof links)[number] }[] = [];
+          for (const l of links.filter((l) => l.claim_id === old || l.canonical_id === old)) {
+            // a member that moved itself is carried when its own moves are
+            if (l.canonical_id === old && (await q.query(`SELECT 1 FROM claim_rekey_moves WHERE old_id = $1 LIMIT 1`, [l.claim_id])).length) continue;
+            const person = !MACHINES.has(l.actor ?? '');
+            const members = l.claim_id === old ? mine : await currentOf(q, l.claim_id);
+            const reps = l.canonical_id === old ? mine : await currentOf(q, l.canonical_id);
+            const carry = (claimId: string, canonicalId: string) => p.relinks.push({ claimId, canonicalId, actor: l.actor ?? actor, reason: l.reason, kind: l.kind, confidence: l.confidence });
+            p.unlink.push(l.claim_id);
+            if (members.single && reps.single) {
+              carry(members.claims[0].id, reps.claims[0].id);
+              continue;
+            }
+            // a merge the audit made is the audit's to make again, week by week
+            if (!person) continue;
+            // a person's merge stays where the two meet: week by week where both are weeks, else on the
+            // week the other claim's own dates fall in; every other week of the member is listed, once
+            const memberWeeks = members.claims.length === 1 && members.claims[0].week === null ? await weeksOfClaim(q, members.claims[0].id) : null;
+            for (const m of members.claims) {
+              let match = reps.claims.find((r) => r.week !== null && r.week === m.week);
+              if (!match && m.week !== null && reps.claims.length === 1 && reps.claims[0].week === null && (await weeksOfClaim(q, reps.claims[0].id)).has(m.week)) match = reps.claims[0];
+              if (!match && memberWeeks) {
+                const inMine = reps.claims.filter((r) => r.week !== null && memberWeeks.has(r.week));
+                if (inMine.length === 1) match = inMine[0];
+              }
+              if (match) carry(m.id, match.id);
+              else for (const r of members.claims.length === 1 ? reps.claims : [reps.claims.find((r) => r.week === null) ?? reps.claims[0]]) if (r) lists.push({ member: m.id, rep: r.id, link: l });
+            }
+          }
+          for (const x of lists) {
+            const reason = `${x.link.actor ?? '有人'}曾接受将这两条断言合并（${x.link.claim_id} → ${x.link.canonical_id}）；按周拆分后这一周与另一方的日期不相交，请确认是否仍合并`;
+            await q.query(
+              `INSERT INTO suggestions (id, kind, title, body, evidence, status, payload) VALUES ($1, 'claim-merge', $2, $3, '[]'::jsonb, 'pending', $4::jsonb) ON CONFLICT (id) DO NOTHING`,
+              [claimPairId(x.member, x.rep), '合并重复断言（来自已接受的合并，按周拆分后待确认）', reason,
+                JSON.stringify({ claimId: x.member, canonicalId: x.rep, kind: 'same_as', reason, carriedFrom: { claimId: x.link.claim_id, canonicalId: x.link.canonical_id, actor: x.link.actor, accepted: true } })],
+            );
+          }
+          p.listed = lists.length;
+          if (lists.length) opts.onProgress?.(`claims: ${lists.length} week(s) of an accepted merge (${old}) meet no week of the other claim: listed as suggestions ${lists.map((x) => `${x.member} → ${x.rep}`).join(', ')}`);
+          await q.query(`UPDATE claim_rekey_moves SET plan = $2::jsonb WHERE old_id = $1`, [old, JSON.stringify(p)]);
+          return p;
+        });
+      }
+      // the links, from the plan: each a no-op once done
       try {
-        for (const id of unlink) {
-          const relinked = relinks.find((r) => r.claimId === id);
+        for (const id of new Set(plan.unlink)) {
+          const relinked = plan.relinks.find((r) => r.claimId === id);
           const [cur] = await store.query<{ canonical_id: string | null }>(`SELECT canonical_id FROM claims WHERE id = $1`, [id]);
           if (cur?.canonical_id && cur.canonical_id !== relinked?.canonicalId) await unmergeClaim(store, id, { actor });
         }
-        for (const r of relinks) {
+        if (opts.interruptAfterUnlink) throw new Error('interrupted after unlink (test)');
+        for (const r of plan.relinks) {
           const [cur] = await store.query<{ canonical_id: string | null; tx_to: string | null }>(`SELECT canonical_id, tx_to FROM claims WHERE id = $1`, [r.claimId]);
           if (!cur || cur.tx_to || cur.canonical_id === r.canonicalId) continue;
           await applyClaimMerge(store, { ...r, kind: r.kind === 'contains' ? 'contains' : 'same_as', reason: `${r.reason}（carried over from ${old}: weekly reading identity）` });
         }
       } catch (err) {
+        if (opts.interruptAfterUnlink) throw err;
         failed.add(old);
         opts.onProgress?.(`claims: carrying the group of ${old} failed: ${err instanceof Error ? err.message : err}`);
         continue;
       }
       await store.query(`UPDATE claim_rekey_moves SET carried = true WHERE old_id = $1`, [old]);
       out.carried++;
-      out.listed += listed.length;
+      out.listed += plan.listed;
     }
   }
 }
