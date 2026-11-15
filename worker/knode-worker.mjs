@@ -356,6 +356,19 @@ async function calibrate() {
 
 const children = new Set();
 
+// A one-turn `claude -p` call with no built-in tools and no MCP servers: with tools on offer the model now and then
+// spends its only turn calling one, and the call fails on "Reached maximum number of turns (1)". A Claude CLI too
+// old to know the flags is run without them from then on.
+const CLAUDE_NO_TOOLS = ['--tools', '', '--strict-mcp-config'];
+const claudeWithoutNoTools = new Set();
+async function runClaudePrint(cmd, argv, stdin, cwd, limitMs = timeoutMs) {
+  if (claudeWithoutNoTools.has(cmd)) return run(cmd, argv, stdin, cwd, limitMs);
+  const r = await run(cmd, [...argv, ...CLAUDE_NO_TOOLS], stdin, cwd, limitMs);
+  if (r.code === 0 || !(/unknown option/i.test(r.stderr) && /--tools|--strict-mcp-config/.test(r.stderr))) return r;
+  claudeWithoutNoTools.add(cmd);
+  return run(cmd, argv, stdin, cwd, limitMs);
+}
+
 function run(cmd, argv, stdin, cwd, limitMs = timeoutMs, env = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, argv, { cwd, env: { ...process.env, ...env }, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -684,7 +697,7 @@ const BACKENDS = {
         const argv = ['-p', '--output-format', 'json', '--max-turns', '1', '--no-session-persistence'];
         if (model) argv.push('--model', String(model));
         if (effort) argv.push('--effort', String(effort));
-        const r = await run(this.bin(), argv, task.prompt, dir);
+        const r = await runClaudePrint(this.bin(), argv, task.prompt, dir);
         let wrapper = null;
         try {
           wrapper = JSON.parse(r.stdout);
@@ -1417,7 +1430,7 @@ async function runEvalCall(call, family, report) {
   try {
     if (family === 'claude') {
       const argv = ['-p', '--output-format', 'json', '--max-turns', '1', '--no-session-persistence', '--model', call.agent.model, ...(call.agent.effort ? ['--effort', call.agent.effort] : [])];
-      const r = await run(EVAL_FAMILIES.claude(), argv, call.prompt, dir, call.timeoutMs);
+      const r = await runClaudePrint(EVAL_FAMILIES.claude(), argv, call.prompt, dir, call.timeoutMs);
       let wrapper = null;
       try {
         wrapper = JSON.parse(r.stdout);

@@ -22,8 +22,9 @@ import { CallUsage, readCodexEvents, usageFromClaudeResult, usageFromCursorResul
  *   - codex:  `codex exec --ignore-user-config --ephemeral -c features.plugins=false -c features.apps=false
  *             -c analytics.enabled=false [-c model_catalog_json=<copy>] --sandbox read-only
  *             --output-last-message <f> --json -`
- *   - claude: `claude -p --output-format stream-json --verbose --max-turns 1` (the answer is its
- *             `result` event; its `rate_limit_event` is kept for the quota floor)
+ *   - claude: `claude -p --output-format stream-json --verbose --max-turns 1 --tools ""
+ *             --strict-mcp-config` (the answer is its `result` event; its `rate_limit_event` is kept for
+ *             the quota floor; no tools, so the one turn is the answer)
  *   - cursor: `cursor-agent -p --output-format json --trust <prompt>` (`--trust` answers the
  *             workspace-trust prompt newer CLIs raise for the temp cwd; the model still
  *             gets no tool grants beyond that directory)
@@ -268,6 +269,19 @@ export function claudeResultOf(stdout: string): Record<string, unknown> | null {
   }
 }
 
+/**
+ * What keeps a text completion to its one turn: no built-in tools and no MCP
+ * servers (the user's own, or a plugin's). With tools on offer the model now
+ * and then spends that turn calling one, and `--max-turns 1` fails the call
+ * with "Reached maximum number of turns (1)" (it stopped an evaluation's
+ * scoring on 2026-11-13). The prompt is smaller without their descriptions,
+ * too.
+ */
+const CLAUDE_NO_TOOLS = ['--tools', '', '--strict-mcp-config'];
+/** Claude CLIs (by command) too old to know those flags: run without them from then on. */
+const claudeWithoutNoTools = new Set<string>();
+const rejectsNoTools = (stderr: string): boolean => /unknown option/i.test(stderr) && /--tools|--strict-mcp-config/.test(stderr);
+
 async function runClaude(cfg: LlmConfig, prompt: string, model: string | undefined, images: string[], report: (usage: CallUsage) => void): Promise<string> {
   const cmd = cliCommand('claude-cli', cfg.cliPath);
   // one turn to read each picture (or all of them at once) and one to answer;
@@ -284,7 +298,14 @@ async function runClaude(cfg: LlmConfig, prompt: string, model: string | undefin
     const dirs = [...new Set(images.map((image) => path.dirname(path.resolve(image))))];
     args.push('--add-dir', ...dirs);
   }
-  const { code, stdout, stderr } = await runProcess(cmd, args, prompt, cfg.cliTimeoutMs);
+  // a picture is read with the Read tool; a text completion gets no tools at all
+  const noTools = images.length === 0 && !claudeWithoutNoTools.has(cmd);
+  let ran = await runProcess(cmd, noTools ? [...args, ...CLAUDE_NO_TOOLS] : args, prompt, cfg.cliTimeoutMs);
+  if (noTools && ran.code !== 0 && rejectsNoTools(ran.stderr)) {
+    claudeWithoutNoTools.add(cmd);
+    ran = await runProcess(cmd, args, prompt, cfg.cliTimeoutMs);
+  }
+  const { code, stdout, stderr } = ran;
   const limits = lastRateLimitInfo(stdout);
   if (limits) recordClaudeLimits(limits);
   // even on failure claude prints a result wrapper — prefer its message over raw output

@@ -122,6 +122,11 @@ export interface RunOptions {
    * 3 for an old command line).
    */
   answerConcurrency?: number;
+  /**
+   * The most judge calls at once: a bound on the width the slots online that
+   * take the judge's calls give (none by default; 2 for an old command line).
+   */
+  judgeConcurrency?: number;
   /** Packs worked on at once (each builds and answers on its own; the shim's slots bound the model calls). */
   packConcurrency?: number;
   quota?: boolean;
@@ -329,6 +334,21 @@ function answerCap(opts: Pick<RunOptions, 'answerConcurrency'>, placement: { leg
   return opts.answerConcurrency ?? (placement.legacy ? 3 : undefined);
 }
 
+/** The most judge calls at once: `--judge-concurrency`, which an old command line has at 2. */
+export function judgeCap(opts: Pick<RunOptions, 'judgeConcurrency'>, placement: { legacy: boolean }): number | undefined {
+  const n = opts.judgeConcurrency ?? (placement.legacy ? 2 : undefined);
+  return n === undefined ? undefined : Math.max(1, Math.trunc(n));
+}
+
+/**
+ * How many judge calls go out at once: as many as the slots online that take
+ * them (docs/design/32 §3), at most the cap, never fewer than one — a call is
+ * published and waits for a slot.
+ */
+export function judgeWidth(remote: RemoteEval, family: EvalFamily, eligible: 'any' | 'local', cap: number | undefined): () => number {
+  return () => Math.max(1, Math.min(cap ?? Infinity, remote.width('eval-call', family, eligible)));
+}
+
 export async function runEval(opts: RunOptions): Promise<RunResult> {
   const progress = opts.onProgress ?? (() => {});
   const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
@@ -435,9 +455,10 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     const judgeLeaves = !opts.overrides?.judge && !opts.judgeChain ? judgeAgent(opts.judgeProvider ?? 'claude-cli', opts.judgeModel ?? '') : null;
     if (remote.where === 'serve' && judgeLeaves && anyPrivate) chainLog('remote: the judge is for this machine\'s slots only (a pack in this run has private sources)');
     else if (remote.where === 'serve' && !judgeLeaves) chainLog('remote: the judge is for this machine\'s slots only (no --judge-model, or a chain or stand-in judges)');
+    const judgeEligible = judgeLeaves && !anyPrivate ? 'any' as const : 'local' as const;
     const judgeClient = remoteJudgeClient(localJudge, remote, {
       family: judgeFamily(opts.judgeProvider ?? 'claude-cli'), model: opts.judgeModel ?? '', effort: judgeLeaves?.effort ?? null,
-      eligible: judgeLeaves && !anyPrivate ? 'any' : 'local', backend: judgeLeaves ? `${judgeLeaves.family}-cli:${judgeLeaves.model}` : null,
+      eligible: judgeEligible, backend: judgeLeaves ? `${judgeLeaves.family}-cli:${judgeLeaves.model}` : null,
     });
     // this machine's plan is spent only by the run's own Codex slots
     quota.setBypass(() => !remote.hasLocal('codex'));
@@ -451,7 +472,11 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
         exhaust: (name, why) => agents.exhaust(agents.links.find((l) => l.name === name)!, why),
       });
     }
-    const judge = new Judge({ client: judgeClient, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl') });
+    // the judge is as wide as the slots online that take its calls, at most --judge-concurrency
+    const judge = new Judge({
+      client: judgeClient, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl'),
+      width: judgeWidth(remote, judgeFamily(opts.judgeProvider ?? 'claude-cli'), judgeEligible, judgeCap(opts, placement)),
+    });
     const models = { model: opts.model ?? '', buildEffort: opts.buildEffort ?? 'low', answerEffort: opts.answerEffort ?? 'medium' };
     judge.audit(judgeAuditFor(opts.judgeAudit, seed, store));
 
@@ -829,9 +854,16 @@ export async function scoreAnswers(
   const mark = meter?.mark() ?? 0;
   const pending: ScoreRecord[] = [];
   const put = (r: ScoreRecord) => pending.push(r);
-  for (const r of await scoreUsage({ answers, tasks: ctx.tasks, citing }, judge)) put(r);
-  for (const r of await scoreLists({ answers, tasks: ctx.tasks, corpusDocs: ctx.corpusDocs }, judge)) put(r);
-  for (const r of await scoreEmergence({ answers, tasks: ctx.tasks, corpusDocs: ctx.corpusDocs }, judge)) put(r);
+  // the three scorers ask the judge together (its gate bounds the calls of all three); their records keep this
+  // order, and a scorer that failed is thrown only once the others are done, so what they asked is in the cache
+  const scored = await Promise.allSettled([
+    scoreUsage({ answers, tasks: ctx.tasks, citing }, judge),
+    scoreLists({ answers, tasks: ctx.tasks, corpusDocs: ctx.corpusDocs }, judge),
+    scoreEmergence({ answers, tasks: ctx.tasks, corpusDocs: ctx.corpusDocs }, judge),
+  ]);
+  const rejected = scored.find((s): s is PromiseRejectedResult => s.status === 'rejected');
+  if (rejected) throw rejected.reason;
+  for (const s of scored) if (s.status === 'fulfilled') for (const r of s.value) put(r);
   const placed = where(meter?.placement((e) => e.system === JUDGE_SYSTEM, mark) ?? null);
   for (const r of pending) store.putScore({ ...r, ...placed });
   return answers.length;
@@ -847,7 +879,7 @@ function where(p: Placed | null): { worker?: string; backend?: string } {
  * its records and the packs it names — with no model of its own running, so
  * only while the run itself is stopped.
  */
-export async function scoreRun(runDir: string, opts: { judgeProvider?: string; judgeModel?: string; judgeAudit?: number; onProgress?: (m: string) => void; remote?: RunOptions['remote']; local?: RunOptions['local']; slots?: number; waitMinutes?: number; waitCheckMs?: number; pool?: string } = {}): Promise<number> {
+export async function scoreRun(runDir: string, opts: { judgeProvider?: string; judgeModel?: string; judgeAudit?: number; judgeConcurrency?: number; onProgress?: (m: string) => void; remote?: RunOptions['remote']; local?: RunOptions['local']; slots?: number; waitMinutes?: number; waitCheckMs?: number; pool?: string } = {}): Promise<number> {
   const store = new RunStore(runDir);
   const meta = store.meta();
   if (!meta) throw new Error(`not a run directory: ${runDir}`);
@@ -882,12 +914,13 @@ export async function scoreRun(runDir: string, opts: { judgeProvider?: string; j
   }
 
   async function scoreWith(remote: RemoteEval): Promise<number> {
+    // never for a run with a private pack
+    const eligible = agent && packs.every(packMayLeave) ? 'any' as const : 'local' as const;
     const client = remoteJudgeClient(local, remote, {
       family, model: opts.judgeModel ?? '', effort: agent?.effort ?? null,
-      // never for a run with a private pack
-      eligible: agent && packs.every(packMayLeave) ? 'any' : 'local', backend: agent ? `${agent.family}-cli:${agent.model}` : null,
+      eligible, backend: agent ? `${agent.family}-cli:${agent.model}` : null,
     });
-    const judge = new Judge({ client, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl') });
+    const judge = new Judge({ client, meter, quota, cacheFile: path.join(store.cacheDir(), 'judge.jsonl'), width: judgeWidth(remote, family, eligible, judgeCap(opts, placement)) });
     for (const pack of packs) {
       for (const t of pack.tasks) tasks.set(`${pack.manifest.id}|${t.id}`, t);
       const docs = new Set(pack.docs.map((d) => d.path));
