@@ -138,7 +138,8 @@ export interface IndexScore {
 /** Score the entities of an open index against gold alias clusters. Reads only. */
 export async function scoreIndex(q: Queryable, gold: GoldAlias[]): Promise<IndexScore> {
   const entities = await q.query<{ id: string; name: string; type: string; description: string; aliases: unknown }>(
-    `SELECT id, name, type, description, aliases FROM entities WHERE tx_to IS NULL AND canonical_id IS NULL`,
+    // in a fixed order: the suite's scorer gives a name several entities claim to the first claimant
+    `SELECT id, name, type, description, aliases FROM entities WHERE tx_to IS NULL AND canonical_id IS NULL ORDER BY id`,
   );
   // the unit an evaluation run exports for an entity (eval/systems/knode.ts)
   const units = entities.map((e) => {
@@ -246,7 +247,7 @@ export async function replayResolution(
       const written = await scoreIndex(ctx.store, gold);
       progress(`indexed ${documents} documents: ${written.entities} entities`);
       const refine = { passes: 0, merged: 0, split: 0, replayed: 0 };
-      for (let i = 0; i < 5; i++) {
+      for (let i = 0; i < 8; i++) {
         const stats = await resolveEntityContext(ctx.store, { config: ctx.config, onProgress: (m) => (m.startsWith('entities:') ? progress(m) : undefined) });
         refine.passes++;
         refine.merged += stats.merged;
