@@ -5,7 +5,7 @@ import type { EmbeddingProvider } from '../../ingest/embeddings.js';
 import { isolatedCopy, runAgent } from '../agent.js';
 import { Bm25, Chunk, chunkDocs, rrf, VectorIndex } from '../retrieval.js';
 import { startServedTools, ToolHost } from '../toolhost.js';
-import { AGENT_BRIEF } from './agents.js';
+import { armBrief, GREP_HAS } from './agents.js';
 import { chat, recordAgent, SystemEnv, SystemUnderTest, taggedEmbedder } from './types.js';
 
 /**
@@ -156,7 +156,7 @@ async function closeSearchHost(env: SystemEnv): Promise<void> {
 }
 
 /** Arm B's sentence of the shared brief: the sources, as for arm A, and the one tool beside them. */
-export const AGENT_RAG_HAS = `The current directory holds the source documents. You also have one tool, \`${RAG_SEARCH_TOOL}\` (on the MCP server knode): ${RAG_SEARCH_TOOL}(query, k) returns the k passages of the documents that best match the query by words and by meaning, each with its document's path, the passage (about 1,200 characters) and a score. A ${RAG_SEARCH_TOOL} call counts against the budget as a command does.`;
+export const AGENT_RAG_HAS = `${GREP_HAS} You also have one tool, \`${RAG_SEARCH_TOOL}\` (on the MCP server knode): ${RAG_SEARCH_TOOL}(query, k) returns the k passages of the documents that best match the query by words and by meaning, each with its document's path, the passage (about 1,200 characters) and a score. A ${RAG_SEARCH_TOOL} call counts against the budget as a command does.`;
 
 /** Document paths named in `search` results, as far as the kept output shows them. */
 function searchedDocuments(outputs: ({ text: string } | null)[] | undefined, docs: ReadonlySet<string>): string[] {
@@ -194,7 +194,7 @@ export function agentRag(): SystemUnderTest {
           sandbox: 'read-only',
           model: env.models.model,
           effort: env.models.answerEffort,
-          prompt: `${AGENT_BRIEF(AGENT_RAG_HAS)}\n\n${prompt}`,
+          prompt: `${armBrief(AGENT_RAG_HAS)}\n\n${prompt}`,
           mcp: { name: 'knode', url: host.url, token: host.secret, enabledTools: [RAG_SEARCH_TOOL] },
         });
         recordAgent(env.meter, { system: 'agent-rag', stage: 'agent', task: task.id }, env.models.model, r);

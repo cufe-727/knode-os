@@ -7,6 +7,9 @@ import { buildFixturePack } from '../src/eval/packs/fixture.js';
 import { runEval } from '../src/eval/run.js';
 import { RunStore } from '../src/eval/runstore.js';
 import { KNODE_FULL_TOOLS } from '../src/eval/systems/knode.js';
+import { LADDER_ARMS, ladderBriefs } from '../src/eval/systems/briefs.js';
+import { taskPrompt } from '../src/eval/prompts.js';
+import { loadPack } from '../src/eval/pack.js';
 import { ScriptedBackend, scriptedJudge } from './helpers/eval-scripted.js';
 
 /**
@@ -20,6 +23,7 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'eval-ladder-'));
 const packDir = path.join(tmp, 'pack');
 const embedder = createEmbeddingProvider({ provider: 'local', baseUrl: '', apiKey: '', model: '', dimensions: 384, batchSize: 64, sendDimensions: false });
 const toolsLog = path.join(tmp, 'tools.log');
+const promptLog = path.join(tmp, 'prompts.jsonl');
 const oldPath = process.env.PATH;
 
 beforeAll(() => {
@@ -29,10 +33,12 @@ beforeAll(() => {
   fs.writeFileSync(path.join(bin, 'codex'), `#!/bin/sh\nexec node "${path.resolve('tests/helpers/fake-codex.mjs')}" "$@"\n`, { mode: 0o755 });
   process.env.PATH = `${bin}:${oldPath}`;
   process.env.FAKE_CODEX_TOOLS_LOG = toolsLog;
+  process.env.FAKE_CODEX_PROMPT_LOG = promptLog;
 });
 afterAll(() => {
   process.env.PATH = oldPath;
   delete process.env.FAKE_CODEX_TOOLS_LOG;
+  delete process.env.FAKE_CODEX_PROMPT_LOG;
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
@@ -60,5 +66,28 @@ describe('arm D: agent-knode-full', () => {
     expect(KNODE_FULL_TOOLS).not.toContain('knode_grep');
     expect(KNODE_FULL_TOOLS).not.toContain('knode_read');
     expect(KNODE_FULL_TOOLS).not.toContain('knode_ls');
+  }, 180_000);
+});
+
+describe('the four arms', () => {
+  it('ask every question with the same brief, apart from what each arm has', async () => {
+    fs.rmSync(promptLog, { force: true });
+    const res = await runEval({
+      packs: [packDir], systems: [...LADDER_ARMS], runDir: path.join(tmp, 'runs', 'arms'), quota: false, suites: ['usage'], judgeAudit: 0, skipScoring: true,
+      overrides: { chat: new ScriptedBackend(), judge: scriptedJudge(), embedder },
+    });
+    const store = new RunStore(res.runDir);
+    expect(store.allAnswers().filter((a) => a.error).map((a) => `${a.system} ${a.taskId}: ${a.error}`)).toEqual([]);
+    const briefs = ladderBriefs();
+    const prompts = fs.readFileSync(promptLog, 'utf8').trim().split('\n').map((l) => JSON.parse(l) as string);
+    const questions = new Set(loadPack(packDir).tasks.map((t) => taskPrompt(t)));
+    // every session's prompt is one arm's brief, then the question as every system gets it
+    const byArm = new Map<string, number>();
+    for (const p of prompts) {
+      const arm = LADDER_ARMS.find((a) => p.startsWith(`${briefs[a].text}\n\n`) && questions.has(p.slice(briefs[a].text.length + 2)));
+      expect(arm, p.slice(0, 200)).toBeDefined();
+      byArm.set(arm!, (byArm.get(arm!) ?? 0) + 1);
+    }
+    for (const arm of LADDER_ARMS) expect(byArm.get(arm), arm).toBe(store.allAnswers().filter((a) => a.system === arm).length);
   }, 180_000);
 });

@@ -59,6 +59,8 @@ process.stdin.on('end', async () => {
   emit({ type: 'thread.started', thread_id: 'fake-thread' });
   // FAKE_CODEX_SESSION_MS: a session takes this long, as an agent thinking would; FAKE_CODEX_SESSION_LOG gets its start and end
   const sessionLog = process.env.FAKE_CODEX_SESSION_LOG;
+  // FAKE_CODEX_PROMPT_LOG: each session's prompt as one JSON line (the briefs an arm's sessions got)
+  if (process.env.FAKE_CODEX_PROMPT_LOG) fs.appendFileSync(process.env.FAKE_CODEX_PROMPT_LOG, `${JSON.stringify(prompt)}\n`);
   if (sessionLog) fs.appendFileSync(sessionLog, `start ${Date.now()}\n`);
   if (Number(process.env.FAKE_CODEX_SESSION_MS ?? 0) > 0) await new Promise((r) => setTimeout(r, Number(process.env.FAKE_CODEX_SESSION_MS)));
   // the session's trace: knode's tools when it has the MCP server, and a search and a wrapped pipeline when its folder has files

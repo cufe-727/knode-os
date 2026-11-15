@@ -18,10 +18,10 @@ import { currentRemote } from '../placement.js';
 import { dirBytes, listFiles } from '../pack.js';
 import { citationsIn } from '../prompts.js';
 import type { Citation, KnowledgeUnit } from '../types.js';
-import { AGENT_BRIEF } from './agents.js';
+import { AGENT_BRIEF, armBrief } from './agents.js';
 import { catalogGuide } from '../../mcp/catalog-guide.js';
 import { questionKindGuide } from '../../mcp/question-kinds.js';
-import { WIKI_SOURCES_BRIEF, WIKI_SOURCES_HAS, wikiWithSources } from './llm-wiki.js';
+import { WIKI_SOURCES_HAS, wikiWithSources } from './llm-wiki.js';
 import { recordAgent, shimClient, SystemEnv, SystemUnderTest } from './types.js';
 import { evalTempDir } from '../tmp.js';
 import { startToolHost, ToolHost } from '../toolhost.js';
@@ -693,7 +693,7 @@ export function agentKnodeWikiSources(): SystemUnderTest {
           sandbox: 'read-only',
           model: env.models.model,
           effort: env.models.answerEffort,
-          prompt: `${WIKI_SOURCES_BRIEF('wiki/, generated pages; sources/ holds one summary per document', 'raw/docs/')}\n\n${prompt}`,
+          prompt: `${armBrief(KNODE_WIKI_SOURCES_HAS)}\n\n${prompt}`,
         });
         recordAgent(env.meter, { system: 'agent-knode-wiki-sources', stage: 'agent', task: task.id }, env.models.model, r);
         const docs = new Set(env.staged.docs.map((d) => d.path));
@@ -722,7 +722,10 @@ export function agentKnodeWikiSources(): SystemUnderTest {
 export const KNODE_FULL_TOOLS = ['knode_search', 'knode_graph_search', 'knode_claims', 'knode_query', 'knode_resolve', 'knode_survey'];
 
 /** Arm D's sentence of the shared brief: arm C's folder, and knode's retrieval tools beside it. */
-export const AGENT_KNODE_FULL_HAS = `${WIKI_SOURCES_HAS('wiki/, generated pages; sources/ holds one summary per document', 'raw/docs/')} You also have knode's retrieval tools (on the MCP server knode) over an index built from the same documents: ${KNODE_FULL_TOOLS.join(', ')}. Their results name documents as raw/docs/<path> and pages as wiki/<page>, the paths of the current directory. A tool call counts against the budget as a command does.`;
+/** Arm C's sentence: the knode wiki and the sources beside it, where its pages' links point. */
+export const KNODE_WIKI_SOURCES_HAS = WIKI_SOURCES_HAS('wiki/, generated pages; sources/ holds one summary per document', 'raw/docs/');
+
+export const AGENT_KNODE_FULL_HAS = `${KNODE_WIKI_SOURCES_HAS} You also have knode's retrieval tools (on the MCP server knode) over an index built from the same documents: ${KNODE_FULL_TOOLS.join(', ')}. Their results name documents as raw/docs/<path> and pages as wiki/<page>, the paths of the current directory. A tool call counts against the budget as a command does.`;
 
 /**
  * Arm D's tool guide: which tool answers which kind of question
@@ -730,9 +733,12 @@ export const AGENT_KNODE_FULL_HAS = `${WIKI_SOURCES_HAS('wiki/, generated pages;
  * catalog's schema for knode_query.
  */
 export function knodeFullGuide(): string {
+  // the catalog guide points to knode_datasources for the full list of views: arm D has no such tool, and a brief
+  // naming tools an agent was not given sends it searching for them
+  const catalog = catalogGuide().replace(/; knode_datasources lists every view/, '');
   return `${questionKindGuide({ grep: 'rg in the shell (rg -n -C3 "<string>" raw/docs wiki)', read: 'the shell (sed -n, head or cat; several files in one command)' })}
 
-${catalogGuide()}`;
+${catalog}`;
 }
 
 export function agentKnodeFull(): SystemUnderTest {
@@ -749,7 +755,7 @@ export function agentKnodeFull(): SystemUnderTest {
           sandbox: 'read-only',
           model: env.models.model,
           effort: env.models.answerEffort,
-          prompt: `${AGENT_BRIEF(AGENT_KNODE_FULL_HAS)}\n\n${knodeFullGuide()}\n\n${prompt}`,
+          prompt: `${armBrief(AGENT_KNODE_FULL_HAS, knodeFullGuide())}\n\n${prompt}`,
           mcp: { name: 'knode', url: host.url, token: host.secret, enabledTools: KNODE_FULL_TOOLS },
         });
         recordAgent(env.meter, { system: 'agent-knode-full', stage: 'agent', task: task.id }, env.models.model, r);
