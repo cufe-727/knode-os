@@ -73,5 +73,10 @@ describe('pack lint', () => {
     const bad = lintBeforeRun([loadPack(path.join(tmp, 'planted'))]);
     expect(bad.ok).toBe(false);
     expect(bad.report).toMatch(/--no-lint/);
+    const out = path.join(tmp, 'v3');
+    await recipe('synthetic-reports-zh').build(out, { seed: 0, log: () => {}, options: { version: 3 } });
+    const good = lintBeforeRun([loadPack(out)]);
+    expect(good.ok).toBe(true);
+    expect(good.report).toBe('');
   });
 });
