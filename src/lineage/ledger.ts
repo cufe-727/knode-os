@@ -31,7 +31,9 @@ export type LedgerEvent =
   | { seq: number; ts: string; ev: 'purge'; actor: string; scope: LedgerScopeRef }
   | { seq: number; ts: string; ev: 'feedback'; actor: string; kind: string; id: string; payload?: unknown }
   | { seq: number; ts: string; ev: 'migrate'; actor: string; from: number; to: number }
-  | { seq: number; ts: string; ev: 'rebuild'; actor: string; note?: string };
+  | { seq: number; ts: string; ev: 'rebuild'; actor: string; note?: string }
+  /** A document's date read again under newer rules (src/ingest/redate.ts): its record corrected in place, not versioned. */
+  | { seq: number; ts: string; ev: 'redate'; actor: string; scope: LedgerScopeRef; documentId: string; from: string | null; to: string | null; rules: number };
 
 export function ledgerPath(dataDir: string): string {
   return path.join(dataDir, LEDGER_EVENTS);

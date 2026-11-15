@@ -9,6 +9,8 @@ import { supersedeByAttribute } from '../src/graph/claim-state-store.js';
 import { rekeyState } from '../src/graph/claim-rekey.js';
 import { applyMerge } from '../src/graph/merge.js';
 import { DOC_DATE_RULES, documentIdFor } from '../src/ingest/apply.js';
+import { readSidecarPart } from '../src/fs/sidecar.js';
+import { readLedger } from '../src/lineage/ledger.js';
 import { sync } from '../src/ingest/sync.js';
 import { toDateString } from '../src/store/temporal.js';
 
@@ -332,6 +334,10 @@ claims:
     expect(after.claims.filter((c) => !known.has(c.id))).toHaveLength(1);
     // the re-key of that one claim, not a walk of the table: its state is as it was
     expect(await rekeyState(ctx.store)).toEqual({ cursor: null, done: true });
+    // the correction is on record: a ledger line, and the sidecar an attic replay dates the document by
+    const line = readLedger(ctx.dataDir).filter((e) => e.ev === 'redate');
+    expect(line).toMatchObject([{ ev: 'redate', scope: { key: R }, from: null, to: '2025-09-05T00:00:00.000Z', rules: DOC_DATE_RULES }]);
+    expect(readSidecarPart(ctx.dataDir, R, 'meta')?.docDate).toBe('2025-09-05T00:00:00.000Z');
     // only the re-dated document's rows fold otherwise
     const changed = (await ctx.store.query<{ id: string; statement: string; fold_sha: string }>(`SELECT id, statement, fold_sha FROM claims WHERE tx_to IS NULL`)).filter((r) => folds.has(r.id) && folds.get(r.id) !== r.fold_sha).map((r) => r.statement).sort();
     expect(changed).toEqual(['孙欣负责结算中台。']);
@@ -347,6 +353,7 @@ claims:
     expect(await sync(ctx, { llmGraph: false, onProgress: (m) => again.push(m) })).toMatchObject({ indexed: 0, errors: 0 });
     expect(again.filter((l) => l.startsWith('re-dated'))).toEqual([]);
     expect(await identity(ctx)).toEqual(settled);
+    expect(readLedger(ctx.dataDir).filter((e) => e.ev === 'redate')).toHaveLength(1);
   });
 
   it('gives a relation only the date its own words state', async () => {

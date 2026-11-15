@@ -1,12 +1,12 @@
-import { readSidecarPart, replayableTier1, SidecarTier1 } from '../fs/sidecar.js';
+import { readSidecarPart, replayableTier1, SidecarTier1, updateSidecarPart } from '../fs/sidecar.js';
 import { rekeyClaims } from '../graph/claim-rekey.js';
 import { frontmatterExtraction } from '../graph/frontmatter.js';
 import { loadOntology, normalizePredicate, Ontology } from '../graph/ontology.js';
 import { claimId, readingWeek } from '../graph/store.js';
 import { propagate } from '../lineage/deps.js';
 import { foldTouched } from '../lineage/fold.js';
-import { lockLedger } from '../lineage/ledger.js';
-import { findLiveScope, foldOptions, liveChildren } from '../lineage/scope.js';
+import { appendLedger, lockLedger, nextLedgerSeq } from '../lineage/ledger.js';
+import { findLiveScope, foldOptions, liveChildren, scopeRef } from '../lineage/scope.js';
 import { emptyTouched, ScopeRow } from '../lineage/types.js';
 import { ParsedMarkdown } from '../markdown.js';
 import { dateEnd, dateStart } from '../store/dates.js';
@@ -197,8 +197,9 @@ async function planScope(q: Queryable, scopeId: string, words: Words, extractor:
  * redone, damaged), or its words do not account for every evidence row,
  * nothing is changed: the scope is held for these rules (`dateHeld`, with the
  * reason) and it is said once; the next rules, or applying it again, read it
- * again. One transaction per re-dated document, then the re-key of the claims
- * that are weekly readings now; null when the scope is already current.
+ * again. One transaction per re-dated document, then a ledger line (`redate`),
+ * the sidecar's meta.docDate and the re-key of claims that are weekly readings
+ * now; null when the scope is already current.
  */
 export async function redateDocument(
   store: Store,
@@ -255,10 +256,10 @@ export async function redateDocument(
   out.rekey = moved.length > 0;
   const txTime = new Date().toISOString();
 
-  const done = await store.tx(async (q) => {
+  const seq = await store.tx(async (q) => {
     await lockLedger(q);
     // applied again since the caller looked: that apply read the date itself
-    if ((await findLiveScope(q, 'doc', doc.file))?.id !== live.id) return false;
+    if ((await findLiveScope(q, 'doc', doc.file))?.id !== live.id) return null;
     const touched = emptyTouched();
     for (const u of updates) {
       await q.query(`UPDATE evidence SET attrs = $2::jsonb WHERE id = $1`, [u.id, JSON.stringify(u.attrs)]);
@@ -269,9 +270,12 @@ export async function redateDocument(
     const fold = await foldTouched(q, touched, txTime, foldOptions(store.dataDir));
     await propagate(q, fold.changed, fold.tombstoned, txTime);
     await mark(q);
-    return true;
+    return nextLedgerSeq(q);
   });
-  if (!done) return null;
+  if (seq === null) return null;
+  // the record is corrected, not versioned: the ledger says so, and the sidecar an attic replay dates the document by follows
+  appendLedger(store.dataDir, { seq, ts: txTime, ev: 'redate', actor: doc.actor ?? 'sync', scope: scopeRef(live), documentId: doc.docId, from: was, to: now, rules: DOC_DATE_RULES });
+  updateSidecarPart(store.dataDir, doc.file, 'meta', (m) => ({ ...m!, docDate: now }));
   log(`re-dated ${doc.file}: ${was?.slice(0, 10) ?? 'none'} → ${now?.slice(0, 10) ?? 'none'} (${out.claims} claim, ${out.relations} relation dates)`);
   // a claim that is a weekly reading now moves to its week's id, by the claim re-key, at once
   if (moved.length) await rekeyClaims(store, moved, { actor: doc.actor ?? 'sync', onProgress: log });
