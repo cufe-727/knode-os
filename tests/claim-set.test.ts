@@ -106,6 +106,9 @@ beforeAll(async () => {
   await addClaim('plat-w1', 'pool-1', 'Order DB pool limit POOL-1 set to 200 connections', { attribute: 'limit', num: 200, unit: 'connections', at: at(1) });
   await addClaim('plat-w3', 'pool-1', 'POOL-1: the 200 is withdrawn, 240 connections stands', { attribute: 'connections', num: 240, unit: 'connections', at: at(3), correction: true });
   await addClaim('plat-w6', 'pool-1', 'The Order DB pool limit was originally 200 connections', { attribute: 'initial limit', num: 200, unit: 'connections', at: at(6) });
+  // and later put back, by the short name the first report gave it, in a claim about the team
+  await store.query(`UPDATE entities SET aliases = '["pool cap"]'::jsonb WHERE id = 'pool-1'`);
+  await addClaim('plat-w15', 'platform', 'Northwind Platform changed the pool cap back to the original 200 connections', { attribute: 'pool cap', num: 200, unit: 'connections', at: at(15) });
 });
 
 afterAll(async () => {
@@ -195,6 +198,10 @@ describe('computing the set from the claims', () => {
     expect(now!.lines[0]).toContain('a correction');
     const then = await set('What was the Order DB pool limit of Northwind Platform as of 2025-01-10?', ['platform']);
     expect(then!.answer).toBe('200');
+    // a revert named by the setting's short name, in a claim about the team, is the value after it
+    const later = await set('What was the Order DB pool limit of Northwind Platform as of 2025-05-01?', ['platform']);
+    expect(later!.answer).toBe('200');
+    expect(later!.lines[0]).toContain('changed the pool cap back to the original 200');
   });
 
   it('counts what an item of the kind asked for is related to, and keeps the ones related to enough', async () => {

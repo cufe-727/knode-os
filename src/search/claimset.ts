@@ -230,7 +230,7 @@ const itemKey = (name: string) => CODE.exec(name)?.[0] ?? name;
 /** A statement about an earlier value, not the value then ("最初定为200", "originally 200"). */
 const RETROSPECTIVE = /最初|起初|原先|原来|一开始|当初|此前曾|\boriginally\b|\binitially\b|\bat first\b|\bpreviously\b/i;
 /** A statement that a value changed, which may name the old one ("由30天改为45天", "以240个连接为准"). */
-const CHANGE = /改为|改成|调整为|调为|变更为|更新为|提高到|提高至|降低到|降至|上调|下调|恢复为|恢复到|撤回|以.{0,16}为准|\bchanged? (?:it )?to\b|\braised to\b|\blowered to\b|\brevert(?:ed)? to\b|\bcorrected to\b/i;
+const CHANGE = /改为|改成|改回|调整为|调为|变更为|更新为|提高到|提高至|降低到|降至|上调|下调|恢复|回退|退回|撤回|以.{0,16}为准|\brolled back\b|\bback to\b|\bchanged? (?:it )?to\b|\braised to\b|\blowered to\b|\brevert(?:ed)? to\b|\bcorrected to\b/i;
 /** It states an earlier value only: "最初定为200" — not "撤回原先的200，以240为准". */
 const onlyRetrospective = (c: { statement: string; correction: boolean | null }) => !c.correction && RETROSPECTIVE.test(c.statement) && !CHANGE.test(c.statement);
 /** A statement that a state holds, so that "没有关闭" can be tested on an item's latest one. */
@@ -541,8 +541,13 @@ export async function computeClaimSet(
     // what the value is of: the subjects the matching claims are about, the scope's organisations only when nothing else is
     let subjects = new Set(matched.map((c) => c.subject_id).filter((id) => !members.has(id)));
     if (subjects.size === 0) subjects = new Set(matched.map((c) => c.subject_id));
+    // a later report may name it only by the short name it was given ("下称保留期") or its code: those statements
+    // are about it whoever their subject is
+    const aliasRows = await store.query<{ aliases: unknown }>(`SELECT aliases FROM entities WHERE id = ANY($1::text[])`, [[...subjects]]);
+    const aliases = aliasRows.flatMap((r) => (Array.isArray(r.aliases) ? r.aliases : [])).filter((a): a is string => typeof a === 'string' && a.length >= 2);
     const have = new Set(matched.map((c) => c.id));
-    matched = cands.filter((c) => subjects.has(c.subject_id) && (have.has(c.id) || !members.has(c.subject_id)));
+    for (const c of cands) if (aliases.some((a) => c.statement.includes(a))) have.add(c.id);
+    matched = cands.filter((c) => (subjects.has(c.subject_id) && (have.has(c.id) || !members.has(c.subject_id))) || (have.has(c.id) && c.value_num !== null));
   }
 
   // the period: a year range from the router, or a yearless one of the data's year
