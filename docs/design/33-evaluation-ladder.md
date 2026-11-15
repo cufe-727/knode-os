@@ -219,7 +219,37 @@ documents all hold a literal term of the question (a word, a name of the alias g
 documents), the share whose first-step document does, and the same two for the ten documents a BM25 search on the
 question ranks first. Any question that names its team reaches that team's reports by the team's name, so the
 literal-term shares change little where the rules require naming the team; the BM25 columns and the hop rows are where
-v3 differs (numbers in the stage-2 report).
+v3 differs.
+
+**The packs built (2026-11-15, seed 0), all lint-clean:**
+
+| Pack | Documents | Characters | Questions | Hops h3 / h4 / h5 / h6 / h7 |
+| --- | --- | --- | --- | --- |
+| `synthetic-reports-zh-v3` | 473 (366 weekly, 28 PMO, 28 minutes, 27 quarterly, 24 postmortems) | 0.88M | 564 | 10 / 14 / 24 / 24 / 24 |
+| `synthetic-reports-en-v3` | 473 | 1.15M | 567 | 10 / 14 / 24 / 24 / 24 |
+| `synthetic-reports-zh-v3-x10` | 4,730 | 8.7M | 607 | 10 / 17 / 30 / 30 / 30 (21 cross-division) |
+| `synthetic-reports-zh-v3-x100` | 47,300 | 88.4M | 607 | as 10× |
+
+Per family at 1× (zh): aggregate 71, current-state 66, alias 69, hop 96, timeline 70, lookalike 60 (47 of them
+unanswerable), update 60, each control 24; 10× and 100× add 22 company-wide aggregates.
+
+**Grep-ability at 10× (zh)**, the share of questions whose gold documents all / whose first-step document hold a
+rare literal term, then whose gold documents all / first-step document BM25 ranks in its top 10. "v2" is the current
+v2 recipe built afresh (the pack the 2026-11-14 run used still has the PMO-only prefix, which sends BM25 to the
+monthly summaries: 0% almost everywhere).
+
+| Family | v2 10× | v3 10× |
+| --- | --- | --- |
+| aggregate | 61% · 62% · 1% · 7% | 76% · 76% · 0% · 6% |
+| current-state | 90% · 92% · 0% · 84% | 100% · 100% · 0% · 32% |
+| alias | — | 49% · 100% · 28% · 52% |
+| hop | 2% · 35% · 0% · 8% | 0% · 21% · 0% · 3% |
+| timeline | 97% · 97% · 3% · 12% | 91% · 100% · 1% · 40% |
+| lookalike (answerable ones) | 54% · 72% · 38% · 48% | 77% · 77% · 31% · 38% |
+
+v3 is harder to look up where it was built to be — the hops and the current state behind corrections — and is not
+harder on aggregates (neither pack's gold is reachable by one search) or timelines (v3 names its project, and the
+project's start is one search away).
 
 **Not done.** No model has answered a v3 question; the gold is checked by tests against the script, the hop chains by
 hand on samples. English 3× and 10× packs have few cross-division hops (the English script's people are busy until
