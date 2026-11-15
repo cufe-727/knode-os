@@ -8,6 +8,7 @@ import {
   claimId,
   ExtractedEntity,
   normalizeClaimType,
+  readingWeek,
   relationId,
   slugify,
 } from '../graph/store.js';
@@ -53,6 +54,7 @@ import {
 
 /** Citation rows per INSERT: ten parameters each, well under PostgreSQL's 65,535. */
 const CITATION_BATCH = 500;
+
 
 export interface DocumentProjection {
   id: string;
@@ -339,7 +341,7 @@ export class ScopeWriter {
   ): Promise<string | null> {
     const statement = c.statement.trim();
     if (!statement) return null;
-    const id = claimId(subjectId, statement);
+    const id = claimId(subjectId, statement, readingWeek({ ...c, statement }));
     const status = (CLAIM_STATUS as readonly string[]).includes(c.status) ? c.status : 'fact';
     const kind = (CLAIM_KINDS as readonly string[]).includes(c.kind ?? '') ? c.kind! : 'fact';
     const type = normalizeClaimType(c.type);

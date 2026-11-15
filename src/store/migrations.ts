@@ -971,6 +971,33 @@ CREATE OR REPLACE FUNCTION match_grams(t text) RETURNS tsvector
 // split from a namesake by context, which extraction then resolves to.
 // v_claims shows the subject's canonical key and falls back, for rows not yet
 // read, to the old date columns.
+// Weekly readings get ids of their own (src/graph/claim-rekey.ts): the moves of an existing
+// workspace's claims onto them, kept until what was decided about the old claim has been
+// carried over, and the indexes that carrying looks claims up by.
+const V21_CLAIM_REKEY = `
+CREATE TABLE IF NOT EXISTS claim_rekey_moves (
+  old_id   TEXT NOT NULL,
+  new_id   TEXT NOT NULL,
+  week     TEXT,
+  whole    BOOLEAN NOT NULL,
+  carried  BOOLEAN NOT NULL DEFAULT false,
+  -- the links to undo and redo, written with the carried rows, so a carry cut short redoes them
+  plan     JSONB,
+  moved_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (old_id, new_id)
+);
+CREATE INDEX IF NOT EXISTS claim_rekey_moves_pending_idx ON claim_rekey_moves (old_id) WHERE NOT carried;
+CREATE INDEX IF NOT EXISTS claim_rekey_moves_new_idx ON claim_rekey_moves (new_id);
+CREATE INDEX IF NOT EXISTS claim_pair_verdicts_a_idx ON claim_pair_verdicts (a_id);
+CREATE INDEX IF NOT EXISTS claim_pair_verdicts_b_idx ON claim_pair_verdicts (b_id);
+CREATE INDEX IF NOT EXISTS suggestions_merge_claim_idx ON suggestions ((payload->>'claimId')) WHERE kind = 'claim-merge';
+CREATE INDEX IF NOT EXISTS suggestions_merge_canonical_idx ON suggestions ((payload->>'canonicalId')) WHERE kind = 'claim-merge';
+CREATE INDEX IF NOT EXISTS suggestions_conflict_a_idx ON suggestions ((payload->>'a')) WHERE kind = 'knowledge';
+CREATE INDEX IF NOT EXISTS suggestions_conflict_b_idx ON suggestions ((payload->>'b')) WHERE kind = 'knowledge';
+CREATE INDEX IF NOT EXISTS disputes_against_idx ON disputes (against_id);
+CREATE INDEX IF NOT EXISTS claim_links_canonical_idx ON claim_links (canonical_id) WHERE tx_to IS NULL;
+`;
+
 const V19_CLAIM_STATE = `
 ALTER TABLE claims ADD COLUMN IF NOT EXISTS attribute TEXT;
 ALTER TABLE claims ADD COLUMN IF NOT EXISTS value_num DOUBLE PRECISION;
@@ -1055,6 +1082,8 @@ export const MIGRATIONS: Migration[] = [
   { version: 17, name: 'content-languages', up: async (q) => execScript(q, V17_CONTENT_LANGUAGES) },
   { version: 18, name: 'match-grams', up: async (q) => execScript(q, V18_MATCH_GRAMS) },
   { version: 19, name: 'claim-state', up: async (q) => execScript(q, V19_CLAIM_STATE) },
+  // 20 is relation-source on the claim-dates branch; whichever merges second renumbers
+  { version: 21, name: 'claim-rekey', up: async (q) => execScript(q, V21_CLAIM_REKEY) },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;
@@ -1197,6 +1226,11 @@ export async function migrate(
       );
     });
     current = m.version;
+  }
+  // a database made here holds no claim written before weekly readings had ids of their own:
+  // nothing for src/graph/claim-rekey.ts to move, and nothing for the audit to wait on
+  if (from === 0) {
+    await q.query(`INSERT INTO meta (key, value) VALUES ('claim_identity', '{"cursor": null, "done": true}'::jsonb) ON CONFLICT (key) DO NOTHING`);
   }
   return { from, to: current };
 }

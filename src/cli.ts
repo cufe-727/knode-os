@@ -24,6 +24,7 @@ import { registerFeedCommands } from './ingest/feeds/cli.js';
 import { runSourceQuery } from './datasource/execute.js';
 import { entityDetail, graphInsights, graphOverview, graphSearch } from './graph/query.js';
 import { applyClaimMerge, listClaimMerges, unmergeClaim } from './graph/claim-merge.js';
+import { rekeyWeeklyReadings } from './graph/claim-rekey.js';
 import { auditDuplicateClaims } from './graph/claim-dedupe.js';
 import { applyMerge, correctEntity, listMerges, unmergeEntity } from './graph/merge.js';
 import { readEntityCorrections } from './graph/corrections.js';
@@ -2250,6 +2251,28 @@ claimCmd
     const ctx = await createContext(dataDir());
     try {
       console.log((await unmergeClaim(ctx.store, claim, { actor: opts.actor })) ? 'unmerged' : 'no live merge for that claim');
+    } finally {
+      await ctx.store.close();
+    }
+  });
+claimCmd
+  .command('rekey')
+  .description('move claims written before weekly readings had ids of their own (docs/design/29) to them, in steps of --limit claims: evidence moves to the new ids, decisions about a claim that moves whole go with it; no model is called')
+  .option('--limit <n>', 'claims per step', '2000')
+  .option('--steps <n>', 'stop after this many steps (default: until done)')
+  .action(async (opts: { limit: string; steps?: string }) => {
+    const ctx = await createContext(dataDir());
+    try {
+      const max = opts.steps ? Math.max(1, Number(opts.steps)) : Infinity;
+      const total = { scanned: 0, rekeyed: 0, created: 0, unmoved: 0, carried: 0, listed: 0, steps: 0, done: false };
+      while (total.steps < max) {
+        const st = await rekeyWeeklyReadings(ctx.store, { limit: Number(opts.limit) || 2000, onProgress: (m) => console.error(m) });
+        total.steps++;
+        for (const k of ['scanned', 'rekeyed', 'created', 'unmoved', 'carried', 'listed'] as const) total[k] += st[k];
+        total.done = st.done;
+        if (st.done) break;
+      }
+      console.log(JSON.stringify(total, null, 2));
     } finally {
       await ctx.store.close();
     }

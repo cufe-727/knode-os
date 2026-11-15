@@ -267,10 +267,165 @@ export function relationId(sourceId: string, type: string, targetId: string): st
   return crypto.createHash('sha256').update(`${sourceId}|${type}|${targetId}`).digest('hex').slice(0, 24);
 }
 
-/** Claim identity: subject + normalized statement (NFKC, trimmed, whitespace-collapsed). */
-export function claimId(subjectId: string, statement: string): string {
+/**
+ * Claim identity: subject + normalized statement (NFKC, trimmed, whitespace-collapsed),
+ * and for a weekly reading the ISO week it is of (`at`, "2025-W24"; readingWeek):
+ * "平台组本周服务可用性为99.92%" in week 3 and in week 17 are two readings, not one
+ * claim reported twice. Without `at` the id is what it always was.
+ */
+export function claimId(subjectId: string, statement: string, at?: string | null): string {
   const normalized = statement.normalize('NFKC').trim().replace(/\s+/g, ' ');
-  return crypto.createHash('sha256').update(`${subjectId}|${normalized}`).digest('hex').slice(0, 24);
+  return crypto.createHash('sha256').update(`${subjectId}|${normalized}${at ? `|@${at}` : ''}`).digest('hex').slice(0, 24);
+}
+
+/**
+ * The reading test (readingWeek), on the statement and the claim's own dates
+ * alone — no attribute, value or date source, which evidence written before
+ * 2026-11-13 does not carry, so a claim of any age gets the id the writer
+ * would give it now.
+ *
+ * A week is named relative to the report's own: this week (本周, 这周, 当周,
+ * "this week"), last week (上周, 上一周, "last week") or N weeks before (上上周,
+ * 两周前, 3周前, "two weeks ago"). Each is a word: 本周 inside 资本周转率 or
+ * 日本周三, a cycle (本周期, 上周期) and a word ending in 上 (早上周会) are none.
+ */
+const BEFORE_BEN = '资日成版样基根文剧课账读原副脚范标摹底蓝话绘稿刊抄拓选珍孤善刻写足残节记笔';
+const BEFORE_SHANG = '马早晚路线网身手桌之向往加爱赶遇碰';
+const BEFORE_DANG = '相应适得正妥';
+const CN_COUNT: Record<string, number> = { 一: 1, 两: 2, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
+const EN_COUNT: Record<string, number> = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
+const WEEK_WORD = new RegExp([
+  `(?<![${BEFORE_BEN}])(?:本|这)周(?![期年刊岁])`,
+  `(?<![${BEFORE_DANG}])当周(?![期年刊岁])`,
+  `(?<![${BEFORE_SHANG}上])上上?一?周(?![期年刊岁])`,
+  String.raw`(?<![\d.])([一两二三四五六七八九十]|\d{1,2})\s*个?\s*(?:周|星期|礼拜)前`,
+  String.raw`\bthis week\b|\blast week\b|\bthe week before last\b|\b(one|two|three|four|five|six|seven|eight|nine|ten|\d{1,2}) weeks? ago\b`,
+].join('|'), 'gi');
+
+/** The statement names a week relative to its report's (WEEK_WORD). */
+export function speaksOfAWeek(statement: string): boolean {
+  return new RegExp(WEEK_WORD.source, 'i').test(statement.normalize('NFKC'));
+}
+
+/** Substrings every statement speaksOfAWeek takes contains one of (lower-cased): a LIKE filter for SQL. */
+export const WEEK_WORD_HINTS = ['本周', '这周', '当周', '上周', '上一周', '周前', '星期前', '礼拜前', 'this week', 'last week', 'week before last', 'weeks ago', 'week ago'];
+
+/** How many weeks before the report's own a week word names: 本周 0, 上周 1, 上上周 2, 两周前 2. */
+function weeksBack(word: string): number {
+  const w = word.toLowerCase().replace(/\s+/g, ' ');
+  if (/^(?:本|这|当)周$|^this week$/.test(w)) return 0;
+  if (/^上上周$|^the week before last$/.test(w)) return 2;
+  if (/^上一?周$|^last week$/.test(w)) return 1;
+  const n = /^([一两二三四五六七八九十]|\d{1,2})/.exec(w)?.[1] ?? /^(\w+) weeks? ago$/.exec(w)?.[1] ?? '';
+  return CN_COUNT[n] ?? EN_COUNT[n] ?? (Number(n) || 0);
+}
+
+/** A comparison names the period a figure is compared with, not the period it is of: 较上周, 同比去年, "vs last week". */
+const COMPARISON = /(?:较|比|相比|相较|对比|环比|同比|比起|高于|低于|多于|少于)(?:于)?\s*(?:上上?一?周|[两三四\d]\s*周前|上个?月|上一?季度?|上年(?:同期)?|去年(?:同期)?|前一周|上期|同期)|\b(?:compared (?:with|to)|vs\.?|versus|from|than)\s+(?:the week before last|last (?:week|month|quarter|year)|a year (?:ago|earlier))/gi;
+
+/**
+ * Any other time a statement names, which makes it no reading of a week: a
+ * year (2025年, 2025-06, FY25, "in 2025", 去年 — a bare 2000 is a value, as
+ * in 成交额为2000亿元), a quarter, half or a company's report of one (Q3, 3Q25,
+ * 三季度, 三季报, 年报, H1, 上半年), another week (W37, 第24周, 下周, 两周后,
+ * "next week"), a month (6月, 六月, 本月, March — not a tenor: 3月期) or a date
+ * (18日, 18号, 今日 — not 7日年化, 3号线, 5日均线).
+ */
+const OTHER_TIME = new RegExp([
+  String.raw`\d{4}\s*(?:年|财年|-\d{1,2})|\bfy\s*'?\d{2,4}\b|\b(?:in|of|for|since|during|until)\s+(?:19|20)\d{2}\b|[去今明上本]年|(?<![当目此之提日])前年|年[初中底末]`,
+  String.raw`\bq[1-4]\b|q[1-4](?=\d|[^a-z]|$)|(?<![\d.])[1-4]\s*q(?=\d|[^a-z]|$)|[一二三四1-4]\s*季(?:度|报)|[上下本]季度|季报|年报|半年报|中报|\bh[12]\b|(?<![a-z])h[12](?=[^a-z\d]|$)|(?<![\d.])[12]\s*h(?=\d|[^a-z]|$)|[上下]半年`,
+  String.raw`\bw\d{1,2}\b|(?<![a-z])w\d{1,2}(?=\D|$)|第\s*\d{1,3}\s*周|下下?一?周|[一两二三四五六七八九十\d]{1,2}\s*个?\s*周后|\bnext week\b`,
+  String.raw`\d{1,2}\s*月(?!期)|[一二三四五六七八九十]{1,2}月(?!期)|[上下本]个?月|月[初中底末]|\b(?:january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov|dec)\b`,
+  String.raw`(?<![\d.])\d{1,2}\s*[日号](?![均年线])|[今昨明前]日|[今昨明前]天`,
+].join('|'), 'i');
+
+/** A figure that is no code, date or week: 99.92%, 149万, 3项 — not R-70, INC-012-T1, D6T3-1059. */
+function hasFigure(text: string): boolean {
+  return /\d/.test(text.replace(/[a-z]+[-_]?\d+(?:[-_][a-z0-9]+)*/gi, ' ').replace(/\d{4}-\d{1,2}(?:-\d{1,2})?/g, ' '));
+}
+
+/**
+ * The calendar day a stored instant stands for: its date as stored. Dates are
+ * stored as UTC instants, and what the extractor writes is a date without a
+ * time (YYYY-MM-DD, YYYY-Www) or the document's date, each its own UTC
+ * midnight, so the stored date is the date written; a timestamp with a time of
+ * day is read by the date it carries (2025-06-22T20:30+08:00 is stored as
+ * 12:30Z on the 22nd: Sunday the 22nd). The writer keeps no offset, so a local
+ * midnight written with one ahead of UTC (2025-06-16T00:00+08:00) is read as
+ * the UTC day before; reading it as written needs the raw value, which only
+ * the extraction path has (src/graph/llm-extract.ts, src/store/dates.ts).
+ */
+function calendarDay(iso: string): number {
+  return Math.floor(Date.parse(iso) / 86_400_000) * 86_400_000;
+}
+
+/** ISO week of a UTC instant (its UTC day): "2025-W24". */
+export function isoWeekOf(iso: string | number): string {
+  const d = new Date(iso);
+  const day = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  const dow = day.getUTCDay() || 7;
+  day.setUTCDate(day.getUTCDate() + 4 - dow);
+  const week = Math.ceil(((day.getTime() - Date.UTC(day.getUTCFullYear(), 0, 1)) / 86_400_000 + 1) / 7);
+  return `${day.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
+}
+
+const isoOf = (t: string | Date | null | undefined): string | null => {
+  if (t === null || t === undefined || t === '') return null;
+  const d = t instanceof Date ? t : new Date(t);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+};
+
+/**
+ * The ISO week a claim is a reading of, or null: what claimId's `at` carries.
+ *
+ * A reading is what the 10× weekly reports (2026-11-14) showed folding
+ * together: a figure in a statement of one week relative to its report's
+ * (WEEK_WORD; a comparison beside it, 较上周, is not its period) that names no
+ * other time (OTHER_TIME). Its week is
+ *   - the week of the date the source gives the claim (a window inside one
+ *     ISO week, an open window from a day of it, or an event in it), by its
+ *     stored calendar date (calendarDay); but when the statement says N weeks
+ *     back, the report is dated on a weekday and that date is the report's own
+ *     week (the extractor gave the report's dates), N weeks before it;
+ *   - else N weeks before the week of the document's date (`observedAt`),
+ *     counted from the document's own ISO week, a weekend's included;
+ *   - else none: a reading no date places stays one claim, as on main.
+ * When a document's date changes, its relative readings change week and id:
+ * src/graph/claim-rekey.ts (rekeyClaims) moves them with what was decided.
+ */
+export function readingWeek(c: {
+  statement: string;
+  eventAt?: string | Date | null;
+  validFrom?: string | Date | null;
+  validTo?: string | Date | null;
+  observedAt?: string | Date | null;
+}): string | null {
+  const text = c.statement.normalize('NFKC').replace(COMPARISON, ' ');
+  const words = [...text.matchAll(WEEK_WORD)].map((m) => m[0]);
+  if (words.length === 0) return null;
+  const back = new Set(words.map(weeksBack));
+  if (back.size > 1) return null; // two weeks in one statement (上周及本周): no one week's reading
+  const rest = text.replace(WEEK_WORD, ' ');
+  if (OTHER_TIME.test(rest) || !hasFigure(rest)) return null;
+  const n = [...back][0];
+  const from = isoOf(c.validFrom) ?? isoOf(c.eventAt);
+  const doc = isoOf(c.observedAt);
+  const weekBefore = (day: number) => isoWeekOf(day - n * 7 * 86_400_000);
+  if (from) {
+    const start = calendarDay(from);
+    const to = isoOf(c.validFrom) ? isoOf(c.validTo) : null;
+    if (to && isoWeekOf(calendarDay(to)) !== isoWeekOf(start)) return null;
+    // dates the extractor gave the week the word names are taken as they are; only a weekday
+    // report that gave "上周" / "两周前" its own week is read N weeks back. A report written on a
+    // weekend may call the week it closes 上周, so its own week stands there too
+    if (n > 0 && doc) {
+      const docDay = calendarDay(doc);
+      const weekday = new Date(docDay).getUTCDay();
+      if (weekday >= 1 && weekday <= 5 && isoWeekOf(docDay) === isoWeekOf(start)) return weekBefore(start);
+    }
+    return isoWeekOf(start);
+  }
+  return doc ? weekBefore(calendarDay(doc)) : null;
 }
 
 /**
