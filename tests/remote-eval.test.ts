@@ -388,6 +388,24 @@ describe('an evaluation run with remote workers', () => {
     expect(audit).toMatch(/"tool":"knode_secret".*"status":403/);
   }, 60_000);
 
+  it('gives arm B\'s search over the rag index to a session on a worker, through serve', async () => {
+    const res = await runEval({ ...common, packs: [packDir], systems: ['agent-rag'], runDir: path.join(runs, 'agent-rag'), remote: remoteOpts() });
+    const answers = new RunStore(res.runDir).allAnswers();
+    expect(answers.length).toBeGreaterThan(0);
+    expect(answers.filter((a) => a.error).map((a) => a.error)).toEqual([]);
+    for (const a of answers) {
+      expect(a.worker).toBe('laptop/w1');
+      expect(a.commands![0]).toBe('mcp:knode.search {"query":"林晓 澜舟科技","k":2}');
+      // the hits came back from the run's index over serve's lease-bound route, and the answer cites the first
+      const hits = JSON.parse(a.outputs![0]!.text) as { doc: string; passage: string; score: number }[];
+      expect(hits).toHaveLength(2);
+      expect(a.text).toContain(`[doc: ${hits[0].doc}]`);
+      expect(a.retrieved).toContain(hits[0].doc);
+    }
+    const audit = fs.readFileSync(path.join(root, '.knode', 'remote-audit.jsonl'), 'utf8');
+    expect(audit).toMatch(/"evalSession":"[0-9a-f-]{36}".*"tool":"search"/);
+  }, 120_000);
+
   it('revokes a session\'s token and stops it on the worker when the run is cancelled', async () => {
     await stopWorker(w1);
     const tokenFile = path.join(tmp, 'session-token.json');
