@@ -249,8 +249,26 @@ export function claimMeasure(
   return { attribute: stated, valueNum, valueText, unit };
 }
 
-/** The same value: numbers compared at the coarser of their precisions, texts folded. */
+/**
+ * A value that is a week, as one spelling: "2025-W25", "2025年第25周", "第25周"
+ * and 25 with the unit 周 are W25 (with the year when one is given). An
+ * extraction writes a planned launch week each of those ways; read as four
+ * values of one day they never superseded each other (23 series of the 10×
+ * benchmark had "several current values" that were one week).
+ */
+function weekValue(v: Pick<ClaimMeasure, 'valueNum' | 'valueText' | 'unit'>): { year: string | null; week: string } | null {
+  if (v.valueNum !== null && v.unit === '周' && Number.isInteger(v.valueNum) && v.valueNum >= 1 && v.valueNum <= 53) return { year: null, week: String(v.valueNum) };
+  if (v.valueText === null) return null;
+  const t = periodText(v.valueText.normalize('NFKC').replace(/[。.\s]+$/u, ''));
+  const m = /^(?:(\d{4})-)?W(\d{2})$/.exec(t);
+  return m ? { year: m[1] ?? null, week: String(Number(m[2])) } : null;
+}
+
+/** The same value: numbers compared at the coarser of their precisions, texts folded, weeks however spelled. */
 export function sameValue(a: Pick<ClaimMeasure, 'valueNum' | 'valueText' | 'unit'>, b: Pick<ClaimMeasure, 'valueNum' | 'valueText' | 'unit'>): boolean {
+  const wa = weekValue(a);
+  const wb = weekValue(b);
+  if (wa && wb) return wa.week === wb.week && (!wa.year || !wb.year || wa.year === wb.year);
   if ((a.unit ?? '') !== (b.unit ?? '')) return false;
   if (a.valueNum !== null && b.valueNum !== null) {
     const decimals = (n: number) => (String(n).split('.')[1]?.length ?? 0);

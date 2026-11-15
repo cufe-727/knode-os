@@ -5,7 +5,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
 import { auditDuplicateClaims, seriesRelation } from '../src/graph/claim-dedupe.js';
-import { formatValue, keyQualifiers, namesSubject, normalizeAttribute, parseMeasure, seriesObject, subjectSpellingsOf, unifyAttributeKeys } from '../src/graph/claim-state.js';
+import { formatValue, keyQualifiers, sameValue, namesSubject, normalizeAttribute, parseMeasure, seriesObject, subjectSpellingsOf, unifyAttributeKeys } from '../src/graph/claim-state.js';
 import { refreshClaimState, seriesSupersession, StateRow } from '../src/graph/claim-state-store.js';
 import { namesakeChoice, namesakeClusters, NamesakeDoc, renameIn, resolveEntityContext } from '../src/graph/entity-context.js';
 import { buildBatchExtractRequest, buildExtractRequest, RawExtractReply } from '../src/graph/llm-extract.js';
@@ -100,6 +100,16 @@ describe('reading a claim as attribute + value', () => {
     expect(m.get('批次间隔')?.canonical).toBe('间隔');
     expect(m.has('间隔')).toBe(false);
     expect(m.get('初始对账批次间隔')?.canonical).toBe('初始间隔');
+  });
+
+  it('reads one week however a value spells it', () => {
+    const v = (valueNum: number | null, valueText: string | null, unit: string | null = null) => ({ valueNum, valueText, unit });
+    expect(sameValue(v(null, '2025-W25'), v(null, '2025年第25周'))).toBe(true);
+    expect(sameValue(v(null, '第21周'), v(21, null, '周'))).toBe(true);
+    expect(sameValue(v(null, '2025-W21'), v(null, '第21周'))).toBe(true);
+    expect(sameValue(v(null, '2025-W21'), v(null, '2024-W21'))).toBe(false);
+    expect(sameValue(v(null, '第32周'), v(null, '第34周'))).toBe(false);
+    expect(sameValue(v(21, null, '周'), v(21, null, '人'))).toBe(false);
   });
 
   it('reads ISO weeks and relative weeks against the document date', () => {
