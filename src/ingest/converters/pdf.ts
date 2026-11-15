@@ -94,7 +94,7 @@ async function renderPdfPage(
   fs.writeFileSync(outputPath, canvas.toBuffer('image/png'));
 }
 
-async function extractPdfPageText(
+export async function extractPdfPageText(
   page: PDFPageProxy,
 ): Promise<string> {
   const content = await page.getTextContent();

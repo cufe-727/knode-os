@@ -8,6 +8,7 @@ import { installExternal } from './install.js';
 import { QuotaGuard, withRefusalRetry } from './quota.js';
 import { loadPack, packsDir, validatePack } from './pack.js';
 import { listRecipes, recipe } from './packs/index.js';
+import { measurePack, writeMeasure } from './packs/measure.js';
 import { extendPack } from './packs/extend.js';
 import './packs/recipes.js';
 import { buildScaleData, renderScale, writeReport } from './report.js';
@@ -193,6 +194,17 @@ export function registerEvalCommands(program: Command): void {
       for (const e of issues.errors) console.log(`error: ${e}`);
       console.log(`${p.manifest.id}: ${p.docs.length} documents, ${p.tasks.length} tasks, ${p.facts.length} facts — ${issues.errors.length ? 'INVALID' : 'ok'}`);
       if (issues.errors.length) process.exitCode = 1;
+    });
+
+  pack
+    .command('measure <dir>')
+    .description('how far a pack can be answered by lookup, without a model: question terms in gold documents, single-document share, corpus size and shape, hops; plus the two cheapest lint checks')
+    .option('--write', 'keep the result as measure.json beside the pack')
+    .action((dir: string, opts: { write?: boolean }) => {
+      const p = loadPack(resolvePack(dir));
+      const m = opts.write ? writeMeasure(p) : measurePack(p);
+      console.log(JSON.stringify(m, null, 2));
+      if (m.lint.answerInFileName.length || m.lint.duplicateQuestionDifferentGold.length) process.exitCode = 1;
     });
 
   const systems = evalCmd.command('systems').description('systems under test');

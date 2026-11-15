@@ -1,0 +1,210 @@
+[
+ {
+  "question_id": "q_0000000000000001",
+  "question": "针对中国A股市场，请你给出你知识库中2021年资本充足率最高的三家公司股票代码",
+  "metadata": [
+   {
+    "symbol": "601398",
+    "year": 2021,
+    "value_capital_adequacy_ratio_pct": 15.4,
+    "schema": {
+     "value_capital_adequacy_ratio_pct": "资本充足率。"
+    },
+    "id": "00000000-0000-0000-0000-000000000001",
+    "doctype": "A股年报"
+   },
+   {
+    "symbol": "002142",
+    "year": 2021,
+    "value_capital_adequacy_ratio_pct": 15.1,
+    "schema": {
+     "value_capital_adequacy_ratio_pct": "资本充足率。"
+    },
+    "id": "00000000-0000-0000-0000-000000000002",
+    "doctype": "A股年报"
+   },
+   {
+    "symbol": "601166",
+    "year": 2021,
+    "value_capital_adequacy_ratio_pct": 14.2,
+    "schema": {
+     "value_capital_adequacy_ratio_pct": "资本充足率。"
+    },
+    "id": "00000000-0000-0000-0000-000000000003",
+    "doctype": "A股年报"
+   },
+   {
+    "symbol": "600000",
+    "year": 2021,
+    "value_capital_adequacy_ratio_pct": 12.0,
+    "schema": {
+     "value_capital_adequacy_ratio_pct": "资本充足率。"
+    },
+    "id": "00000000-0000-0000-0000-000000000004",
+    "doctype": "A股年报"
+   },
+   {
+    "symbol": "601288",
+    "year": 2021,
+    "value_capital_adequacy_ratio_pct": 11.5,
+    "schema": {
+     "value_capital_adequacy_ratio_pct": "资本充足率。"
+    },
+    "id": "00000000-0000-0000-0000-000000000005",
+    "doctype": "A股年报"
+   },
+   {
+    "symbol": "601939",
+    "year": 2021,
+    "value_capital_adequacy_ratio_pct": 10.9,
+    "schema": {
+     "value_capital_adequacy_ratio_pct": "资本充足率。"
+    },
+    "id": "00000000-0000-0000-0000-000000000006",
+    "doctype": "A股年报"
+   }
+  ],
+  "source_answer": [],
+  "final_answer": "根据2021年数据分析，资本充足率最高的三家公司股票代码分别是：601398、002142、601166。"
+ },
+ {
+  "question_id": "q_0000000000000002",
+  "question": "针对中国A股市场，请你给出你知识库中2021年资本充足率最高的三家公司股票代码",
+  "metadata": [
+   {
+    "symbol": "601398",
+    "year": 2021,
+    "value_capital_adequacy_ratio_pct": 15.4,
+    "schema": {
+     "value_capital_adequacy_ratio_pct": "资本充足率。"
+    },
+    "id": "00000000-0000-0000-0000-000000000001",
+    "doctype": "A股年报"
+   },
+   {
+    "symbol": "002142",
+    "year": 2021,
+    "value_capital_adequacy_ratio_pct": 15.1,
+    "schema": {
+     "value_capital_adequacy_ratio_pct": "资本充足率。"
+    },
+    "id": "00000000-0000-0000-0000-000000000002",
+    "doctype": "A股年报"
+   },
+   {
+    "symbol": "601166",
+    "year": 2021,
+    "value_capital_adequacy_ratio_pct": 14.2,
+    "schema": {
+     "value_capital_adequacy_ratio_pct": "资本充足率。"
+    },
+    "id": "00000000-0000-0000-0000-000000000003",
+    "doctype": "A股年报"
+   },
+   {
+    "symbol": "600000",
+    "year": 2021,
+    "value_capital_adequacy_ratio_pct": 12.0,
+    "schema": {
+     "value_capital_adequacy_ratio_pct": "资本充足率。"
+    },
+    "id": "00000000-0000-0000-0000-000000000004",
+    "doctype": "A股年报"
+   },
+   {
+    "symbol": "601288",
+    "year": 2021,
+    "value_capital_adequacy_ratio_pct": 11.5,
+    "schema": {
+     "value_capital_adequacy_ratio_pct": "资本充足率。"
+    },
+    "id": "00000000-0000-0000-0000-000000000005",
+    "doctype": "A股年报"
+   }
+  ],
+  "source_answer": [],
+  "final_answer": "根据2021年数据分析，资本充足率最高的三家公司股票代码分别是：601398、002142、601166。"
+ },
+ {
+  "question_id": "q_0000000000000003",
+  "question": "针对中国A股市场，请你计算你知识库中2021年资本充足率的极差是多少？",
+  "metadata": [
+   {
+    "symbol": "601398",
+    "year": 2021,
+    "value_capital_adequacy_ratio_pct": 15.4,
+    "schema": {
+     "value_capital_adequacy_ratio_pct": "资本充足率。"
+    },
+    "id": "00000000-0000-0000-0000-000000000001",
+    "doctype": "A股年报"
+   },
+   {
+    "symbol": "002142",
+    "year": 2021,
+    "value_capital_adequacy_ratio_pct": 15.1,
+    "schema": {
+     "value_capital_adequacy_ratio_pct": "资本充足率。"
+    },
+    "id": "00000000-0000-0000-0000-000000000002",
+    "doctype": "A股年报"
+   },
+   {
+    "symbol": "601166",
+    "year": 2021,
+    "value_capital_adequacy_ratio_pct": 14.2,
+    "schema": {
+     "value_capital_adequacy_ratio_pct": "资本充足率。"
+    },
+    "id": "00000000-0000-0000-0000-000000000003",
+    "doctype": "A股年报"
+   },
+   {
+    "symbol": "600000",
+    "year": 2021,
+    "value_capital_adequacy_ratio_pct": 12.0,
+    "schema": {
+     "value_capital_adequacy_ratio_pct": "资本充足率。"
+    },
+    "id": "00000000-0000-0000-0000-000000000004",
+    "doctype": "A股年报"
+   },
+   {
+    "symbol": "601288",
+    "year": 2021,
+    "value_capital_adequacy_ratio_pct": 11.5,
+    "schema": {
+     "value_capital_adequacy_ratio_pct": "资本充足率。"
+    },
+    "id": "00000000-0000-0000-0000-000000000005",
+    "doctype": "A股年报"
+   },
+   {
+    "symbol": "601939",
+    "year": 2021,
+    "value_capital_adequacy_ratio_pct": 10.9,
+    "schema": {
+     "value_capital_adequacy_ratio_pct": "资本充足率。"
+    },
+    "id": "00000000-0000-0000-0000-000000000006",
+    "doctype": "A股年报"
+   }
+  ],
+  "source_answer": [],
+  "final_answer": "极差为4.5个百分点。"
+ },
+ {
+  "question_id": "q_0000000000000004",
+  "question": "ESG question",
+  "metadata": [
+   {
+    "symbol": "601398",
+    "year": 2021,
+    "id": "esg-1",
+    "doctype": "A股ESG报告"
+   }
+  ],
+  "source_answer": [],
+  "final_answer": "x"
+ }
+]

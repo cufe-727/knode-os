@@ -1,0 +1,4 @@
+FORM 10-K
+NORTHWIND TRADERS, INC.
+(Exact name of registrant as specified in its charter)
+Net cash from operating activities 316,116
