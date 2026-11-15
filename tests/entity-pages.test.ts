@@ -137,7 +137,7 @@ describe('entity pages', () => {
   });
 
   it('name the document a tier-1 relation comes from', async () => {
-    // tier 1 writes a relation's evidence on a tier1 scope under the document, with no document on the relation
+    // tier 1 writes a relation's evidence on a tier1 scope under the document; the fold names that document on the relation
     const file = 'raw/docs/notes/atlas.md';
     const documentId = documentIdFor(file);
     const [doc] = await ctx.store.query<{ sha256: string }>(`SELECT sha256 FROM documents WHERE id = $1`, [documentId]);
@@ -154,11 +154,11 @@ describe('entity pages', () => {
     );
     expect(res.outcome).toBe('applied');
     expect(res.relations).toBe(1);
-    const [ev] = await ctx.store.query<{ kind: string; document_id: string | null }>(
-      `SELECT s.kind, r.document_id FROM relations r JOIN evidence ev ON ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL
-       JOIN scopes s ON s.id = ev.scope_id WHERE r.description = 'next door' AND r.tx_to IS NULL`,
+    const [ev] = await ctx.store.query<{ kind: string; document_id: string | null; chunk_document: string | null }>(
+      `SELECT s.kind, r.document_id, c.document_id AS chunk_document FROM relations r JOIN evidence ev ON ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL
+       JOIN scopes s ON s.id = ev.scope_id LEFT JOIN chunks c ON c.id = r.chunk_id WHERE r.description = 'next door' AND r.tx_to IS NULL`,
     );
-    expect(ev).toEqual({ kind: 'tier1', document_id: null });
+    expect(ev).toEqual({ kind: 'tier1', document_id: documentId, chunk_document: documentId });
     await regeneratePage(ctx, 'wiki/entities/atlas-depot.md', 'entity_stub');
     expect(page('atlas-depot')).toMatch(/- related to → Quay Nine: next door — raw\/docs\/notes\/atlas\.md/);
   });

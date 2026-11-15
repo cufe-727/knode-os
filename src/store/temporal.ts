@@ -88,6 +88,36 @@ export interface EvidenceAtRow {
   tx_from: string;
 }
 
+/** The document a scope read, for the scopes that read one: a document's own scope and its tier-1 child. */
+export interface ScopeDocument {
+  documentId: string;
+  /** The scope's key (the document's path), which orders supporters of one instant. */
+  key: string;
+}
+
+/**
+ * The documents behind evidence scopes. A document's scope and its tier-1
+ * child name it in `meta.documentId`; the human-prose scope of a generated
+ * wiki page (`wiki-human`) names its page there too, but a page knode wrote is
+ * no source, so it is left out with merges, research and a person's edits —
+ * the scope kinds entity pages fall back to (src/wiki/pages.ts).
+ */
+export const SOURCE_SCOPE_KINDS = ['doc', 'tier1'] as const;
+
+export async function scopeDocuments(q: Queryable, scopeIds: Iterable<string>): Promise<Map<string, ScopeDocument>> {
+  const ids = [...new Set(scopeIds)];
+  const out = new Map<string, ScopeDocument>();
+  if (ids.length === 0) return out;
+  const rows = await q.query<{ id: string; key: string; document_id: string }>(
+    `SELECT s.id, s.key, d.id AS document_id
+     FROM scopes s JOIN documents d ON d.id = s.meta->>'documentId'
+     WHERE s.id = ANY($1::text[]) AND s.kind = ANY($2::text[])`,
+    [ids, [...SOURCE_SCOPE_KINDS]],
+  );
+  for (const r of rows) out.set(r.id, { documentId: r.document_id, key: r.key });
+  return out;
+}
+
 /**
  * Evidence rows that were live at `asOf` for the given targets. The ids go to
  * the database as one array parameter: an `as_of` read folds every row it
@@ -194,6 +224,27 @@ export interface RelationAsOf {
   valid_from: string | null;
   valid_to: string | null;
   evidence_count: number;
+}
+
+/**
+ * The document a relation was read from, and the passage when its evidence was
+ * grounded to one: of the live supporters whose scope read a document, the
+ * earliest (by tx_from, then scope key and id) — the order entity pages and the
+ * graph walk fall back to while `relations.document_id` is empty, and the one
+ * migrations.ts fillRelationSources fills it by.
+ */
+export function relationSource(rows: EvidenceAtRow[], docs: ReadonlyMap<string, ScopeDocument>): { documentId: string; chunkId: string | null } | null {
+  let best: { r: EvidenceAtRow; doc: ScopeDocument } | null = null;
+  for (const r of rows) {
+    const doc = docs.get(r.scope_id);
+    if (!doc) continue;
+    if (!best) { best = { r, doc }; continue; }
+    const d = new Date(r.tx_from).getTime() - new Date(best.r.tx_from).getTime()
+      || (doc.key < best.doc.key ? -1 : doc.key > best.doc.key ? 1 : 0)
+      || (r.scope_id < best.r.scope_id ? -1 : r.scope_id > best.r.scope_id ? 1 : 0);
+    if (d < 0) best = { r, doc };
+  }
+  return best ? { documentId: best.doc.documentId, chunkId: best.r.segment_id ?? null } : null;
 }
 
 export function foldRelationEvidence(row: { id: string; source_id: string; target_id: string; type: string }, rows: EvidenceAtRow[]): RelationAsOf | null {

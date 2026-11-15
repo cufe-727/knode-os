@@ -109,7 +109,7 @@ export async function historyOf(store: Store, dataDir: string, target: string): 
   const scopes = (await store.query<ScopeRow>(`SELECT * FROM scopes WHERE key = $1 ORDER BY applied_at DESC`, [key])).map(normalizeScope);
   const ids = new Set(scopes.map((s) => s.id));
   const events = readLedger(dataDir).filter((e) => {
-    if (e.ev === 'apply' || e.ev === 'dispose' || e.ev === 'purge') return e.scope.key === key || ids.has(e.scope.id);
+    if (e.ev === 'apply' || e.ev === 'dispose' || e.ev === 'purge' || e.ev === 'redate') return e.scope.key === key || ids.has(e.scope.id);
     return false;
   });
   return { key, scopes, events };

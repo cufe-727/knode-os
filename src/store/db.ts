@@ -2,7 +2,7 @@ import { DatabaseConfig } from '../config.js';
 import { ClaimTypeRefoldResult, claimTypesStale, refoldClaimTypes } from '../lineage/claim-types.js';
 import { Backend, openBackend } from './backend.js';
 import { ensureMatchIndexes, MatchIndexResult } from './grams.js';
-import { CoOccursCleanupResult, dropStoredCoOccurrence, migrate, MigrationResult, Queryable } from './migrations.js';
+import { CoOccursCleanupResult, dropStoredCoOccurrence, fillRelationSources, migrate, MigrationResult, Queryable, RelationSourcesResult } from './migrations.js';
 
 /**
  * Vector column type for the embeddings table.
@@ -95,6 +95,12 @@ export class Store implements Queryable {
    * when `close` stopped the build. `matchIndexes` names the ones ready.
    */
   public indexing: Promise<MatchIndexResult | null> = Promise.resolve(null);
+  /**
+   * The batched follow-up of migration v20 (fillRelationSources): relations
+   * written before it get the document they were read from, in the background
+   * after `cleanup`; settled at once when nothing is pending.
+   */
+  public relationSources: Promise<RelationSourcesResult | null> = Promise.resolve(null);
   public readonly matchIndexes = new Set<string>();
   private stopCleanup = false;
   /** Backend pid of an index build in flight, for close to cancel; only a server can take that call meanwhile. */
@@ -178,6 +184,13 @@ export class Store implements Queryable {
           return null;
         });
     }
+    // relations written before v20 name their document: short batches, after the cleanup
+    this.relationSources = this.cleanup
+      .then(() => fillRelationSources(this, { stop: () => this.stopCleanup }))
+      .catch((err: unknown) => {
+        console.warn(`[knode-os] relation sources stopped: ${err instanceof Error ? err.message : String(err)}; the next open resumes it`);
+        return null;
+      });
     // building the chunk index takes minutes on a large workspace; searches
     // scan without it until it is ready, and a stopped build starts over
     this.indexing = this.cleanup
@@ -277,6 +290,7 @@ export class Store implements Queryable {
     }
     await this.cleanup;
     await this.retype;
+    await this.relationSources;
     await this.indexing;
     await this.db.close();
   }

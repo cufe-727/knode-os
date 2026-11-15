@@ -195,7 +195,7 @@ Run by refine before the duplicate audit (`resolveEntityContext`), deterministic
     `"context"`, which a workspace turns on, adds what follows.
   - *What a workspace on the default sees after upgrading.* Nothing changes when it opens, and no entity is parted
     by a code. A raw document that is new, changed or indexed again gets a date from a dateline at its top when
-    frontmatter and path give none; documents already indexed keep theirs. As documents gain dates that way, refine
+    frontmatter and path give none; documents already indexed are re-dated on the next sync pass (*Re-dating* below). As documents gain dates that way, refine
     may split a person name whose reports fall into two teams at the same time — it logs `entities: X split —
     reason`, the second person appears as `X（team）`, and `knode-os entities merge <X（team）> <X>` puts them back
     for good. A name already parted (by an earlier split) keeps resolving to its entities, in mentions and in the
@@ -237,6 +237,21 @@ Run by refine before the duplicate audit (`resolveEntityContext`), deterministic
   report's own period (≤ 31 days) — or, while that period is still running, the day of indexing — and nothing when
   it is longer or starts in the future. The date may be in digits or with the month by name, and may carry a time
   of day. A bare date (no label, range, weekday, time or byline) counts only on the first or second line.
+- **Re-dating** (`src/ingest/redate.ts`). A doc scope records the date rules it was checked under (`dateRules`,
+  `DOC_DATE_RULES`: 2 since datelines). A sync pass reads the date of a document checked under older rules the way
+  applying reads it; when it reads otherwise than `doc_date`, the document is re-dated in place, in one transaction:
+  `doc_date`, and the dates of the evidence of its frontmatter and of its stored tier-1 extraction — relative dates
+  read again from the stored words, `observed_at`, a claim that states none dated by the document — matched to the
+  words by statement (a claim) or by type, description and endpoints (a relation; one whose words state no date
+  keeps none); then the fold and the pages of the rows that changed. No entity is resolved again, no scope is
+  replaced, no id changes and nothing anyone decided moves; a claim that is now a weekly reading is moved to its
+  week's id by the claim re-key (`rekeyClaims`). A document whose date reads the same is only marked. When a stored
+  extraction cannot be read again, or its words do not account for every row, nothing changes: the document is
+  held for these rules (`dateHeld`), said once, and read again under the next rules or when it is applied again.
+  *A re-date corrects the record; it does not version it.* The evidence rows are updated where they are, so an
+  as-of read for a time before the re-date returns the new dates too. What is kept is a ledger line per document
+  (`ev: "redate"`: old date, new date, rule number) and the sidecar's `meta.docDate`, which an attic replay dates
+  the document by.
 
 ## 6. Extraction
 

@@ -26,7 +26,7 @@ import { DocRoot } from '../types.js';
 import { hasProse, hasRegions, stripRegions } from '../wiki/regions.js';
 import { chunkCode, chunkText } from './chunker.js';
 import { splitCodebaseKey } from './codebase/files.js';
-import { docDateOf } from './docdate.js';
+import { DOC_DATE_RULES, documentDate, redateDocument } from './redate.js';
 import { detectLanguage } from '../lang/detect.js';
 import { estimateTokens } from '../llm/tokens.js';
 import { MINDMAP_PLAN_VERSION, MindMapPlan, planDocumentMindMap, wireMindMap, withMindMapSubject } from '../mindmap/graph.js';
@@ -34,6 +34,8 @@ import { isMindMapFrontmatter, mindMapChunks, parseMindMap } from '../mindmap/ou
 import type { DeferredEmbeddings } from '../context.js';
 import { EmbeddingProvider } from './embeddings.js';
 import { loadSourceText, sha256 } from './source.js';
+
+export { DOC_DATE_RULES } from './redate.js';
 
 /**
  * Apply one file as a document scope: chunk → embed (reusing unchanged
@@ -167,7 +169,11 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
     && !isReservedWikiFile(file) && raw.includes('raw/docs/');
   // a mind map applied by an older planner is read again once (docs/design/19)
   const mindMapStale = live !== null && live.sha === sha && sameModel && live.meta.mindmap !== MINDMAP_PLAN_VERSION && looksLikeMindMap(raw);
+  // a document applied under older date rules has its date read again, and is re-dated in place when it reads otherwise
+  const code = root === 'codebase';
+  const parse = (): ParsedMarkdown => (code ? { frontmatter: {}, body: raw } : parseFrontmatter(raw));
   if (live && live.sha === sha && sameModel && !opts.reapply && !citationsStale && !mindMapStale) {
+    await redateDocument(store, live, { file, root, raw, sha, docId, at: opts.at, actor }, parse, progress);
     // a sidecar may have gained a replayable tier-1 extraction since (copied
     // from another machine, or written by a bench run) — apply it as the
     // document's child scope without re-indexing the document itself
@@ -184,12 +190,11 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
 
   progress(`indexing ${file}`);
   // source code has no frontmatter: a YAML file or a README's own header is its text, not knode metadata
-  const code = root === 'codebase';
-  const parsed: ParsedMarkdown = code ? { frontmatter: {}, body: raw } : parseFrontmatter(raw);
+  const parsed = parse();
   const title = code ? codebaseTitle(file) : titleFromMarkdown(file, parsed);
   const cls = await classify(store, file, root, parsed);
   // a raw document may date itself in its first lines; a wiki page, a trace or source code is dated by its metadata alone
-  const docDate = docDateOf(file, parsed.frontmatter, root === 'docs' ? parsed.body : null, opts.at);
+  const docDate = documentDate(file, root, parsed, opts.at);
   // what a reader would read it as: the Translate stage reads this (docs/design/17);
   // '' is "read, and in no language", which no backfill needs to read again — and code is never translated
   const language = code ? '' : detectLanguage(raw, parsed.frontmatter) ?? '';
@@ -310,7 +315,7 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
       trust,
       acl: declaredAcl,
       meta: {
-        documentId: docId, embedModel: embedder.model, root, kind: cls.kind, title,
+        documentId: docId, embedModel: embedder.model, root, kind: cls.kind, title, dateRules: DOC_DATE_RULES,
         ...(root === 'wiki' ? { citations: CITATIONS_VERSION } : {}),
         ...(mindMapPlan ? { mindmap: MINDMAP_PLAN_VERSION } : {}),
       },

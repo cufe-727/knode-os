@@ -22,6 +22,8 @@ export interface Queryable {
 
 /** `meta` key v13 sets: stored co_occurs rows are still to be deleted (see dropStoredCoOccurrence). */
 export const COOCCURS_CLEANUP_META = 'cooccurs_cleanup';
+/** `meta` key v20 sets: relations written before still lack their document (see fillRelationSources). */
+export const RELATION_SOURCES_META = 'relation_sources';
 
 export interface MigrationContext {
   /** Schema version the database had before this migration run started. */
@@ -1045,6 +1047,29 @@ CREATE OR REPLACE VIEW v_claims AS
   WHERE cl.tx_to IS NULL AND cl.canonical_id IS NULL;
 `;
 
+// A relation names the document it was read from (relations.document_id was
+// in the baseline schema and never written) and, where the extraction grounded
+// it, the passage, as a claim does with chunk_id. The fold sets both from the earliest
+// live supporter whose scope is a document's own or its tier-1 extraction
+// (a generated page's prose scope names its page, but is no source); only
+// chunk_id needs an index, for the foreign key a chunk's deletion fires.
+// Neither enters fold_sha, so
+// filling them re-renders nothing. Rows written before keep NULL until
+// `fillRelationSources` (Store.open, in the background, in batches) or their
+// next fold; readers already fall back to the evidence's scope key meanwhile.
+const V20_RELATION_SOURCE = `
+ALTER TABLE relations ADD COLUMN IF NOT EXISTS chunk_id TEXT REFERENCES chunks(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS relations_chunk_idx ON relations (chunk_id) WHERE chunk_id IS NOT NULL;
+CREATE OR REPLACE VIEW v_relations AS
+  SELECT r.id, r.source_id, r.target_id, r.type, r.description, r.weight,
+         r.evidence_count, r.tx_from, r.valid_from, r.valid_to,
+         r.document_id, r.chunk_id, d.path AS source_path
+  FROM relations r LEFT JOIN documents d ON d.id = r.document_id
+  WHERE r.tx_to IS NULL;
+INSERT INTO meta (key, value) VALUES ('${RELATION_SOURCES_META}', '{"pending": true}'::jsonb)
+  ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+`;
+
 export const MIGRATIONS: Migration[] = [
   { version: 1, name: 'baseline', up: async (q) => execScript(q, V1_BASELINE) },
   {
@@ -1082,7 +1107,7 @@ export const MIGRATIONS: Migration[] = [
   { version: 17, name: 'content-languages', up: async (q) => execScript(q, V17_CONTENT_LANGUAGES) },
   { version: 18, name: 'match-grams', up: async (q) => execScript(q, V18_MATCH_GRAMS) },
   { version: 19, name: 'claim-state', up: async (q) => execScript(q, V19_CLAIM_STATE) },
-  // 20 is relation-source on the claim-dates branch; whichever merges second renumbers
+  { version: 20, name: 'relation-source', up: async (q) => execScript(q, V20_RELATION_SOURCE) },
   { version: 21, name: 'claim-rekey', up: async (q) => execScript(q, V21_CLAIM_REKEY) },
 ];
 
@@ -1233,4 +1258,70 @@ export async function migrate(
     await q.query(`INSERT INTO meta (key, value) VALUES ('claim_identity', '{"cursor": null, "done": true}'::jsonb) ON CONFLICT (key) DO NOTHING`);
   }
   return { from, to: current };
+}
+
+export interface RelationSourcesResult {
+  relations: number;
+  batches: number;
+  seconds: number;
+}
+
+/**
+ * The follow-up v20 flags: give each live relation written before it the
+ * document (and passage) its earliest live supporter was read from, the rule
+ * the fold applies (store/temporal.ts relationSource): evidence of a document's
+ * own scope or its tier-1 extraction (SOURCE_SCOPE_KINDS), earliest by
+ * tx_from, then scope key. A row a fold filled meanwhile is left as it is.
+ * `batch` relations per statement keyed forward by id, each its own
+ * transaction; Store.open runs it in the background and `close` stops it after
+ * the statement in flight, the next open resumes. Only `document_id` and
+ * `chunk_id` are written — not tx_from, fold_sha or anything a page renders —
+ * and a relation no document supports (a merge's, a person's) stays NULL.
+ * Skipping it loses nothing: readers fall back to the evidence's scope key,
+ * and a relation's next fold fills it as well.
+ */
+export async function fillRelationSources(
+  store: MetaStore,
+  opts: { batch?: number; log?: (line: string) => void; stop?: () => boolean } = {},
+): Promise<RelationSourcesResult | null> {
+  const flag = await store.getMeta<{ pending?: boolean }>(RELATION_SOURCES_META);
+  if (!flag?.pending) return null;
+  const batch = Math.max(1, Math.floor(opts.batch ?? 5_000));
+  const log = opts.log ?? ((line: string) => console.log(`[knode-os] ${line}`));
+  const started = Date.now();
+  let relations = 0;
+  let batches = 0;
+  let last = '';
+  for (;;) {
+    if (opts.stop?.()) {
+      log(`relation sources paused after ${relations} relations, ${((Date.now() - started) / 1000).toFixed(1)} s; the next open resumes it`);
+      return { relations, batches, seconds: (Date.now() - started) / 1000 };
+    }
+    const [row] = await store.query<{ relations: number; last: string | null }>(
+      `WITH batch AS (
+         SELECT id FROM relations WHERE tx_to IS NULL AND document_id IS NULL AND id > $1 ORDER BY id LIMIT $2
+       ), src AS (
+         SELECT DISTINCT ON (e.target_id) e.target_id, d.id AS document_id, e.segment_id
+         FROM batch b
+         JOIN evidence e ON e.kind = 'relation' AND e.target_id = b.id AND e.tx_to IS NULL
+         JOIN scopes s ON s.id = e.scope_id AND s.kind IN ('doc', 'tier1')
+         JOIN documents d ON d.id = s.meta->>'documentId'
+         ORDER BY e.target_id, e.tx_from, s.key, s.id
+       ), upd AS (
+         UPDATE relations r SET document_id = src.document_id, chunk_id = (SELECT c.id FROM chunks c WHERE c.id = src.segment_id)
+         FROM src WHERE r.id = src.target_id AND r.document_id IS NULL
+         RETURNING r.id
+       )
+       SELECT (SELECT count(*)::int FROM upd) AS relations, (SELECT max(id) FROM batch) AS last`,
+      [last, batch],
+    );
+    if (!row?.last) break;
+    last = row.last;
+    relations += Number(row.relations);
+    batches++;
+  }
+  const seconds = (Date.now() - started) / 1000;
+  await store.setMeta(RELATION_SOURCES_META, { pending: false, finishedAt: new Date().toISOString(), relations, batches, seconds });
+  if (relations > 0) log(`relation sources: ${relations} relations now name their document (${batches} batches, ${seconds.toFixed(1)} s)`);
+  return { relations, batches, seconds };
 }
