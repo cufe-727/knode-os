@@ -9,7 +9,8 @@ import { factsForQuestion, namedEntities, namedSurface, QuestionFact } from './f
 import { search, SearchMode } from './search.js';
 import { EnumeratedClaim, Enumeration, enumerateClaims, typesInQuestion } from './enumerate.js';
 import { ComputedSet, computeClaimSet } from './claimset.js';
-import { QuestionKind, QuestionRoute, questionRange, routeQuestion } from './route.js';
+import { secondRound } from './second.js';
+import { isChainQuestion, QuestionKind, QuestionRoute, questionRange, routeQuestion } from './route.js';
 import { stepsAsFacts, walkRelations } from './walk.js';
 
 /** Characters of a retrieved passage the answering model is shown. */
@@ -39,6 +40,8 @@ export interface AskRoute {
   walked?: { hops: number; relations: number; reached: number; bridges: number };
   /** For a question asking for a set, a count or a value as of a date: what the claims gave (docs/design/34 §1). */
   computed?: { op: string; scope: string; matched: number; items: number; rows: number; ms: number };
+  /** When the first round was thin: what the second found, and why it ran (docs/design/34 §2). */
+  second?: { chunks: number; facts: number; from: string[]; uncoveredNamed: string[]; missingTerms: string[]; statements: number; ms: number };
 }
 
 const ASK_SYSTEM = `You answer questions from a personal knowledge base. You are given retrieved context chunks, each tagged [n] — one marked "excerpt" holds only the lines of its document that name what the question asks about — and optionally a "Known facts" list: claims extracted from the whole knowledge base, each tagged [n] too, with its date and the document it comes from. The facts reach documents the chunks do not; a question that asks for every case, a list or a history is answered from both.
@@ -155,6 +158,8 @@ export async function ask(
     route?: QuestionKind | 'auto';
     /** false: its searches record no hits (an evaluation answering against the index as built, docs/design/31 D3). */
     track?: boolean;
+    /** false: no second retrieval round however thin the first (docs/design/34 §2). */
+    second?: boolean;
   } = {},
 ): Promise<AskResult> {
   const router = { ...defaultAskRouterConfig(), ...config.retrieval.router };
@@ -193,7 +198,7 @@ interface RouteEnv {
   embedder: EmbeddingProvider;
   llm: LlmClient;
   question: string;
-  opts: { k?: number; mode?: SearchMode; facts?: number; excerpts?: number; track?: boolean };
+  opts: { k?: number; mode?: SearchMode; facts?: number; excerpts?: number; track?: boolean; second?: boolean };
   queryVector: number[] | undefined;
   router: ReturnType<typeof defaultAskRouterConfig>;
   routed: QuestionRoute;
@@ -329,8 +334,23 @@ async function multihopAnswer(env: RouteEnv): Promise<AskResult> {
 }
 
 /** The one completion every route ends in, and its citations. */
-async function compose(env: RouteEnv, contexts: SearchResult[], ranked: PromptFact[], counts: string, routed: AskRoute, heading?: string): Promise<AskResult> {
+async function compose(env: RouteEnv, firstContexts: SearchResult[], firstRanked: PromptFact[], counts: string, routedFirst: AskRoute, heading?: string): Promise<AskResult> {
   const { llm, question, computed } = env;
+  // a thin first round gets one more, from what it found; a computed set or a timeline is complete already
+  let contexts = firstContexts;
+  let ranked = firstRanked;
+  let routed = routedFirst;
+  if (!computed && routedFirst.kind !== 'timeline' && env.opts.second !== false) {
+    const more = await secondRound(env.store, question, {
+      named: env.named, contexts, facts: ranked, chain: routedFirst.kind === 'multihop' || isChainQuestion(question),
+      queryVector: env.queryVector, model: env.embedder.model,
+    }).catch(() => null);
+    if (more) {
+      contexts = [...contexts, ...more.chunks];
+      ranked = [...ranked, ...more.facts];
+      routed = { ...routed, second: { chunks: more.chunks.length, facts: more.facts.length, ...more.reason, statements: more.statements, ms: more.ms } };
+    }
+  }
   // the computed set's rows lead the facts; what else was ranked follows, without repeating them
   const setRows = computed ? computedFacts(computed) : [];
   const inSet = new Set(setRows.map((f) => f.id));

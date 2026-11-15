@@ -36,4 +36,12 @@ Where rules end, and a model would be needed (none is added):
 
 ## 2. A second round when the first is thin (`src/search/second.ts`)
 
-See the second commit on this branch.
+After the first round, and only when no computed set answers the question and it is no timeline, `secondRound` decides by rules whether the round was thin:
+
+- a **chain question** (`isChainQuestion`, or routed multihop): one round answered steps the question asks one after another;
+- a **named entity** no fact is about and no passage mentions;
+- **half the question's words** in none of the passages and facts (CJK pairs that are pieces of grammar — "的人", "复过" — and the names it gives are not words it asks about).
+
+It looks further from the uncovered named entities and from up to four entities the first round reached — its facts are about them, its passages mention them — that the question does not name, weighted by how often they appear and how many of the question's words the facts about them hold. An entity mentioned in more than 15 documents (a team in every weekly report, a person every report lists) is looked from only through passages that also hold a word the first round missed ("调到", "接手"), and never one in more than 80. One round, no model call: at most 4 passages (one a document, most of those entities first, then most missing words, then nearness to the question) and 12 facts about those entities, ranked as the first round's are. `route.second` says what it found and why it ran; `ask(…, { second: false })` turns it off.
+
+Measured on the 312 tasks the 10× run asked (fresh no-model rebuild, the run's bge-m3 vectors): it runs for 57 (every deep-hop, nonlexical-hop and cross-lingual question, 3 others), costs 3.7 statements and 49 ms on average (86 ms at most; the machine was under heavy load), adds 1.25 passages and 12 facts. A gold document in the prompt: 0.86 → 0.88 over all tasks (cross-lingual 0.39 → 0.56, nonlexical-hop 0.61 → 0.72, style 0.41 → 0.47); every gold document: 0.49 unchanged. Deep-hop chains need four or five documents; one more round reaches one of the missing ones at best, and the step it most often misses is a fix written without the incident's code ("上周那起缓存击穿已由方杰修复"), which only entity resolution can link.
