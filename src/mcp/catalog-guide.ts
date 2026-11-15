@@ -26,6 +26,10 @@ export const CATALOG_EXAMPLES: { question: string; sql: string }[] = [
     sql: `SELECT c.attribute, c.value_num, c.value_text, c.unit, c.effective_at, c.superseded_by IS NULL AS current, c.effective_source_path FROM v_claims c JOIN v_entities e ON e.id = c.subject_id WHERE e.name ILIKE 'Acme%' AND c.attribute IS NOT NULL ORDER BY c.attribute, c.effective_at`,
   },
   {
+    question: 'who did what with an entity — every relation in both directions, with the sentence that states it (one hop of a chain)',
+    sql: `SELECT s.name AS source, r.type, t.name AS target, r.description, r.valid_from FROM v_relations r JOIN v_entities s ON s.id = r.source_id JOIN v_entities t ON t.id = r.target_id WHERE s.name ILIKE 'Acme%' OR t.name ILIKE 'Acme%' ORDER BY r.weight DESC LIMIT 50`,
+  },
+  {
     question: 'how many documents mention each organization',
     sql: `SELECT e.name, count(DISTINCT m.document_id) AS documents FROM v_entities e JOIN v_mentions m ON m.entity_id = e.id WHERE e.type = 'organization' AND e.canonical_id IS NULL GROUP BY e.name ORDER BY documents DESC LIMIT 20`,
   },

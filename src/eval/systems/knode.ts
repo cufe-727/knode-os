@@ -18,6 +18,7 @@ import { citationsIn } from '../prompts.js';
 import type { Citation, KnowledgeUnit } from '../types.js';
 import { AGENT_BRIEF } from './agents.js';
 import { catalogGuide } from '../../mcp/catalog-guide.js';
+import { questionKindGuide } from '../../mcp/question-kinds.js';
 import { WIKI_SOURCES_BRIEF, wikiWithSources } from './llm-wiki.js';
 import { recordAgent, shimClient, SystemEnv, SystemUnderTest } from './types.js';
 import { evalTempDir } from '../tmp.js';
@@ -79,19 +80,15 @@ export const KNODE_AGENT_TOOLS = ['knode_resolve', 'knode_survey', 'knode_search
 
 /**
  * The knode agent's brief: the grep baseline's (same opening, same budget)
- * with the tools routed by the kind of question, and the catalog's schema,
- * which an agent cannot guess. The shared brief's "search and read the files
+ * with the tools routed by the kind of question (`questionKindGuide`: the
+ * kinds the 10× reports run showed to matter, 2026-11-15), and the catalog's
+ * schema, which an agent cannot guess. The shared brief's "search and read the files
  * with shell commands" does not apply here: there are no files to run them on.
  */
 export function knodeAgentBrief(): string {
   return `You are answering a question about a document collection. The documents are not in the current directory: they are in a knowledge base you reach through the knode MCP tools (source documents under raw/docs/, generated pages under wiki/). Work read-only. You have a budget of about 20 tool calls; answer before you run out — most questions need 2 to 5. Do not use the network.
 
-Pick the tool by the kind of question:
-- Lists, counts, filters, time ranges ("which…", "how many…", "every…", "in 2025…", "in order"): knode_claims (every claim about an entity, each with its date and source; order="timeline", event_range="2025") or knode_query with source="catalog" (SQL, schema below). One call returns the whole set; then read only the documents you need to confirm or quote.
-- "Who or what is X": knode_resolve on the question (the entities it names, their claims and the best passages in one call), then the entity's page under wiki/.
-- A passage that says something: knode_search (mode="sag" when the answer crosses a relation: "the CEO of the company that acquired…").
-- An exact string, name or number: knode_grep with context=3 (the lines around each match, grouped by file) — often enough without reading the file.
-- Reading: knode_read with paths=[…] reads several documents, sections or line ranges in one call. Never read one document per call.
+${questionKindGuide()}
 
 ${catalogGuide()}`;
 }

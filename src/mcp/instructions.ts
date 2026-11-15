@@ -21,13 +21,15 @@ const MAX_GUIDE_CHARS = 6_000;
  * initialised, the agent spent a call on `knode_read "AGENTS.md"` in two
  * questions of four and got nothing. With a guide the text follows right
  * here, so reading it again is a call for what the agent already holds.
+ * The kinds on the first line are the ones the 2026-11 reports run showed to
+ * matter (src/mcp/question-kinds.ts says what each won).
  */
 function preamble(guide: 'none' | 'whole' | 'cut'): string {
   const second = guide === 'none'
     ? `knode_survey says what this base holds, in numbers. It has no guide of its own yet (${GUIDE_FILE}, written by an initialization).`
     : `The base's own guide (${GUIDE_FILE}: what it holds, how things are named, which tool answers which question) follows${guide === 'cut' ? ', cut short' : ''}; knode_survey has the current numbers.`;
   return [
-    'knode-os is a local knowledge base: documents → entities / relations / claims → wiki pages. Pick the tool by the kind of question. Lists, counts, filters and time ranges: knode_claims (every claim about an entity; order=timeline, event_range) or knode_query source="catalog" (SQL over v_claims / v_entities / v_evidence — its description has the columns and examples), one call for the whole set. "Who or what is X": start with knode_resolve (its entities, claims and passages in one call), then the entity page under wiki/. Passages: knode_search (mode=sag when the answer crosses a relation). Exact strings, names, numbers: knode_grep with `context`, which shows the lines around each match. Relations: knode_graph_search. Read documents several per call (`paths`), not one call each. as_of / valid_at travel in time.',
+    'knode-os is a local knowledge base: documents → entities / relations / claims → wiki pages. Pick the tool by the kind of question. How something changed (progress by month, a history): knode_claims order=timeline. Lists, counts and rankings across the whole base: knode_query source="catalog" (SQL over v_claims / v_entities / v_relations — its description has the columns and examples) or knode_claims text=, one call for the whole set. Who did what, and chains of it (who fixed X, which project that person owns): v_relations through knode_query, one call per hop (knode_graph_search draws the graph around an entity). "Who or what is X": start with knode_resolve (its entities, claims and passages in one call), then the entity page under wiki/. Passages: knode_search (mode=sag when the answer crosses a relation). Exact strings, IDs, numbers, and a value now or as of a date (the latest source before it): knode_grep with `context`, which shows the lines around each match. Read documents several per call (`paths`), not one call each. as_of / valid_at travel in time.',
     second,
     'Writes go through knode_write (wiki/, raw/docs/, playbooks/packs/) and land quarantined until a person promotes them; a contradiction opens a dispute instead of overwriting.',
     'Web material you rely on goes in with knode_capture: knode fetches the URL itself, keeps the original under raw/docs/research/ (converted and indexed like any document) and returns the path to cite. knode_study shows multi-page research studies.',
