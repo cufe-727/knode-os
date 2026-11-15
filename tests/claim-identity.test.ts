@@ -821,5 +821,14 @@ describe('carrying decisions (review of 4ec34fd)', () => {
     expect(lines.filter((l) => l.includes('accepted merge'))).toHaveLength(1);
   });
 
-
+  it('keeps a reset made while a step runs, and prunes carried moves once done', async () => {
+    const ctx = await legacy('state-merge');
+    // a reset lands while a step is between reading and writing the state
+    const step = rekeyWeeklyReadings(ctx.store, { limit: 1, onProgress: () => {} });
+    await ctx.store.setMeta('claim_identity', { cursor: null, done: false, reset: true });
+    await step;
+    expect((await rekeyState(ctx.store)) as unknown).toMatchObject({ cursor: null, done: false });
+    await untilDone(ctx);
+    expect(await ctx.store.query(`SELECT 1 FROM claim_rekey_moves`)).toHaveLength(0);
+  });
 });

@@ -416,6 +416,8 @@ export async function rekeyClaims(store: Store, ids: string[], opts: { actor?: s
     const drained = await drainCarry(store, opts);
     stats.carried += drained.carried;
     stats.listed += drained.listed;
+    // a later move (a document re-dated) after the migration ended leaves nothing behind either
+    if ((await rekeyState(store)).done) await store.query(`DELETE FROM claim_rekey_moves WHERE carried`);
   }
   return stats;
 }
@@ -423,7 +425,8 @@ export async function rekeyClaims(store: Store, ids: string[], opts: { actor?: s
 /** One bounded step: at most `limit` claims from the cursor on, with their group mates. */
 export async function rekeyWeeklyReadings(store: Store, opts: { limit?: number; actor?: string; onProgress?: (msg: string) => void; carry?: boolean } = {}): Promise<RekeyStats> {
   const limit = Math.max(1, opts.limit ?? 2000);
-  const state = await rekeyState(store);
+  const read = await store.getMeta<RekeyState>(META_KEY);
+  const state = read ?? { cursor: null, done: false };
   // a step cut short left moves whose decisions were not carried yet
   const resumed = opts.carry === false ? { carried: 0, listed: 0 } : await drainCarry(store, opts);
   const stats: RekeyStats = { scanned: 0, rekeyed: 0, created: 0, unmoved: 0, carried: resumed.carried, listed: resumed.listed, done: state.done };
@@ -439,8 +442,17 @@ export async function rekeyWeeklyReadings(store: Store, opts: { limit?: number; 
     done: candidates.length < limit,
     unmoved: (state.unmoved ?? 0) + step.unmoved,
   };
-  await store.setMeta(META_KEY, next);
-  stats.done = next.done;
+  // written only over the state this step read: a reset (or another step) since then stands
+  const written = await store.tx(async (q) => {
+    await lockLedger(q);
+    const [cur] = await q.query<{ value: unknown }>(`SELECT value FROM meta WHERE key = $1`, [META_KEY]);
+    if (JSON.stringify(cur?.value ?? null) !== JSON.stringify(read ?? null)) return false;
+    await q.query(`INSERT INTO meta (key, value) VALUES ($1, $2::jsonb) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [META_KEY, JSON.stringify(next)]);
+    // once done, the moves whose decisions were carried have served
+    if (next.done) await q.query(`DELETE FROM claim_rekey_moves WHERE carried`);
+    return true;
+  });
+  stats.done = written ? next.done : (await rekeyState(store)).done;
   if (stats.rekeyed || stats.unmoved) {
     opts.onProgress?.(`claims: ${stats.rekeyed} claims moved to weekly-reading identity (${stats.created} readings${stats.unmoved ? `, ${stats.unmoved} too old to tell, left whole` : ''}${stats.listed ? `, ${stats.listed} merges listed for a person` : ''})${next.done ? '; done' : ''}`);
   }
