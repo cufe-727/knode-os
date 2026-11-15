@@ -71,6 +71,27 @@ async function session(cwd, out) {
     emit({ type: 'item.completed', item: { id, type: 'mcp_tool_call', server: 'knode', tool: 'search', arguments: input, status: r.isError ? 'failed' : 'completed', result: { content: r.content }, error: null } });
     const top = r.isError ? null : JSON.parse(r.content?.[0]?.text ?? '[]')[0]?.doc;
     answer = `林晓在澜舟科技担任高级数据工程师 [doc: ${top ?? 'none'}]。\nFinal answer: 高级数据工程师`;
+  } else if (url && enabled.includes('knode_search') && !enabled.includes('knode_read')) {
+    // arm D: a real knode_search through the session's URL, and a knode_read it was not given, which must be refused
+    const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+    const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+    const client = new Client({ name: 'fake-eval-cli', version: '1.0.0' });
+    await client.connect(new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: { Authorization: `Bearer ${token}` } } }));
+    const input = { query: '林晓', k: 2 };
+    const id = `item_${ids++}`;
+    emit({ type: 'item.started', item: { id, type: 'mcp_tool_call', server: 'knode', tool: 'knode_search', arguments: input, status: 'in_progress' } });
+    const r = await client.callTool({ name: 'knode_search', arguments: input });
+    emit({ type: 'item.completed', item: { id, type: 'mcp_tool_call', server: 'knode', tool: 'knode_search', arguments: input, status: r.isError ? 'failed' : 'completed', result: { content: r.content }, error: null } });
+    let read = 'answered';
+    try {
+      const x = await client.callTool({ name: 'knode_read', arguments: { path: 'raw/docs/email/2026-03-05.md' } });
+      if (x.isError) read = 'refused';
+    } catch {
+      read = 'refused';
+    }
+    await client.close();
+    const files = fs.readdirSync(cwd).sort().join(',');
+    answer = `folder: ${files}; knode_search: ${r.isError ? 'failed' : 'answered'}; knode_read: ${read}\nFinal answer: done`;
   } else if (url) {
     ran({ type: 'mcp_tool_call', server: 'knode', tool: 'knode_resolve', arguments: { query: '林晓的岗位' } }, { status: 'completed', result: { content: [{ type: 'text', text: '{"entities":[{"name":"林晓"}]}' }] }, error: null });
     if (prompt.includes('CALL_MCP')) {

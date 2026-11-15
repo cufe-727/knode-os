@@ -1,6 +1,6 @@
 import { agentGrep } from './agents.js';
 import { externalSystem, EXTERNAL_SYSTEMS } from './external.js';
-import { agentKnode, agentKnodeWiki, agentKnodeWikiSources, knodeAsk, knodeSag } from './knode.js';
+import { agentKnode, agentKnodeFull, agentKnodeWiki, agentKnodeWikiSources, knodeAsk, knodeSag } from './knode.js';
 import { llmWiki, llmWikiSources } from './llm-wiki.js';
 import { agentRag, ragBm25, ragHybrid, ragVector } from './rag.js';
 import { closedBook, longContext } from './refs.js';
@@ -13,6 +13,7 @@ export const SYSTEMS: Record<string, () => SystemUnderTest> = {
   'agent-knode': agentKnode,
   'agent-knode-wiki': agentKnodeWiki,
   'agent-knode-wiki-sources': agentKnodeWikiSources,
+  'agent-knode-full': agentKnodeFull,
   'agent-wiki': llmWiki,
   'agent-wiki-sources': llmWikiSources,
   'agent-grep': agentGrep,

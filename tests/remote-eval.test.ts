@@ -406,6 +406,21 @@ describe('an evaluation run with remote workers', () => {
     expect(audit).toMatch(/"evalSession":"[0-9a-f-]{36}".*"tool":"search"/);
   }, 120_000);
 
+  it('runs arm D on a worker: the wiki and the sources as its folder, knode\'s six retrieval tools through serve and no other', async () => {
+    const res = await runEval({ ...common, packs: [packDir], systems: ['agent-knode-full'], runDir: path.join(runs, 'agent-knode-full'), remote: remoteOpts(), reuseBuildsFrom: e2eDir });
+    const answers = new RunStore(res.runDir).allAnswers();
+    expect(answers.length).toBeGreaterThan(0);
+    expect(answers.filter((a) => a.error).map((a) => a.error)).toEqual([]);
+    for (const a of answers) {
+      expect(a.worker).toBe('laptop/w1');
+      expect(a.text).toMatch(/^folder: raw,wiki; knode_search: answered; knode_read: refused/);
+      expect(a.commands).toEqual(['mcp:knode.knode_search {"query":"林晓","k":2}']);
+      expect(a.outputs![0]!.chars).toBeGreaterThan(0);
+    }
+    const audit = fs.readFileSync(path.join(root, '.knode', 'remote-audit.jsonl'), 'utf8');
+    expect(audit).toMatch(/"tool":"knode_read".*"status":403/);
+  }, 120_000);
+
   it('revokes a session\'s token and stops it on the worker when the run is cancelled', async () => {
     await stopWorker(w1);
     const tokenFile = path.join(tmp, 'session-token.json');
