@@ -6,6 +6,7 @@ import { LlmClient } from '../llm/client.js';
 import { exportAudit, importAudit } from './audit.js';
 import { installExternal } from './install.js';
 import { QuotaGuard, withRefusalRetry } from './quota.js';
+import { formatGrepability, grepability } from './grepability.js';
 import { formatLint, lintBeforeRun, lintPack } from './lint.js';
 import { loadPack, packsDir, validatePack } from './pack.js';
 import { listRecipes, recipe } from './packs/index.js';
@@ -206,6 +207,17 @@ export function registerEvalCommands(program: Command): void {
       for (const r of results) console.log(formatLint(r, Number(opts.examples)));
       if (opts.json) fs.writeFileSync(opts.json, JSON.stringify(results, null, 1) + '\n');
       if (results.some((r) => r.findings.length)) process.exitCode = 1;
+    });
+
+  pack
+    .command('grepability <dirs...>')
+    .description('how far a literal search gets, per question family: the share of questions whose gold documents all hold a rare word of the question, and whose first-step document does (no model)')
+    .option('--share <f>', 'a term narrows a search when at most this share of the corpus holds it', '0.05')
+    .option('--json <file>', 'write the numbers as JSON')
+    .action((dirs: string[], opts) => {
+      const results = dirs.map((d) => grepability(loadPack(resolvePack(d)), Number(opts.share)));
+      console.log(formatGrepability(results));
+      if (opts.json) fs.writeFileSync(opts.json, JSON.stringify(results, null, 1) + '\n');
     });
 
   const systems = evalCmd.command('systems').description('systems under test');

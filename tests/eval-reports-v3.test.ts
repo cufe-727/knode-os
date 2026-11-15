@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { grepability } from '../src/eval/grepability.js';
 import { lintPack } from '../src/eval/lint.js';
 import { docText, LoadedPack, loadPack, validatePack } from '../src/eval/pack.js';
 import { recipe } from '../src/eval/packs/index.js';
@@ -187,5 +188,14 @@ describe('weekly reports v3: the questions', () => {
       expect(t.meta!.stale).toEqual([String(f.reported)]);
       expect(t.question).toContain('以月报为准');
     }
+  });
+});
+
+describe('grep-ability', () => {
+  it('finds the v3 hops much harder to reach by a literal term than its controls', () => {
+    const r = grepability(packs.zh);
+    const row = (f: string) => r.rows.find((x) => x.family === f)!;
+    expect(row('hop').allGold).toBeLessThan(0.1);
+    expect(row('control-exact').firstStep).toBe(1);
   });
 });
