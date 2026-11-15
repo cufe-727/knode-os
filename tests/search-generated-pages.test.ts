@@ -6,7 +6,7 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { defaultRerankConfig } from '../src/config.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
-import { cutWithSources, describeVectorScan, docLiveAt, GENERATED_SHARE, search, searchExplained, SearchMode, sideBudget, vectorScan } from '../src/search/search.js';
+import { cutWithSources, describeVectorScan, docLiveAt, GENERATED_SHARE, generatedPlaces, search, searchExplained, SearchMode, sideBudget, vectorScan } from '../src/search/search.js';
 import { Store, toVectorLiteral } from '../src/store/db.js';
 import { MATCH_INDEXES } from '../src/store/grams.js';
 import { resolveScopeFilter } from '../src/store/resolver.js';
@@ -176,6 +176,17 @@ describe('generated pages in search results', () => {
     // a filter that leaves a side nothing sends no branch for it, and one that leaves neither side anything no statement
     expect(await ids('vector', { sources: ['raw/docs/weekly/s3.md'] })).toEqual(['s3']);
     expect(await ids('vector', { sources: ['raw/docs/nowhere'] })).toEqual([]);
+  });
+
+  it('gives pages a quarter at most: the share is rounded down', async () => {
+    expect([1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 20].map((k) => generatedPlaces(k, GENERATED_SHARE))).toEqual([0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 3, 5]);
+    // rounded to the nearest, a search for 10 gave pages 3 places and one for 6 gave them 2
+    expect(sidesOf(await ids('hybrid', { k: 10 })).pages).toHaveLength(2);
+    expect(sidesOf(await ids('hybrid', { k: 6 })).pages).toHaveLength(1);
+    // the page that ranks first keeps a place where a quarter is less than one
+    expect([1, 2, 3].map((k) => generatedPlaces(k, GENERATED_SHARE, true))).toEqual([1, 1, 1]);
+    expect(generatedPlaces(8, 0, true)).toBe(0);
+    expect(generatedPlaces(8, 1)).toBe(8);
   });
 
   it('gives a side a budget of rows that grows with the root of the index', () => {

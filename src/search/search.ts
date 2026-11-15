@@ -139,12 +139,26 @@ export const GENERATED_SHARE = 0.25;
 
 /**
  * How many of `k` results generated pages may take at `share`: the share of
- * `k`, rounded, and one at least when the best candidate of all is a page
- * (`topIsPage`) — the page a question about a name is answered from keeps its
- * place in a search for one or two results, where the share rounds to none.
+ * `k`, rounded down — the share is the most pages get, and rounded to the
+ * nearest it gave them 3 of 10 and 2 of 6 — and one at least when the best
+ * candidate of all is a page (`topIsPage`): the page a question about a name
+ * is answered from keeps its place in a search for one to three results,
+ * where a quarter is less than a place.
+ *
+ * The places pages do not take go to sources however low they rank: there is
+ * no floor a source must clear. A fused score is a sum of reciprocal ranks,
+ * not a measure of relevance, so there is no score to draw the line at that
+ * means the same thing in two corpora or two channels; and what the replay
+ * shows of the last places is that they earn their keep — given all 8 places
+ * instead of 6, sources hold a gold document for 113 questions instead of
+ * 102 (the table above), so the seventh and eighth source answer 11
+ * questions the first six do not. A source that should not be there costs a
+ * place in the context; a source left out costs the answer. Where a reranker
+ * is configured its score is a relevance one, and a floor could be drawn on
+ * it: not done, for want of a measurement with one.
  */
 export function generatedPlaces(k: number, share: number, topIsPage = false): number {
-  const places = Math.round(k * Math.min(1, Math.max(0, share)));
+  const places = Math.floor(k * Math.min(1, Math.max(0, share)) + 1e-9);
   return Math.min(k, Math.max(0, places, topIsPage && share > 0 ? 1 : 0));
 }
 
