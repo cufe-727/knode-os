@@ -85,6 +85,19 @@ The producer becomes a client that publishes what its records lack and collects 
 
 A knowledge-base build stays as it is: each extraction pass depends on what the pass before found, so its calls are published as the build goes, by something that is alive.
 
+**Where the store lives (decided 2026-11-15): the root data folder, `<root>/.knode/eval-queue/`, one folder per run.**
+
+| Weighed | Root data folder | A schema of its own in the server's database |
+| --- | --- | --- |
+| `serve` on PGlite or PostgreSQL | the same code either way | two code paths; on PGlite the database is a workspace's, opened by `serve` alone, and evaluation work is the server's, not a workspace's |
+| What is already there | the archives sessions read are files beside it (`.knode/eval-archives/`); a run directory keeps its records as keyed files too | nothing evaluation keeps is in a database today |
+| Results of megabytes (a session's stdout, up to 32 MB) | a file each, written once, read only when collected, removed with `rm` | rows of megabytes held in a table, vacuumed after; PGlite keeps them in this process's memory |
+| Surviving a restart | each task is a file written whole (a temporary file renamed over it); a result written before its task's state is still read as the result | transactions |
+| Two `serve` processes | one owner at a time: the store takes `owner.json` (process id and a nonce, created exclusively); a second process that finds a live owner does not open it, keeps its evaluation work in memory as stage 1 did, and says so in `/eval/v1/status` and its log | row locks, but two processes leasing from one table would also need leases shared through it, which this design keeps in memory |
+| Size | one bound in bytes, counted from the files | a bound counted in the database |
+
+A transaction is the one thing the database would give that the files do not, and a task changes state at most three times (published, finished, collected), each by one owner. So the files: no migration, no second path, and `eval drop` can remove a run's tasks with `serve` stopped.
+
 ## 6. Evaluation as a job (stage 3)
 
 Three systems need the knowledge base a run built, not only a model: `agent-knode` (its sessions call knode's tools on that index), `knode-ask` (retrieval before its model call) and the build itself. Today that index is opened by the run process and its tools are served from inside it (design 31 D4), so those pieces can only be served while the run is alive; on PGlite no other process could open the index at all.
@@ -119,7 +132,7 @@ Two defects found on 2026-11-14 are fixed in stage 1, since they are placement b
 
 ## 10. Open items
 
-- Where `serve` keeps durable tasks: the root data folder, or a schema of its own in the server's database.
+- ~~Where `serve` keeps durable tasks~~: decided 2026-11-15, the root data folder (§5).
 - Whether a local slot started by a run is bound by `processing.maxLocalCalls`, which today covers `serve`'s slots only. A run and `serve` on one account otherwise exceed the limit the user set for the machine. Stage 1 leaves the run's slots outside it (the default this design proposed), so `--local codex:6` beside `serve`'s own six is twelve calls on this machine.
 - Whether `judge` calls of a review should carry `requires` too, so a review can be pinned to a pool as a run can.
 - How a pool is shown in the Tasks view, next to the worker and backend it already lists. Stage 1 tags a remote worker with its pool and evaluation work with `evaluation`, and puts a piece's required pool in its detail; a better place may come with use.
