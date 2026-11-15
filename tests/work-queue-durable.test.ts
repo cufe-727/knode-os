@@ -7,12 +7,13 @@ import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { afterAll, describe, expect, it } from 'vitest';
 import { defaultConfig } from '../src/config.js';
+import { OwnQueue, RemoteEval, RunCancelledError, ServeQueue, ServeRefusedError } from '../src/eval/remote.js';
 import type { WorkerIdentity } from '../src/labeling/scheduler.js';
 import { mountEvalProducer } from '../src/remote/eval-producer.js';
 import type { WorkTask } from '../src/work/broker.js';
 import { dropStoredRun, EvalStoreFullError, EvalTaskStore } from '../src/work/eval-store.js';
 import { EvalWork } from '../src/work/eval.js';
-import type { EvalCallSpec, EvalSessionSpec, EvalWorkOptions } from '../src/work/eval.js';
+import type { EvalCallSpec, EvalOutcome, EvalSessionSpec, EvalWorkOptions } from '../src/work/eval.js';
 
 /**
  * docs/design/32 stage 2: `serve` keeps an evaluation run's tasks and their
@@ -111,6 +112,10 @@ async function startServe(root: string, opts: { port?: number; work?: EvalWorkOp
     },
   };
 }
+
+const connect = (url: string, run: string, over: Record<string, unknown> = {}) => RemoteEval.connect({ serveUrl: url, token: TOKEN, run, scope: path.join(tmp, 'runs', run), refreshMs: 100, backoffMs: 30, waitMinutes: 0, ...over });
+const publishCall = (remote: RemoteEval, prompt: string) => remote.publish({ kind: 'eval-call', eligible: 'any', label: 'answer', agent, prompt, schema: null, timeoutMs: 60_000 }, async () => 'here', { system: 'closed-book', task: prompt });
+const textOf = (p: Awaited<ReturnType<typeof publishCall>>) => (p.local ? `local: ${'value' in p ? p.value : p.error}` : p.outcome.outcome === 'answered' ? p.outcome.text : `error: ${p.outcome.error}`);
 
 describe('the store in the root data folder', () => {
   it('keeps a published task across a restart, waiting again whatever lease it had, and refuses the old lease\'s late answer', async () => {
@@ -320,6 +325,150 @@ describe('the store in the root data folder', () => {
   });
 });
 
+describe('a run against serve\'s durable queue', () => {
+  it('publishes in batches and collects with a poll, never one held request a piece', async () => {
+    const s = await startServe(newRoot());
+    const w = startWorker(() => s.work);
+    const remote = (await connect(s.url, 'batches'))!;
+    const results = await Promise.all(Array.from({ length: 40 }, (_, i) => publishCall(remote, `q${i}`)));
+    expect(results.map(textOf)).toEqual(Array.from({ length: 40 }, (_, i) => `done: q${i}`));
+    expect(s.hits.offer ?? 0).toBe(0);
+    expect(s.hits.tasks).toBeLessThanOrEqual(4);
+    expect([...w.done.values()].every((n) => n === 1)).toBe(true);
+    expect(w.done.size).toBe(40);
+    remote.close();
+    await w.stop();
+    await s.close();
+  });
+
+  it('carries on across a restart of serve while it waits, each piece done once, and the old lease\'s answer refused', async () => {
+    const root = newRoot();
+    let s = await startServe(root);
+    const port = s.port;
+    let up: EvalWork | null = s.work;
+    const lines: string[] = [];
+    const remote = (await connect(s.url, 'restart', { log: (m: string) => lines.push(m) }))!;
+    // the worker holds the first piece it gets, as one would while serve stops
+    let holdOne = true;
+    const w = startWorker(() => up, { hold: () => (holdOne ? ((holdOne = false), true) : false) });
+    const pieces = Array.from({ length: 6 }, (_, i) => publishCall(remote, `r${i}`));
+    await until(() => w.held.length === 1 && w.done.size >= 2);
+    // serve stops while pieces wait, and starts again on the same port and data root
+    up = null;
+    await s.close();
+    await sleep(300);
+    s = await startServe(root, { port });
+    expect((await w.answer(0, s.work)).accepted).toBe(false);
+    up = s.work;
+    const results = await Promise.all(pieces);
+    expect(results.map(textOf)).toEqual(Array.from({ length: 6 }, (_, i) => `done: r${i}`));
+    expect(w.done.size).toBe(6);
+    expect([...w.done.values()].every((n) => n === 1)).toBe(true);
+    expect(lines.some((l) => /serve is not answering/.test(l))).toBe(true);
+    remote.close();
+    await w.stop();
+    await s.close();
+  });
+
+  it('exits and resumes without losing or repeating work in flight: what a worker finished meanwhile is collected, not asked again', async () => {
+    const s = await startServe(newRoot());
+    const w = startWorker(() => s.work, { hold: (t) => ['x0', 'x1'].includes((t as { prompt?: string }).prompt ?? '') });
+    const a = (await connect(s.url, 'resume'))!;
+    const first = ['x0', 'x1', 'x2', 'x3'].map((q) => publishCall(a, q).catch((e) => e));
+    await until(() => w.held.length === 2 && w.done.size === 2);
+    // the run stops (a signal, its wait limit): the pieces out with the worker stay in serve
+    await a.cancel();
+    expect((await Promise.all(first)).slice(0, 2).every((e) => e instanceof RunCancelledError)).toBe(true);
+    for (let i = 0; i < 2; i++) expect((await w.answer(i, s.work)).accepted).toBe(true);
+    // the resume asks what its records lack — here all four — and every one comes back from the store
+    const b = (await connect(s.url, 'resume'))!;
+    const results = await Promise.all(['x0', 'x1', 'x2', 'x3'].map((q) => publishCall(b, q)));
+    expect(results.map(textOf)).toEqual(['done: x0', 'done: x1', 'done: x2', 'done: x3']);
+    expect(w.done.size).toBe(4);
+    expect([...w.done.values()].every((n) => n === 1)).toBe(true);
+    b.close();
+    await w.stop();
+    await s.close();
+  });
+
+  it('keeps the run\'s own slots working against it, their results never handed to another process of the run', async () => {
+    const s = await startServe(newRoot());
+    const a = (await connect(s.url, 'own'))!;
+    a.startLocal({ codex: 2 });
+    let runs = 0;
+    const own = (remote: RemoteEval, q: string) => remote.publish({ kind: 'eval-call', eligible: 'local', label: 'answer', agent, prompt: '', schema: null, timeoutMs: 60_000 }, async () => `${++runs}: ${q}`, { system: 'closed-book', task: q }, [q]);
+    expect(await Promise.all(['l0', 'l1', 'l2'].map((q) => own(a, q)))).toEqual([
+      { local: true, value: expect.stringMatching(/: l0$/) }, { local: true, value: expect.stringMatching(/: l1$/) }, { local: true, value: expect.stringMatching(/: l2$/) },
+    ]);
+    expect(runs).toBe(3);
+    a.close();
+    await a.drained();
+    // another process of the run has no value for them: its own slots run them again
+    const b = (await connect(s.url, 'own'))!;
+    b.startLocal({ codex: 1 });
+    expect(await own(b, 'l0')).toEqual({ local: true, value: '4: l0' });
+    b.close();
+    await b.drained();
+    await s.close();
+  });
+
+  it('serves two producers: two runs apart, and one key published by two clients as one task', async () => {
+    const s = await startServe(newRoot());
+    const w = startWorker(() => s.work);
+    const r1 = (await connect(s.url, 'two-a'))!;
+    const r2 = (await connect(s.url, 'two-b'))!;
+    const [a, b] = await Promise.all([Promise.all(['p0', 'p1'].map((q) => publishCall(r1, q))), Promise.all(['p0', 'p1'].map((q) => publishCall(r2, q)))]);
+    expect(a.map(textOf)).toEqual(['done: p0', 'done: p1']);
+    expect(b.map(textOf)).toEqual(['done: p0', 'done: p1']);
+    // the same prompt in two runs is two pieces: a run never gets another's result
+    expect(w.done.size).toBe(4);
+    r1.close();
+    r2.close();
+    await w.stop();
+    // two clients of one run publish the same key: one task, both get its result
+    const q1 = new ServeQueue(s.url, TOKEN);
+    const q2 = new ServeQueue(s.url, TOKEN);
+    await q1.status('same', true);
+    await q2.status('same', true);
+    const ac = new AbortController();
+    const spec = call('same', 'shared-0001');
+    const both = Promise.all([q1.publish(spec, ac.signal), q2.publish(spec, ac.signal)]);
+    await until(() => s.work.calls.live('same', 'shared-0001') === 'waiting');
+    await sleep(100);
+    expect((await s.work.calls.status()).runs.find((r) => r.run === 'same')).toMatchObject({ waiting: 1 });
+    const w2 = startWorker(() => s.work);
+    const outcomes = await both;
+    expect(outcomes.map((o) => (o as EvalOutcome & { text?: string }).text)).toEqual(['done: prompt of shared-0001', 'done: prompt of shared-0001']);
+    expect(w2.done.get('shared-0001')).toBe(1);
+    q1.close();
+    q2.close();
+    await w2.stop();
+    await s.close();
+  });
+
+  it('stops plainly with serve\'s word when its queue is full', async () => {
+    const s = await startServe(newRoot(), { work: { durable: { maxBytes: 500 } } });
+    const remote = (await connect(s.url, 'full'))!;
+    const err = await Promise.race([publishCall(remote, 'y'.repeat(2_000)).catch((e) => e), sleep(5_000).then(() => 'still publishing')]);
+    expect(err).toBeInstanceOf(ServeRefusedError);
+    expect(String(err.message)).toMatch(/serve refused .*507.*its limit \(server\.remote\.evalQueueMB/);
+    remote.close();
+    await s.close();
+  });
+
+  it('says in status where it keeps tasks, and drops a run\'s tasks on DELETE', async () => {
+    const root = newRoot();
+    const s = await startServe(root);
+    const headers = { authorization: `Bearer ${TOKEN}` };
+    const status = await (await fetch(`${s.url}/eval/v1/status`, { headers })).json() as { tasks: { version: number; durable: boolean } };
+    expect(status.tasks).toMatchObject({ version: 2, durable: true });
+    s.work.publish([call('dropme', 'piece-0020')]);
+    expect(await (await fetch(`${s.url}/eval/v1/runs/dropme`, { method: 'DELETE', headers })).json()).toEqual({ removed: 1 });
+    expect(s.work.store.ofRun('dropme')).toEqual([]);
+    await s.close();
+  });
+});
+
 describe('compatibility', () => {
   it('serves a run from stage 1 on its held offer, and drops the piece when it closes the request', async () => {
     const s = await startServe(newRoot());
@@ -335,5 +484,43 @@ describe('compatibility', () => {
     await pending;
     await until(() => s.work.store.get('old-run', 'old-key-0002')?.state === 'dropped');
     await s.close();
+  });
+
+  it('publishes to a serve from stage 1 the stage-1 way, one held offer a piece, and says so', async () => {
+    let offers = 0;
+    const server = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', (d) => (body += d));
+      req.on('end', () => {
+        if (req.url?.startsWith('/eval/v1/status')) {
+          res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ offered: true, slots: { 'eval-call': [], 'eval-session': [] }, run: { waiting: 0, leased: 0 } }));
+        } else if (req.url === '/eval/v1/offer') {
+          offers++;
+          const { spec } = JSON.parse(body) as { spec: EvalCallSpec };
+          res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ outcome: 'answered', worker: 'laptop/w1/eval-codex#1', backend: 'codex-cli:gpt-test', text: `old: ${spec.prompt}`, usage: null, model: 'gpt-test' }));
+        } else res.writeHead(404, { 'content-type': 'application/json' }).end('{"error":"not found"}');
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const lines: string[] = [];
+    const remote = (await connect(url, 'to-old', { log: (m: string) => lines.push(m) }))!;
+    expect(textOf(await publishCall(remote, 'z'))).toBe('old: z');
+    expect(offers).toBe(1);
+    expect(lines.some((l) => /from before durable tasks/.test(l))).toBe(true);
+    remote.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('keeps the run\'s own broker in memory: nothing written, nothing kept after a piece settles', async () => {
+    const remote = RemoteEval.own({ run: 'in-memory', source: { retryMs: 0 } });
+    remote.startLocal({ codex: 1 });
+    const r = await publishCall(remote, 'm');
+    expect(r).toEqual({ local: true, value: 'here' });
+    const queue = remote.queue as OwnQueue;
+    expect(queue.calls.durable).toBe(false);
+    expect((await queue.calls.status()).store).toBeNull();
+    expect(queue.calls.live('in-memory', 'anything')).toBeNull();
+    remote.close();
   });
 });

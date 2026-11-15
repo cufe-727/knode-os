@@ -425,9 +425,9 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
     pool: opts.pool, waitMinutes: opts.waitMinutes ?? 30, checkMs: opts.waitCheckMs, logEveryMs: opts.waitCheckMs ? opts.waitCheckMs * 12 : undefined, onStop: () => stop.abort(),
     onStuck: (piece: import('./remote.js').StuckPiece) => store.log('piece stuck', { ...piece }),
   };
-  let remote = opts.remote ? await RemoteEval.connect({ ...opts.remote, run: runId, quota, log: queueLog, ...waiting }) : null;
+  let remote = opts.remote ? await RemoteEval.connect({ ...opts.remote, run: runId, scope: runDir, quota, log: queueLog, ...waiting }) : null;
   if (opts.remote && !remote) queueLog(`work: serve is not answering: the run publishes to a broker of its own${placement.local ? '' : ', and with no --local nothing takes its pieces'}`);
-  remote ??= RemoteEval.own({ run: runId, quota, log: queueLog, refreshMs: opts.remote?.refreshMs, ...waiting });
+  remote ??= RemoteEval.own({ run: runId, scope: runDir, quota, log: queueLog, refreshMs: opts.remote?.refreshMs, ...waiting });
   // what the end of the run closes, whatever it got to: set as the run starts each of them
   const opened: { shim: Awaited<ReturnType<typeof startShim>> | null; localShim: Awaited<ReturnType<typeof startShim>> | null; meta: RunMeta | null; onSignal: ((s: NodeJS.Signals) => void) | null } = { shim: null, localShim: null, meta: null, onSignal: null };
   const loaded: { pack: LoadedPack; staged: StagedCorpus }[] = [];
@@ -902,9 +902,10 @@ export async function scoreRun(runDir: string, opts: { judgeProvider?: string; j
   if (placement.legacy) log(`work: no --remote and no --local: the judge runs on this machine, on --local ${describeLocal(placement.local!)} (sized from --slots)`);
   const run = queueRunId(`${meta.id}-score`);
   const waiting = { pool: opts.pool, waitMinutes: opts.waitMinutes ?? 30, checkMs: opts.waitCheckMs, logEveryMs: opts.waitCheckMs ? opts.waitCheckMs * 12 : undefined };
-  let remote = opts.remote ? await RemoteEval.connect({ ...opts.remote, run, quota, log, ...waiting }) : null;
+  // the scoring's pieces are its own: another scope than the run's answers
+  let remote = opts.remote ? await RemoteEval.connect({ ...opts.remote, run, scope: `${runDir}#score`, quota, log, ...waiting }) : null;
   if (opts.remote && !remote) log(`work: serve is not answering: scoring publishes to a broker of its own${placement.local ? '' : ', and with no --local nothing takes its calls'}`);
-  remote ??= RemoteEval.own({ run, quota, log, ...waiting });
+  remote ??= RemoteEval.own({ run, scope: `${runDir}#score`, quota, log, ...waiting });
   try {
     return await scoreWith(remote);
   } catch (err) {

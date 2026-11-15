@@ -74,6 +74,8 @@ interface QueueStatus {
   offered: boolean;
   slots: Record<EvalKind, EvalSlotSeen[]>;
   run: EvalRunStatus;
+  /** Where serve keeps tasks (docs/design/32 §5); null: a serve from stage 1, which holds one request per piece. */
+  tasks?: { version: number; durable: boolean; reason: string | null } | null;
 }
 
 /** Where a run publishes: `serve`'s broker or its own. One code path either way. */
@@ -86,6 +88,12 @@ export interface EvalQueue {
   slotsNow?(): Record<EvalKind, EvalSlotSeen[]>;
   /** A folder a worker's session reads: only `serve` hands archives to workers. */
   archive(dir: string, signal: AbortSignal): Promise<{ sha256: string; bytes: number } | null>;
+  /**
+   * The run went away (stopped, killed, at its wait limit): what only it can
+   * serve is withdrawn and the rest is left for its resume, where tasks are
+   * durable; elsewhere (and where absent) the same as `cancelRun`.
+   */
+  detach?(run: string): Promise<void>;
   lease(who: LocalSlotIdentity, kinds: EvalKind[]): Promise<WorkTask[]>;
   complete(who: LocalSlotIdentity, id: string, outcome: LocalOutcome): Promise<void>;
   renew(who: LocalSlotIdentity, ids: string[]): Promise<void>;
@@ -158,17 +166,46 @@ export class OwnQueue implements EvalQueue {
     this.sessions.cancelRun(run);
   }
 
+  /** In memory: nothing outlives the run, so going away cancels everything. */
+  detach(run: string): Promise<void> {
+    return this.cancelRun(run);
+  }
+
   close(): void {
     this.calls.close();
     this.sessions.close();
   }
 }
 
+/** A piece the run waits for in serve's durable queue: published (or not yet), and who waits for it. */
+interface Wanted {
+  spec: EvalSpec;
+  resolve: ((o: RemoteOutcome) => void)[];
+  published: boolean;
+  sending: boolean;
+}
+
+/** The longest a poll is held in serve, and the batch the run publishes at once. */
+const POLL_WAIT_MS = 20_000;
+const PUBLISH_BATCH = 100;
+const POLL_KEYS = 4_000;
+
 /** `serve`'s broker, over the loopback producer channel and the data root's MCP token. */
 export class ServeQueue implements EvalQueue {
   readonly where = 'serve' as const;
+  /** Serve keeps tasks itself (docs/design/32 §5): the run publishes in batches and polls, instead of one held request a piece. */
+  durable = false;
+  /** Serve keeps them in memory only (another serve holds the folder): said once. */
+  storeReason: string | null = null;
+  private readonly wanted = new Map<string, Wanted>();
+  private flushTimer: NodeJS.Timeout | null = null;
+  private flushing = false;
+  private polling = false;
+  private pollAbort: AbortController | null = null;
+  private readonly watched = new WeakSet<AbortSignal>();
+  private closedQueue = false;
 
-  constructor(private readonly serveUrl: string, private readonly token: string) {}
+  constructor(private readonly serveUrl: string, private readonly token: string, private readonly opts: { scope?: string | null; deadlineMs?: number } = {}) {}
 
   get origin(): string {
     return this.serveUrl;
@@ -181,13 +218,156 @@ export class ServeQueue implements EvalQueue {
   private async post<T>(route: string, body: unknown, signal?: AbortSignal): Promise<T> {
     const res = await fetch(`${this.serveUrl}/eval/v1/${route}`, { method: 'POST', headers: this.headers(), body: JSON.stringify(body), signal: signal ?? AbortSignal.timeout(30_000) });
     const text = (await res.text()).trim();
-    const parsed = text ? JSON.parse(text) as T & { error?: string } : null;
-    if (res.status >= 400 && res.status < 500 && res.status !== 409) throw new ServeRefusedError(route, res.status, parsed?.error ?? text.slice(0, 200));
+    let parsed: (T & { error?: string }) | null = null;
+    try {
+      parsed = text ? JSON.parse(text) as T & { error?: string } : null;
+    } catch {
+      // not JSON: a proxy's page, a server mid-restart
+    }
+    // a refusal (and the queue at its bound, 507) is serve's answer: asking again gets the same
+    if ((res.status >= 400 && res.status < 500 && res.status !== 409) || res.status === 507) throw new ServeRefusedError(route, res.status, parsed?.error ?? text.slice(0, 200));
     if (!parsed || (!res.ok && res.status !== 409)) throw new Error(`${route}: ${res.status} ${parsed?.error ?? text.slice(0, 200)}`);
     return parsed;
   }
 
-  async publish(spec: EvalSpec, signal: AbortSignal): Promise<RemoteOutcome> {
+  /**
+   * Publish a piece and wait for what becomes of it. On a serve that keeps
+   * tasks (stage 2) the piece joins a batch, and one poll waits for all the
+   * run's pieces; on a serve from stage 1 it is one held request.
+   */
+  publish(spec: EvalSpec, signal: AbortSignal): Promise<RemoteOutcome> {
+    if (!this.durable) return this.offer(spec, signal);
+    if (signal.aborted || this.closedQueue) return Promise.resolve({ outcome: 'cancelled' });
+    this.watch(signal);
+    return new Promise<RemoteOutcome>((resolve) => {
+      const had = this.wanted.get(spec.key);
+      if (had) {
+        had.spec = spec;
+        had.resolve.push(resolve);
+        had.published = false;
+      } else this.wanted.set(spec.key, { spec, resolve: [resolve], published: false, sending: false });
+      this.scheduleFlush();
+    });
+  }
+
+  /** The run's signal ends every piece it waits for, once (one listener, however many pieces). */
+  private watch(signal: AbortSignal): void {
+    if (this.watched.has(signal)) return;
+    this.watched.add(signal);
+    signal.addEventListener('abort', () => {
+      for (const key of [...this.wanted.keys()]) this.settle(key, { outcome: 'cancelled' });
+      this.pollAbort?.abort();
+    }, { once: true });
+  }
+
+  private settle(key: string, outcome: RemoteOutcome): void {
+    const w = this.wanted.get(key);
+    if (!w) return;
+    this.wanted.delete(key);
+    for (const r of w.resolve) r(outcome);
+  }
+
+  private scheduleFlush(): void {
+    if (this.flushTimer || this.flushing) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      void this.flush();
+    }, 20);
+    this.flushTimer.unref?.();
+  }
+
+  /** Publish what waits to be published, a batch at a time; then (re)start the one poll for all of them. */
+  private async flush(): Promise<void> {
+    if (this.flushing) return;
+    this.flushing = true;
+    try {
+      for (;;) {
+        if (this.closedQueue) return;
+        const batch = [...this.wanted.values()].filter((w) => !w.published && !w.sending).slice(0, PUBLISH_BATCH);
+        if (!batch.length) break;
+        for (const w of batch) w.sending = true;
+        try {
+          const r = await this.post<{ tasks?: { key: string; state: string; outcome?: RemoteOutcome }[] }>('tasks', {
+            run: batch[0].spec.run, scope: this.opts.scope ?? null, deadlineMs: this.opts.deadlineMs, specs: batch.map((w) => w.spec),
+          });
+          for (const w of batch) w.sending = false;
+          for (const t of r.tasks ?? []) {
+            const w = this.wanted.get(t.key);
+            if (!w) continue;
+            if (t.outcome) this.settle(t.key, this.known(t.outcome));
+            else w.published = true;
+          }
+        } catch (err) {
+          for (const w of batch) w.sending = false;
+          const outcome: RemoteOutcome = err instanceof ServeRefusedError
+            ? { outcome: 'refused', status: err.status, error: err.reason }
+            : { outcome: 'unreachable', error: err instanceof Error ? err.message : String(err) };
+          for (const w of batch) this.settle(w.spec.key, outcome);
+        }
+      }
+    } finally {
+      this.flushing = false;
+    }
+    // the keys changed: the poll held now asks after the old ones, so it starts again with all of them
+    this.pollAbort?.abort();
+    if (!this.polling) void this.poll();
+  }
+
+  /** An outcome this run knows, or a refusal naming the other version. */
+  private known(o: RemoteOutcome): RemoteOutcome {
+    if (KNOWN_OUTCOMES.has(o.outcome)) return o;
+    return { outcome: 'refused', status: 200, error: `serve answered "${o.outcome}", which this run does not know: serve on this machine runs another version — restart it on this build` };
+  }
+
+  /** One poll for every piece published and not yet done: held in serve until one is done. */
+  private async poll(): Promise<void> {
+    this.polling = true;
+    try {
+      while (!this.closedQueue) {
+        const keys = [...this.wanted.values()].filter((w) => w.published).map((w) => w.spec.key).slice(0, POLL_KEYS);
+        if (!keys.length) return;
+        const run = this.wanted.get(keys[0])!.spec.run;
+        const ac = new AbortController();
+        this.pollAbort = ac;
+        let timedOut = false;
+        const timer = setTimeout(() => {
+          timedOut = true;
+          ac.abort();
+        }, POLL_WAIT_MS + 15_000);
+        timer.unref?.();
+        try {
+          const r = await this.post<{ done?: { key: string; outcome: RemoteOutcome }[]; missing?: string[] }>('tasks/poll', { run, keys, waitMs: POLL_WAIT_MS }, ac.signal);
+          for (const d of r.done ?? []) this.settle(d.key, this.known(d.outcome));
+          // serve does not have it (it lost it, or never had it): published again
+          let again = false;
+          for (const key of r.missing ?? []) {
+            const w = this.wanted.get(key);
+            if (w) {
+              w.published = false;
+              again = true;
+            }
+          }
+          if (again) this.scheduleFlush();
+        } catch (err) {
+          // started again for a new set of keys, or the run is closing
+          if (ac.signal.aborted && !timedOut) continue;
+          const outcome: RemoteOutcome = err instanceof ServeRefusedError
+            ? { outcome: 'refused', status: err.status, error: err.reason }
+            : { outcome: 'unreachable', error: timedOut ? 'serve held a poll past its time' : err instanceof Error ? err.message : String(err) };
+          // every piece published waits for serve and is published again (serve kept it: the same task)
+          for (const key of keys) this.settle(key, outcome);
+        } finally {
+          clearTimeout(timer);
+          if (this.pollAbort === ac) this.pollAbort = null;
+        }
+      }
+    } finally {
+      this.polling = false;
+    }
+  }
+
+  /** Stage 1's way, for a serve from before stage 2: one request held open until the piece is answered. */
+  private async offer(spec: EvalSpec, signal: AbortSignal): Promise<RemoteOutcome> {
     try {
       const res = await fetch(`${this.serveUrl}/eval/v1/offer`, {
         method: 'POST', headers: this.headers(), body: JSON.stringify({ spec }), signal,
@@ -218,7 +398,13 @@ export class ServeQueue implements EvalQueue {
     const body = await res.json() as Partial<QueueStatus>;
     // a serve from before docs/design/32 has no slots for a run's own and would withdraw pieces: refuse it plainly
     if (!body.slots) throw new ServeRefusedError('status', res.status, 'serve on this machine is older than this run (no slots in /eval/v1/status): restart it on this build, or run without --remote');
-    return { offered: Boolean(body.offered), slots: { 'eval-call': body.slots?.['eval-call'] ?? [], 'eval-session': body.slots?.['eval-session'] ?? [] }, run: body.run ?? { waiting: 0, leased: 0 } };
+    const tasks = body.tasks && typeof body.tasks.version === 'number' ? body.tasks : null;
+    // the first answer decides the protocol; a serve restarted on stage 1 later refuses /tasks plainly (404)
+    if (first) {
+      this.durable = Boolean(tasks && tasks.version >= 2);
+      this.storeReason = tasks && !tasks.durable ? tasks.reason ?? 'serve keeps its tasks in memory' : null;
+    }
+    return { offered: Boolean(body.offered), slots: { 'eval-call': body.slots?.['eval-call'] ?? [], 'eval-session': body.slots?.['eval-session'] ?? [] }, run: body.run ?? { waiting: 0, leased: 0 }, tasks };
   }
 
   /** Packed, and uploaded unless `serve` holds it already: a folder every question reads goes up once. */
@@ -256,12 +442,30 @@ export class ServeQueue implements EvalQueue {
     await fetch(`${this.serveUrl}/eval/v1/runs/${encodeURIComponent(run)}/cancel`, { method: 'POST', headers: this.headers(false), signal: AbortSignal.timeout(5_000) }).catch(() => {});
   }
 
-  close(): void {}
+  /** Durable: only what needs the run is withdrawn, the rest waits for its resume. Stage 1: everything is. */
+  async detach(run: string): Promise<void> {
+    if (!this.durable) return this.cancelRun(run);
+    await fetch(`${this.serveUrl}/eval/v1/runs/${encodeURIComponent(run)}/detach`, { method: 'POST', headers: this.headers(false), signal: AbortSignal.timeout(5_000) }).catch(() => {});
+  }
+
+  close(): void {
+    this.closedQueue = true;
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flushTimer = null;
+    for (const key of [...this.wanted.keys()]) this.settle(key, { outcome: 'cancelled' });
+    this.pollAbort?.abort();
+  }
 }
 
 export interface RemoteEvalOptions {
   /** The run's id: pieces carry it, and cancelling the run withdraws them. */
   run: string;
+  /**
+   * The run's directory (docs/design/32 §5): part of every piece's key, so a
+   * resumed run finds its own pieces in serve's store and another run of the
+   * same name never does. Absent: the run's id alone.
+   */
+  scope?: string;
   /** The run's quota guard: a run's own Codex slot waits for this machine's plan before it runs a piece. */
   quota?: QuotaGuard | null;
   /** How often the slots online are read again from `serve` (default 15 s). */
@@ -399,7 +603,10 @@ function runOnce(entry: Entry): Promise<void> {
   return entry.running;
 }
 
-const randomKey = () => crypto.randomBytes(9).toString('base64url');
+/** A run's scope as serve keeps it: a digest of its directory. */
+export function scopeOf(dir: string): string {
+  return crypto.createHash('sha256').update(dir).digest('hex').slice(0, 24);
+}
 const sleep = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve) => {
   const t = setTimeout(resolve, ms);
   signal?.addEventListener('abort', () => {
@@ -419,6 +626,8 @@ export class RemoteEval {
   private cancelling: Promise<void> | null = null;
   private closed = false;
   private readonly entries = new Map<string, Entry>();
+  /** Pieces published by what they are: the n-th of the same gets its own key. */
+  private readonly seen = new Map<string, number>();
   private readonly local: Record<EvalFamily, number> = { codex: 0, claude: 0 };
   private readonly loops: Promise<void>[] = [];
   private wake: (() => void) | null = null;
@@ -453,8 +662,8 @@ export class RemoteEval {
   }
 
   /** `serve`'s broker on this machine; null (and a log line) when it is not answering; refused when it is another version. */
-  static async connect(opts: RemoteEvalOptions & { serveUrl: string; token: string }): Promise<RemoteEval | null> {
-    const queue = new ServeQueue(opts.serveUrl, opts.token);
+  static async connect(opts: RemoteEvalOptions & { serveUrl: string; token: string; deadlineMs?: number }): Promise<RemoteEval | null> {
+    const queue = new ServeQueue(opts.serveUrl, opts.token, { scope: scopeOf(opts.scope ?? opts.run), deadlineMs: opts.deadlineMs });
     let status: QueueStatus;
     try {
       status = await queue.status(opts.run, true);
@@ -466,6 +675,8 @@ export class RemoteEval {
     const r = new RemoteEval(queue, opts);
     r.status = status;
     if (!status.offered) r.log('remote: serve does not offer evaluation work to remote workers (server.remote.offer.eval is off): only this run\'s own slots will take its pieces');
+    if (!queue.durable) r.log('remote: serve on this machine is from before durable tasks (docs/design/32 stage 1): each piece is one request held open, and a restart of serve publishes them again');
+    else if (queue.storeReason) r.log(`remote: serve keeps this run's tasks in memory only (${queue.storeReason}): a restart of serve publishes them again`);
     return r;
   }
 
@@ -536,15 +747,16 @@ export class RemoteEval {
    * Publish one piece and wait for what becomes of it. `exec` is how the
    * run's own slot does it; a worker does it from the spec.
    */
-  async publish<T>(spec: Omit<EvalCallSpec, 'run' | 'key' | 'pool'> | Omit<EvalSessionSpec, 'run' | 'key' | 'pool'>, exec: () => Promise<T>, tag: PieceTag | null = currentPieceTag()): Promise<Published<T>> {
+  async publish<T>(spec: Omit<EvalCallSpec, 'run' | 'key' | 'pool'> | Omit<EvalSessionSpec, 'run' | 'key' | 'pool'>, exec: () => Promise<T>, tag: PieceTag | null = currentPieceTag(), identity?: unknown): Promise<Published<T>> {
     if (this.abort.signal.aborted) throw new RunCancelledError();
-    const key = randomKey();
+    const key = this.keyOf(spec, tag, identity);
     const entry: Entry = { exec };
     this.entries.set(key, entry);
     this.counts.published++;
     const full = { ...spec, run: this.opts.run, key, pool: this.pool } as EvalSpec;
     const requirement: Requirement = { kind: spec.kind, family: spec.agent.family, model: spec.agent.model, eligible: spec.eligible, pool: this.pool };
     const release = this.hold(requirement);
+    let again = 0;
     try {
       for (let backoff = this.opts.backoffMs ?? 1_000; ;) {
         this.poke();
@@ -554,6 +766,11 @@ export class RemoteEval {
           // one of the run's own slots did it (perhaps before serve went away): its result is the piece's
           this.counts.local++;
           return 'error' in entry.done ? { local: true, error: entry.done.error } : { local: true, value: entry.done.value as T };
+        }
+        if ((o.outcome === 'answered' || o.outcome === 'error') && o.local && again < 3) {
+          // one of this run's own slots did it in a process before this one: the value went with that process, so it is asked again
+          again++;
+          continue;
         }
         if (o.outcome === 'answered' || o.outcome === 'error') {
           this.counts.workers++;
@@ -592,6 +809,28 @@ export class RemoteEval {
       this.entries.delete(key);
       release();
     }
+  }
+
+  /**
+   * A piece's key (docs/design/32 §5): what the piece is — the run's
+   * directory, its kind, CLI, model, pool, label, the system and task it is
+   * for (a repeat's task carries `~r<n>`), and its content (the prompt as the
+   * caller has it, the schema, the folder's archive, the tools) — and how many
+   * pieces just like it this process published before. A resumed run that asks
+   * what its records lack, in the order it asks, finds the same keys: a piece
+   * done while it was away is that result, not a second piece.
+   */
+  private keyOf(spec: Omit<EvalCallSpec, 'run' | 'key' | 'pool'> | Omit<EvalSessionSpec, 'run' | 'key' | 'pool'>, tag: PieceTag | null, identity: unknown): string {
+    const content = spec.kind === 'eval-call'
+      ? [spec.prompt, spec.schema ?? null]
+      : [spec.prompt, spec.sandbox, spec.maxSteps, spec.archive?.sha256 ?? null, spec.mcp?.tools ?? null];
+    const what = crypto.createHash('sha256').update(JSON.stringify([
+      this.opts.scope ?? this.opts.run, spec.kind, spec.agent.family, spec.agent.model, spec.agent.effort ?? null, spec.agent.speed ?? null, spec.eligible,
+      this.pool, spec.label, tag?.system ?? null, tag?.task ?? null, identity ?? null, content,
+    ])).digest('base64url').slice(0, 40);
+    const n = this.seen.get(what) ?? 0;
+    this.seen.set(what, n + 1);
+    return n ? `${what}-${n}` : what;
   }
 
   /** Pieces stuck since `since` (an index into `stuck`) for this system (and task, when given). */
@@ -663,13 +902,17 @@ export class RemoteEval {
   }
 
   /**
-   * The run is cancelled: what is published or out is withdrawn, and session tokens die at once. Every call
-   * waits for the one withdrawal, so a run that ends on its cancellation ends after the tokens are revoked.
+   * The run stops here (a signal, its wait limit, a refusal, its caller's
+   * cancel): what only it can serve is withdrawn and session tokens die at
+   * once; on a serve that keeps tasks the rest stays, and a resume collects
+   * what workers finished meanwhile (docs/design/32 §5). Every call waits for
+   * the one withdrawal, so a run that ends on its cancellation ends after the
+   * tokens are revoked.
    */
   cancel(): Promise<void> {
     this.cancelling ??= (async () => {
       this.abort.abort();
-      await this.queue.cancelRun(this.opts.run).catch(() => {});
+      await (this.queue.detach ? this.queue.detach(this.opts.run) : this.queue.cancelRun(this.opts.run)).catch(() => {});
       this.close();
     })();
     return this.cancelling;
@@ -847,7 +1090,7 @@ export class PublishedChatBackend implements ChatBackend {
       prompt: leaves ? renderCliPrompt(req.messages, req.json) : '',
       schema: leaves ? req.schema ?? null : null,
       timeoutMs: 900_000,
-    }, () => this.local.complete(req), tag ? { system: tag.system, ...(tag.task ? { task: tag.task } : {}) } : null);
+    }, () => this.local.complete(req), tag ? { system: tag.system, ...(tag.task ? { task: tag.task } : {}) } : null, [tag?.stage ?? null, req.messages, req.json ?? null, req.schema ?? null, req.effort ?? null]);
     if (p.local) {
       if ('error' in p) throw p.error;
       return p.value;
@@ -868,7 +1111,7 @@ export function remoteJudgeClient(client: LlmClient, remote: RemoteEval, judge: 
     const p = await remote.publish({
       kind: 'eval-call', eligible: judge.eligible, label: 'judge', agent: { family: judge.family, model: judge.model, effort: judge.effort, speed: null },
       prompt: leaves ? renderCliPrompt(messages, Boolean(opts.json)) : '', schema: null, timeoutMs: 600_000,
-    }, here, { system: '__judge__' });
+    }, here, { system: '__judge__' }, [messages, Boolean(opts.json)]);
     if (p.local) {
       if (judge.backend) notePlacement({ backend: judge.backend });
       if ('error' in p) throw p.error;
@@ -938,7 +1181,7 @@ export async function publishAgent(scope: PackScope, opts: AgentRunOptions, here
     prompt: eligible === 'any' ? opts.prompt : '',
     archive,
     mcp,
-  }, here);
+  }, here, undefined, [opts.prompt, opts.sandbox, opts.maxSteps ?? 25, opts.label ?? null]);
   if (p.local) {
     if ('error' in p) throw p.error;
     return p.value;
