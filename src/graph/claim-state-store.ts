@@ -1,7 +1,7 @@
 import { breather } from '../pool.js';
 import { Store } from '../store/db.js';
 import { EvidenceAtRow, foldClaimEvidence, groupBy, toDateString, toIso } from '../store/temporal.js';
-import { CLAIM_STATE_VERSION, sameValue, seriesObject, unifyAttributeKeys } from './claim-state.js';
+import { CLAIM_STATE_VERSION, sameValue, seriesObject, subjectSpellingsOf, unifyAttributeKeys } from './claim-state.js';
 import { packSubjectBatches } from './subject-batches.js';
 
 /**
@@ -82,24 +82,40 @@ export async function backfillClaimState(store: Store, opts: { limit?: number } 
 
 /**
  * Unify each subject's near-synonym attribute keys (claim-state.ts
- * unifyAttributeKeys) into claim_attribute_keys, which v_claims, supersession,
+ * unifyAttributeKeys), over the entities merged with it and with their
+ * spellings, into claim_attribute_keys, which v_claims, supersession,
  * the duplicate audit and the entity page read. Rewritten whole each run, or
  * for `subjects` alone (a subject's keys depend on no other subject):
  * returns the mappings added or changed, and those dropped.
  */
 export async function refreshAttributeKeys(store: Store, opts: { subjects?: string[] } = {}): Promise<{ mapped: number; dropped: number }> {
   const only = opts.subjects ? [opts.subjects] : [];
-  const uses = await store.query<{ subject_id: string; attribute: string; n: number; units: string[] }>(
-    `SELECT subject_id, attribute, count(*)::int AS n, array_agg(DISTINCT COALESCE(unit, '')) AS units
-     FROM claims WHERE tx_to IS NULL AND attribute IS NOT NULL${opts.subjects ? ' AND subject_id = ANY($1::text[])' : ''}
-     GROUP BY subject_id, attribute`,
+  // keys are unified over a merged group (its series spans the group), with the spellings of its entities
+  const uses = await store.query<{ subject_id: string; root: string; attribute: string; n: number; units: string[] }>(
+    `SELECT c.subject_id, COALESCE(se.canonical_id, c.subject_id) AS root, c.attribute, count(*)::int AS n, array_agg(DISTINCT COALESCE(c.unit, '')) AS units
+     FROM claims c JOIN entities se ON se.id = c.subject_id
+     WHERE c.tx_to IS NULL AND c.attribute IS NOT NULL${opts.subjects ? ' AND c.subject_id = ANY($1::text[])' : ''}
+     GROUP BY 1, 2, 3`,
     only,
   );
+  const roots = [...new Set(uses.map((u) => u.root))];
+  const names = roots.length === 0 ? [] : await store.query<{ root: string; name: string; aliases: string[] | null }>(
+    `SELECT COALESCE(canonical_id, id) AS root, name, aliases FROM entities
+     WHERE tx_to IS NULL AND (id = ANY($1::text[]) OR canonical_id = ANY($1::text[]))`,
+    [roots],
+  );
+  const spellings = new Map<string, string[]>();
+  for (const [root, list] of groupBy(names, (r) => r.root)) spellings.set(root, list.flatMap((r) => subjectSpellingsOf(r.name, r.aliases ?? [])));
   const desired = new Map<string, { subject: string; attribute: string; canonical: string; reason: string }>();
-  for (const [subject, list] of groupBy(uses, (u) => u.subject_id)) {
-    if (list.length < 2) continue;
-    for (const [attribute, m] of unifyAttributeKeys(list.map((u) => ({ attribute: u.attribute, count: u.n, units: u.units })))) {
-      desired.set(`${subject}\u0000${attribute}`, { subject, attribute, ...m });
+  for (const [root, list] of groupBy(uses, (u) => u.root)) {
+    const keys = [...groupBy(list, (u) => u.attribute).entries()].map(([attribute, rows]) => ({
+      attribute, count: rows.reduce((n, r) => n + r.n, 0), units: [...new Set(rows.flatMap((r) => r.units))],
+    }));
+    if (keys.length < 2) continue;
+    const map = unifyAttributeKeys(keys, spellings.get(root) ?? []);
+    for (const u of list) {
+      const m = map.get(u.attribute);
+      if (m) desired.set(`${u.subject_id}\u0000${u.attribute}`, { subject: u.subject_id, attribute: u.attribute, ...m });
     }
   }
   const current = await store.query<{ subject_id: string; attribute: string; canonical: string }>(
@@ -145,8 +161,8 @@ export interface StateRow {
 /**
  * Which claim supersedes which within one (subject, attribute, object, kind)
  * series, oldest effective date first: each claim by the claims of the next
- * later day (the first of them) — or, when its own stated window still
- * covers that day, by the first claim after its window; claims of one day with different values supersede none of each
+ * later day (the first of them), unless its own stated window still covers
+ * that day; claims of one day with different values supersede none of each
  * other (a disagreement stays visible). A correction supersedes the newest
  * claim up to its date whose value differs from its own — the report it
  * corrects — whatever the order says. Exported for tests.

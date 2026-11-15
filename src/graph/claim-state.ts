@@ -67,7 +67,6 @@ export function seriesObject(attribute: string | null | undefined, objectId: str
   return objectId ?? '';
 }
 
-
 /** Verbs and hedges between an attribute and its value, longest first. */
 const LINKS_ZH = ['更正为', '修正为', '调整为', '下降至', '提升至', '提高至', '增加至', '减少至', '维持在', '保持在', '仍然为', '约为', '应为', '可能为', '预计为', '达到了', '达到', '升至', '降至', '增至', '减至', '变为', '已达', '仍为', '依然为', '为', '是', '达', '约', '有', '：', ':', '='];
 const LINKS_EN = /\s*(?:is now|was revised to|was corrected to|stood at|rose to|fell to|increased to|decreased to|dropped to|grew to|reached|is|was|are|were|at|of|to|:|=)\s*$/i;
@@ -300,31 +299,108 @@ export interface AttributeUse {
 }
 
 /**
+ * The qualifiers that make a key another measure of the same thing: a change
+ * (环比 / 同比 / 变化), the first value (初始 / 最初), a plan or forecast, an
+ * average, a running total, a peak. "支付成功率环比变化" contains
+ * "支付成功率" and "初始间隔" contains "间隔", but neither is that measure:
+ * unified with it, a week-on-week change of +0.04% stood beside the week's
+ * 98.64% as a second current value of one day, and a report's "（对账批次间隔
+ * 最初定的是15分钟）" became the setting's newest value.
+ */
+const QUALIFIERS: readonly [string, RegExp][] = [
+  ['环比', /环比|week[- ]on[- ]week|\bwow\b|month[- ]on[- ]month/i],
+  ['同比', /同比|year[- ]on[- ]year|\byoy\b/i],
+  ['变化', /变化|变动|增幅|降幅|涨幅|增速|增量|差值|增减|\bchange\b|\bdelta\b|\bgrowth\b/i],
+  ['初始', /初始|最初|起初|原始|原定|最早|\binitial\b|\boriginal\b|\bfirst\b/i],
+  // not 目标 / target: an extraction labels a setting put back ("决定改回原来的80分") 目标阈值
+  ['计划', /计划|预计|预期|预测|\bplanned\b|\bforecast\b|\bexpected\b/i],
+  ['平均', /平均|均值|\baverage\b|\bmean\b/i],
+  ['累计', /累计|累积|\bcumulative\b|\bytd\b/i],
+  ['峰值', /峰值|最高|最大|\bpeak\b|\bmax(?:imum)?\b/i],
+  ['最低', /最低|最小|\bmin(?:imum)?\b/i],
+];
+
+/** Which qualifiers a key carries; a change word goes with the period it is a change over. */
+export function keyQualifiers(key: string): string {
+  const q = QUALIFIERS.filter(([, re]) => re.test(key)).map(([k]) => k);
+  const period = q.includes('环比') || q.includes('同比');
+  return q.filter((k) => !(period && k === '变化')).join('+');
+}
+
+/**
+ * Keys that name the value of the subject itself: "配置值", "取值", "数值",
+ * or a spelling of the subject (its name without the "（平台组 · T1-C2）" a
+ * split adds, an alias, a code) or a part of one ("批次间隔", "间隔" of
+ * 对账批次间隔). A setting reported as "对账批次间隔定为15分钟", "批次间隔从本周
+ * 起调整为30分钟" and "T2-C2调整为20分钟" was three series (批次间隔 / 间隔 /
+ * 配置值), each with a current value of its own.
+ */
+const VALUE_WORDS = /^(?:值|取值|数值|配置值|设定值|设置值|参数值|当前值|配置|设定|设置|参数|配置数值|value|setting|current value)$/i;
+
+/** The head words of a name that is a measure, not a thing that has measures: 上限, 时长, 天数, 金额, 分数线 … */
+const MEASURE_HEAD = /(?:上限|下限|阈值|时长|天数|间隔|金额|额度|配额|比例|比率|分数线|分数|数量|次数|人数|周期|期限|费率|利率|价格|单价)$/u;
+
+export function namesSubject(key: string, spellings: readonly string[]): boolean {
+  const bare = key.replace(new RegExp(QUALIFIERS.map(([, re]) => re.source).join('|'), 'gi'), '').trim();
+  if (!bare) return false;
+  if (VALUE_WORDS.test(bare)) return true;
+  return spellings.some((sp) => {
+    const s = fold(sp);
+    if (s.length < 2 || bare.length < 2) return false;
+    // the head of a name is its end: 间隔 names 对账批次间隔, 增长 does not name 增长组; a key
+    // with the head of a name that is a measure itself (…上限, …时长) is that measure's value
+    if (s === bare || s.endsWith(bare)) return true;
+    if (/^\p{Script=Han}+$/u.test(s) && /^\p{Script=Han}+$/u.test(bare) && s.length >= 4 && bare.length >= 3 && MEASURE_HEAD.test(s) && s.slice(-2) === bare.slice(-2)) return true;
+    const rest = bare.split(s).join('').trim();
+    return bare.includes(s) && (!rest || VALUE_WORDS.test(rest));
+  });
+}
+
+/** The spellings of an entity a key may name it by: its name, the name without a split's "（…）", the codes and aliases. */
+export function subjectSpellingsOf(name: string, aliases: readonly string[] = []): string[] {
+  const out = new Set<string>([name, ...aliases]);
+  const m = /^(.+?)[（(]([^）)]*)[）)]$/.exec(name.trim());
+  if (m) {
+    out.add(m[1].trim());
+    for (const part of m[2].split(/[·・,，]/)) if (/\d/.test(part) && /[A-Za-z]/.test(part)) out.add(part.trim());
+  }
+  return [...out].filter((s) => s.trim().length >= 2);
+}
+
+/**
  * A subject's near-synonym keys, unified: two keys of one unit join when one
  * contains the other (在岗 / 在岗人数) or their bigrams mostly agree (Dice ≥
- * 0.67: 支付成功率 / 支付的成功率). The most used key of a group names it.
+ * 0.67: 支付成功率 / 支付的成功率), and only when they carry the same
+ * qualifiers (keyQualifiers: 支付成功率环比 is not 支付成功率). Keys that name
+ * the subject itself (namesSubject, given the subject's `spellings`) are one
+ * key per qualifier. The most used key of a group names it.
  * Returns key → canonical key, with the reason, for keys that change.
  */
-export function unifyAttributeKeys(uses: AttributeUse[]): Map<string, { canonical: string; reason: string }> {
+export function unifyAttributeKeys(uses: AttributeUse[], spellings: readonly string[] = []): Map<string, { canonical: string; reason: string }> {
   const sorted = [...uses].sort((a, b) => b.count - a.count || a.attribute.localeCompare(b.attribute));
   const unitOf = (u: AttributeUse) => [...new Set(u.units.map((x) => x || '∅'))].sort().join('|');
-  const groups: { head: AttributeUse; unit: string; members: AttributeUse[] }[] = [];
+  const groups: { head: AttributeUse; unit: string; qualifiers: string; self: boolean; members: AttributeUse[] }[] = [];
   const out = new Map<string, { canonical: string; reason: string }>();
   for (const use of sorted) {
     const unit = unitOf(use);
+    const qualifiers = keyQualifiers(use.attribute);
+    const self = namesSubject(use.attribute, spellings);
     const group = groups.find((g) => {
-      if (g.unit !== unit) return false;
+      if (g.unit !== unit || g.qualifiers !== qualifiers) return false;
+      if (self && g.self) return true;
       return g.members.some((m) => {
         const [s, l] = m.attribute.length <= use.attribute.length ? [m.attribute, use.attribute] : [use.attribute, m.attribute];
         return (s.length >= 2 && l.includes(s)) || dice(m.attribute, use.attribute) >= 0.67;
       });
     });
     if (!group) {
-      groups.push({ head: use, unit, members: [use] });
+      groups.push({ head: use, unit, qualifiers, self, members: [use] });
       continue;
     }
     group.members.push(use);
-    out.set(use.attribute, { canonical: group.head.attribute, reason: `与"${group.head.attribute}"同单位且名称相近（${use.count} 条断言）` });
+    group.self ||= self;
+    const why = self && group.self ? '都指主体自身的取值' : '同单位且名称相近';
+    out.set(use.attribute, { canonical: group.head.attribute, reason: `与"${group.head.attribute}"${why}（${use.count} 条断言）` });
   }
   return out;
 }

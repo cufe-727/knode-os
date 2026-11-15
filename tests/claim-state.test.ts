@@ -5,7 +5,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
 import { auditDuplicateClaims, seriesRelation } from '../src/graph/claim-dedupe.js';
-import { formatValue, normalizeAttribute, parseMeasure, seriesObject, unifyAttributeKeys } from '../src/graph/claim-state.js';
+import { formatValue, keyQualifiers, namesSubject, normalizeAttribute, parseMeasure, seriesObject, subjectSpellingsOf, unifyAttributeKeys } from '../src/graph/claim-state.js';
 import { refreshClaimState, seriesSupersession, StateRow } from '../src/graph/claim-state-store.js';
 import { namesakeChoice, namesakeClusters, NamesakeDoc, renameIn, resolveEntityContext } from '../src/graph/entity-context.js';
 import { buildBatchExtractRequest, buildExtractRequest, RawExtractReply } from '../src/graph/llm-extract.js';
@@ -62,6 +62,44 @@ describe('reading a claim as attribute + value', () => {
     expect(m.get('周活跃用户数')?.canonical).toBe('周活跃用户');
     expect(m.has('在岗人数')).toBe(false);
     expect(m.has('活跃度')).toBe(false);
+  });
+
+  it('keeps a change, a first value or a target apart from the measure itself', () => {
+    expect(keyQualifiers('支付成功率')).toBe('');
+    expect(keyQualifiers('支付成功率环比变化')).toBe(keyQualifiers('支付成功率环比'));
+    expect(keyQualifiers('初始间隔')).toBe('初始');
+    const m = unifyAttributeKeys([
+      { attribute: '支付成功率', count: 40, units: ['%'] },
+      { attribute: '支付成功率环比变化', count: 30, units: ['%'] },
+      { attribute: '支付成功率环比', count: 9, units: ['%'] },
+    ]);
+    expect(m.has('支付成功率环比变化')).toBe(false);
+    expect(m.get('支付成功率环比')?.canonical).toBe('支付成功率环比变化');
+  });
+
+  it('makes the keys that name a setting itself one key, and its first value another', () => {
+    const spellings = subjectSpellingsOf('对账批次间隔（第一事业部支付组 · T2-C2）', ['T2-C2', '批次间隔']);
+    expect(spellings).toEqual(expect.arrayContaining(['对账批次间隔', 'T2-C2', '批次间隔']));
+    expect(namesSubject('间隔', spellings)).toBe(true);
+    expect(namesSubject('配置值', spellings)).toBe(true);
+    expect(namesSubject('在岗人数', spellings)).toBe(false);
+    // the head of a name is its end: 增长 does not name 增长组
+    expect(namesSubject('增长', ['增长组'])).toBe(false);
+    // the same head as a name that is a measure: 连接上限 is the value of 订单库连接池上限
+    expect(namesSubject('连接上限', ['订单库连接池上限'])).toBe(true);
+    expect(namesSubject('支付成功率', ['第一事业部支付组'])).toBe(false);
+    expect(namesSubject('在岗人数', ['第一事业部平台组'])).toBe(false);
+    const m = unifyAttributeKeys([
+      { attribute: '初始间隔', count: 14, units: ['分钟'] },
+      { attribute: '间隔', count: 9, units: ['分钟'] },
+      { attribute: '配置值', count: 1, units: ['分钟'] },
+      { attribute: '批次间隔', count: 1, units: ['分钟'] },
+      { attribute: '初始对账批次间隔', count: 3, units: ['分钟'] },
+    ], spellings);
+    expect(m.get('配置值')?.canonical).toBe('间隔');
+    expect(m.get('批次间隔')?.canonical).toBe('间隔');
+    expect(m.has('间隔')).toBe(false);
+    expect(m.get('初始对账批次间隔')?.canonical).toBe('初始间隔');
   });
 
   it('reads ISO weeks and relative weeks against the document date', () => {
