@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { AppContext, createContext } from '../context.js';
+import { describeVectorScan } from '../search/search.js';
 import { CONFIG_FILE, DatabaseConfig, defaultConfig, KnodeConfig, loadConfig, saveConfig } from '../config.js';
 import { initDataDir } from '../fs/datadir.js';
 import { syncWorkspaceSettings } from '../global-settings.js';
@@ -399,6 +400,8 @@ export class WorkspaceContextRegistry {
     // a workspace's config is a copy of the root's: a plugin it names by a
     // relative path lives beside the root config, not in every workspace
     const ctx = await createContext(dataDir, { pluginRoots: [this.rootDataDir] });
+    // which way this workspace's vector searches are answered, once, where an operator reads it
+    void describeVectorScan(ctx.store).then((line) => this.log(`[${path.relative(this.rootDataDir, dataDir) || '.'}] ${line}`)).catch(() => {});
     const cleanup = await this.options.onCreate?.(ctx, scope);
     if (cleanup) this.cleanups.set(dataDir, cleanup);
     return ctx;

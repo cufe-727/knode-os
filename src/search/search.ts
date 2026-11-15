@@ -380,26 +380,67 @@ export function wantsCode(filter: ResolvedScopeFilter): boolean {
   return Boolean(filter.sources?.some((s) => s === RAW_CODEBASE || s.startsWith(`${RAW_CODEBASE}/`)));
 }
 
-const iterativeScans = new WeakMap<object, Promise<boolean>>();
+/** How a store's vector index can be walked, and what the catalog says of the extension. */
+export interface VectorScan {
+  /** The pgvector library walks its index on past the first rows (`hnsw.iterative_scan`, 0.8.0 on). */
+  iterative: boolean;
+  /** `pg_extension.extversion`: the version the catalog was last brought to, which may be behind the library. */
+  catalog: string | null;
+}
+
+const vectorScans = new WeakMap<object, Promise<VectorScan>>();
 
 /**
- * Whether the store's pgvector scans its index iteratively (0.8.0 on): asked
- * once per store. Without it a filtered search is left to what one walk of
- * the index finds.
+ * What the store's pgvector can do, asked once per store. The test is of the
+ * library the server has loaded, not of the catalog: the setting exists when
+ * the library defines it. `pg_extension.extversion` says only which version
+ * `CREATE` or `ALTER EXTENSION … UPDATE` last recorded, and a server whose
+ * library was upgraded without that still reports the old one — gated on the
+ * catalog, it kept the one-walk behaviour with nothing said. (The cast loads
+ * the library into a connection that has not used it yet; before that the
+ * setting is unknown to it whatever the version.)
  */
-function scansIteratively(store: Store): Promise<boolean> {
-  let known = iterativeScans.get(store);
+export function vectorScan(store: Store): Promise<VectorScan> {
+  let known = vectorScans.get(store);
   if (!known) {
     known = store
-      .query<{ v: string }>(`SELECT extversion AS v FROM pg_extension WHERE extname = 'vector'`)
-      .then(([row]) => {
-        const [major, minor] = (row?.v ?? '0.0').split('.').map(Number);
-        return major > 0 || minor >= 8;
-      })
-      .catch(() => false);
-    iterativeScans.set(store, known);
+      .query<{ mode: string | null; catalog: string | null }>(
+        `SELECT '[1]'::vector AS loaded, current_setting('hnsw.iterative_scan', true) AS mode,
+                (SELECT extversion FROM pg_extension WHERE extname = 'vector') AS catalog`,
+      )
+      .then(([row]) => ({ iterative: row?.mode != null, catalog: row?.catalog ?? null }))
+      .catch(() => ({ iterative: false, catalog: null }));
+    vectorScans.set(store, known);
   }
   return known;
+}
+
+const versionBefore = (version: string | null, major: number, minor: number) => {
+  const [a, b] = (version ?? '').split('.').map(Number);
+  return Number.isFinite(a) && Number.isFinite(b) && (a < major || (a === major && b < minor));
+};
+
+/**
+ * One line for the log of a server that opens a workspace: which way its
+ * vector searches are answered, why, and what an operator can do about it.
+ * knode-os never alters the extension itself.
+ */
+export async function describeVectorScan(store: Store): Promise<string> {
+  const scan = await vectorScan(store);
+  const catalog = scan.catalog ? `pgvector ${scan.catalog} in the catalog` : 'no pgvector version in the catalog';
+  if (!scan.iterative) {
+    return `vector search: one walk of the index per search (${catalog}; the library on this server has no hnsw.iterative_scan, which pgvector has from 0.8.0). `
+      + 'A search with a filter, or for the sources among nearer generated pages, gets what the nearest 40 rows hold. '
+      + 'To change it: install pgvector 0.8.0 or later on the database server, restart it, then run ALTER EXTENSION vector UPDATE in the database.';
+  }
+  const behind = versionBefore(scan.catalog, 0, 8)
+    ? ' The catalog is behind the library: ALTER EXTENSION vector UPDATE, run in the database by its owner, brings it in line; search does not wait for it.'
+    : '';
+  return `vector search: the index is walked on until each side of a search has its candidates (${catalog}; the library has hnsw.iterative_scan).${behind}`;
+}
+
+function scansIteratively(store: Store): Promise<boolean> {
+  return vectorScan(store).then((scan) => scan.iterative);
 }
 
 /**

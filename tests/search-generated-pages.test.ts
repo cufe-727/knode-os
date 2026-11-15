@@ -6,7 +6,7 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { defaultRerankConfig } from '../src/config.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
-import { cutWithSources, docLiveAt, GENERATED_SHARE, search, searchExplained, SearchMode, sideBudget } from '../src/search/search.js';
+import { cutWithSources, describeVectorScan, docLiveAt, GENERATED_SHARE, search, searchExplained, SearchMode, sideBudget, vectorScan } from '../src/search/search.js';
 import { Store, toVectorLiteral } from '../src/store/db.js';
 import { MATCH_INDEXES } from '../src/store/grams.js';
 import { resolveScopeFilter } from '../src/store/resolver.js';
@@ -285,6 +285,69 @@ describe('lists the generator keeps, and pages a person wrote under the same nam
     // the graph routes, the walk, context packs and excerpts go through docLiveAt: it says nothing of lists
     const sql = docLiveAt('d', new Params());
     expect(sql).toBe("d.status = 'indexed' AND d.root <> 'codebase'");
+  });
+});
+
+describe('which way the vector index is walked', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-vector-scan-'));
+  let plain: Store;
+
+  beforeAll(async () => {
+    fs.mkdirSync(path.join(dir, '.knode'), { recursive: true });
+    plain = await Store.open(dir, embedder.dimensions);
+    await plain.indexing;
+    await plain.query(`INSERT INTO documents (id, path, root, kind, title, sha256, bytes, status) VALUES ('d1', 'raw/docs/a.md', 'docs', 'source', 'a', 'sha', 10, 'indexed')`);
+    await plain.query(`INSERT INTO chunks (id, document_id, seq, content, token_count, tsv) VALUES ('c1', 'd1', 0, 'text', 1, to_tsvector('simple', 'text'))`);
+    await plain.query(`INSERT INTO embeddings (chunk_id, model, embedding) VALUES ('c1', 'fixture-v1', $1)`, [toVectorLiteral([1, 0.1, 0, 0])]);
+  });
+
+  afterAll(async () => {
+    if (plain) await plain.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** A store whose server answers the library check as given. */
+  const serverSaying = (mode: string | null, catalog: string | null) => ({ query: async () => [{ mode, catalog }] }) as unknown as Store;
+
+  it('is decided by the library the server has loaded, not by the version in the catalog', async () => {
+    // the library was upgraded and ALTER EXTENSION never run: the catalog still says 0.7.4, the setting exists
+    expect(await vectorScan(serverSaying('off', '0.7.4'))).toEqual({ iterative: true, catalog: '0.7.4' });
+    expect(await vectorScan(serverSaying(null, '0.7.4'))).toEqual({ iterative: false, catalog: '0.7.4' });
+    // the embedded index carries a library that has it
+    expect((await vectorScan(plain)).iterative).toBe(true);
+  });
+
+  it('says in one line which behaviour is in effect, why, and what an operator runs', async () => {
+    expect(await describeVectorScan(serverSaying('off', '0.8.7'))).toBe(
+      'vector search: the index is walked on until each side of a search has its candidates (pgvector 0.8.7 in the catalog; the library has hnsw.iterative_scan).',
+    );
+    const behind = await describeVectorScan(serverSaying('off', '0.7.4'));
+    expect(behind).toContain('the index is walked on');
+    expect(behind).toContain('The catalog is behind the library: ALTER EXTENSION vector UPDATE');
+    const old = await describeVectorScan(serverSaying(null, '0.7.4'));
+    expect(old).toContain('one walk of the index per search (pgvector 0.7.4 in the catalog; the library on this server has no hnsw.iterative_scan');
+    expect(old).toContain('install pgvector 0.8.0 or later on the database server, restart it, then run ALTER EXTENSION vector UPDATE');
+  });
+
+  it('sends the walk without the setting to a library that has none, and answers', async () => {
+    const sent: string[] = [];
+    const query = plain.query.bind(plain);
+    plain.query = ((sql: string, params?: unknown[]) => {
+      sent.push(sql);
+      if (sql.includes(`current_setting('hnsw.iterative_scan'`)) return Promise.resolve([{ mode: null, catalog: '0.7.4' }]);
+      return query(sql, params);
+    }) as typeof plain.query;
+    try {
+      // a store's answer is kept: this one is asked for the first time here
+      const unasked = Object.create(plain) as Store;
+      const results = await search(unasked, embedder, 'anything', { k: 4, mode: 'vector', track: false, current: false, exactSide: 0 });
+      expect(results.map((r) => r.chunkId)).toEqual(['c1']);
+    } finally {
+      plain.query = query;
+    }
+    const vector = sent.filter((sql) => sql.includes('<=>'));
+    expect(vector).toHaveLength(1);
+    expect(vector[0]).not.toContain('set_config');
   });
 });
 
