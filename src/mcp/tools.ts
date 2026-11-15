@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { AppContext } from '../context.js';
 import { runSourceQuery } from '../datasource/execute.js';
 import { MAX_FILE_BYTES } from '../constants.js';
-import { assertNotPrivate, assertSourcePath, assertWritablePath, cleanRelPath, grepFiles, listTree, safePath, writeFileText } from '../fs/files.js';
+import { assertNotPrivate, assertSourcePath, assertWritablePath, cleanRelPath, grepAnswer, listTree, safePath, writeFileText } from '../fs/files.js';
 import { recordOrigin } from '../fs/sidecar.js';
 import { assertNotConvertedOriginal, readSourceTextCapped } from '../ingest/source.js';
 import { assertNotLinked } from '../ingest/folders.js';
@@ -41,7 +41,7 @@ import { callApiSource, loadResearchSource } from '../research/sources.js';
 import { createStudy, listStudies, startStudy, studyAgent, studyView, refineStudy } from '../research/study.js';
 import { webSearch, webSearchEnabled } from '../research/web.js';
 import { readSection } from '../research/read.js';
-import { grepWithContext, grepPaths, READ_BUDGET, READ_BUDGET_MAX, READ_PATHS_MAX, readMany } from './batch.js';
+import { grepAcross, grepWithContext, READ_BUDGET, READ_BUDGET_MAX, READ_PATHS_MAX, readMany } from './batch.js';
 import { catalogGuide } from './catalog-guide.js';
 import { loadFeed } from '../ingest/feeds/definitions.js';
 import { pushToFeed } from '../ingest/feeds/run.js';
@@ -977,7 +977,7 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
     'knode_grep',
     {
       title: 'Grep the knowledge files',
-      description: 'Regex search across wiki, raw/docs (including the Markdown derived from PDFs and images), raw/skills, playbooks/packs and raw/codebase (code repositories; pass path="raw/codebase/<repo>" to search one) (like grep -rn). For exact strings, symbols, tickers and numbers. `context: N` returns N lines around each match, grouped by file (like grep -n -C N), so one call can replace reading the files; `paths` searches several subtrees or files at once.',
+      description: 'Regex search across wiki, raw/docs (including the Markdown derived from PDFs and images), raw/skills, playbooks/packs and raw/codebase (code repositories; pass path="raw/codebase/<repo>" to search one) (like grep -rn). For exact strings, symbols, tickers and numbers. `context: N` returns N lines around each match, grouped by file (like grep -n -C N), so one call can replace reading the files; `paths` searches several subtrees or files at once. Without `context` the answer is {matches, total}; when more lines match than it shows (maxMatches, or max_per_file) it has `cut` as well: the matches are then a sample shared over the folders and files that hold them, not the first ones met, and `cut.folders` names every folder that matches with its count — search that folder alone to see its matches. With `context` the same is said in a closing note.',
       inputSchema: {
         pattern: z.string().describe('JavaScript regular expression (case-insensitive)'),
         path: z.string().optional().describe('Restrict to a subtree or a file, e.g. "wiki/datasets"'),
@@ -992,8 +992,8 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
       if (context !== undefined && context > 0) {
         return { content: [{ type: 'text' as const, text: grepWithContext(ctx, { pattern, paths: roots, context, maxMatches, maxPerFile: max_per_file }) }] };
       }
-      if (roots.length <= 1 && max_per_file === undefined) return json(grepFiles(ctx.dataDir, pattern, { path: roots[0], maxMatches }));
-      return json(grepPaths(ctx, { pattern, paths: roots, maxMatches, maxPerFile: max_per_file }));
+      // one shape, cut or not: {matches, total}, and `cut` when the matches are a sample of what matches
+      return json(grepAnswer(grepAcross(ctx, { pattern, paths: roots, maxMatches, maxPerFile: max_per_file })));
     },
   );
 }

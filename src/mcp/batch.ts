@@ -1,6 +1,6 @@
 import { AppContext } from '../context.js';
 import { MAX_FILE_BYTES } from '../constants.js';
-import { grepFiles, GrepMatch } from '../fs/files.js';
+import { GrepAnswer, GrepMatch, GrepResult, grepAnswer, grepPartialNote, grepSearch, shareEvenly } from '../fs/files.js';
 import { readSourceTextCapped } from '../ingest/source.js';
 import { isVirtualPath, readVirtual } from '../compiler/vfs.js';
 import { readSection, ReadSlice } from '../research/read.js';
@@ -48,16 +48,7 @@ async function readOne(ctx: AppContext, r: ReadRequest): Promise<{ text: string;
  * than an even share is read whole and the longer ones split the rest evenly.
  */
 export function shareBudget(lengths: number[], budget: number): number[] {
-  const out = new Array<number>(lengths.length).fill(0);
-  let remaining = budget;
-  let left = lengths.length;
-  for (const i of lengths.map((_, i) => i).sort((a, b) => lengths[a] - lengths[b] || a - b)) {
-    const share = Math.floor(remaining / left);
-    out[i] = Math.min(lengths[i], share);
-    remaining -= out[i];
-    left--;
-  }
-  return out;
+  return shareEvenly(lengths, budget);
 }
 
 /** `text` cut to `chars` on a line, with where to read on. */
@@ -105,29 +96,44 @@ export interface GrepRequest {
 const GREP_CHARS_MAX = 60_000;
 const LINE_CHARS = 300;
 
-/** The matches of one or several subtrees, deduplicated, in file then line order of discovery. */
-export function grepPaths(ctx: AppContext, req: GrepRequest): GrepMatch[] {
-  const max = Math.min(req.maxMatches ?? 100, 500);
-  const perFile = Math.max(1, req.maxPerFile ?? max);
-  const out: GrepMatch[] = [];
-  const seen = new Set<string>();
-  const counts = new Map<string, number>();
-  for (const root of req.paths?.length ? req.paths : [undefined]) {
-    if (out.length >= max) break;
-    // over-fetch so a file past its per-file cap does not starve the others
-    for (const m of grepFiles(ctx.dataDir, req.pattern, { path: root, maxMatches: 500 })) {
-      const key = `${m.path}:${m.line}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      const n = counts.get(m.path) ?? 0;
-      if (n >= perFile) continue;
-      counts.set(m.path, n + 1);
-      out.push(m);
-      if (out.length >= max) break;
-    }
-  }
-  return out;
+/**
+ * The matches of one or several subtrees, each file once, in the order
+ * searched. More matches than `maxMatches` are shared over the folders and
+ * files that hold them (`grepSearch`), not taken from the first ones met.
+ */
+export function grepAcross(ctx: AppContext, req: GrepRequest): GrepResult {
+  return grepSearch(ctx.dataDir, req.pattern, { paths: req.paths, maxMatches: req.maxMatches, maxPerFile: req.maxPerFile });
 }
+
+export function grepPaths(ctx: AppContext, req: GrepRequest): GrepMatch[] {
+  return grepAcross(ctx, req).matches;
+}
+
+const count = (n: number, one: string, many = `${one}s`) => `${n.toLocaleString('en-US')} ${n === 1 ? one : many}`;
+
+/**
+ * What a text answer says when it is a sample: how many lines match in all,
+ * and every folder that matches with its count and how many of its lines
+ * are shown, so the caller can ask for the one folder it means. Empty when
+ * every match is shown.
+ */
+export function grepCutNote(answer: GrepAnswer): string {
+  const cut = answer.cut;
+  if (!cut) return '';
+  const lower = cut.partial ? ` (at least: ${grepPartialNote(cut.partial)})` : '';
+  const lines = cut.folders.map((f) => {
+    const below = f.folders ? ` and ${count(f.folders, 'folder')} below it` : '';
+    const unread = f.unread ? `, ${count(f.unread, 'file')} not read` : '';
+    return `  ${f.path || '.'}${below}: ${count(f.matches, 'match', 'matches')} in ${count(f.files, 'file')}, ${f.shown.toLocaleString('en-US')} shown${unread}`;
+  });
+  return [
+    `(showing ${cut.shown.toLocaleString('en-US')} of ${count(answer.total, 'matching line')}${lower}, shared over the folders and files that hold them:`,
+    ...lines,
+    'To see a folder\'s matches, search it alone (`path`), or narrow the pattern.)',
+  ].join('\n');
+}
+
+const folderOf = (file: string) => (file.includes('/') ? file.slice(0, file.lastIndexOf('/')) : '');
 
 /**
  * The matches with `context` lines around them, grouped by file:
@@ -138,21 +144,21 @@ export function grepPaths(ctx: AppContext, req: GrepRequest): GrepMatch[] {
  *   13- line after
  *   --
  *   40: another match
+ *
+ * An answer past `GREP_CHARS_MAX` leaves files out a folder in turn, as the
+ * matches were chosen: the first file of every folder is in before any
+ * folder's second. Cut in the order searched, the last folders fell out
+ * whole, and the note still counted their lines as shown.
  */
 export function grepWithContext(ctx: AppContext, req: GrepRequest): string {
-  const matches = grepPaths(ctx, req);
+  const result = grepAcross(ctx, req);
+  const { matches } = result;
   if (matches.length === 0) return `no match for /${req.pattern}/${req.paths?.length ? ` under ${req.paths.join(', ')}` : ''}`;
   const context = Math.min(Math.max(req.context ?? 0, 0), 20);
   const byFile = new Map<string, number[]>();
   for (const m of matches) (byFile.get(m.path) ?? byFile.set(m.path, []).get(m.path)!).push(m.line);
-  const blocks: string[] = [];
-  let size = 0;
-  const skipped: string[] = [];
+  const blocks: { file: string; text: string; hits: number }[] = [];
   for (const [file, hits] of byFile) {
-    if (size >= GREP_CHARS_MAX) {
-      skipped.push(file);
-      continue;
-    }
     let lines: string[];
     try {
       lines = context > 0 ? (readSourceTextCapped(ctx.dataDir, file, MAX_FILE_BYTES)?.content ?? '').split('\n') : [];
@@ -174,14 +180,47 @@ export function grepWithContext(ctx: AppContext, req: GrepRequest): string {
       }
       last = Math.max(last, to);
     }
-    const block = out.join('\n');
-    size += block.length;
-    blocks.push(block);
+    blocks.push({ file, text: out.join('\n'), hits: sorted.length });
   }
-  const max = Math.min(req.maxMatches ?? 100, 500);
+
+  // what fits, a folder in turn
+  const inFolder = new Map<string, number[]>();
+  blocks.forEach((b, i) => (inFolder.get(folderOf(b.file)) ?? inFolder.set(folderOf(b.file), []).get(folderOf(b.file))!).push(i));
+  const kept = new Set<number>();
+  let size = 0;
+  for (let round = 0; kept.size < blocks.length && size < GREP_CHARS_MAX; round++) {
+    let any = false;
+    for (const members of inFolder.values()) {
+      const i = members[round];
+      if (i === undefined) continue;
+      any = true;
+      if (size >= GREP_CHARS_MAX) break;
+      kept.add(i);
+      size += blocks[i].text.length;
+    }
+    if (!any) break;
+  }
+  const dropped = blocks.filter((_, i) => !kept.has(i));
+  let shownResult = result;
+  if (dropped.length > 0) {
+    // the answer shows less than the search picked: its matches, and each folder's count of shown lines, say so
+    const gone = new Set(dropped.map((b) => b.file));
+    const lost = new Map<string, number>();
+    for (const b of dropped) lost.set(folderOf(b.file), (lost.get(folderOf(b.file)) ?? 0) + b.hits);
+    const folders = result.folders
+      ?? [...inFolder.keys()].map((folder) => {
+        const mine = blocks.filter((b) => folderOf(b.file) === folder);
+        return { path: folder, matches: mine.reduce((n, b) => n + b.hits, 0), files: mine.length, shown: mine.reduce((n, b) => n + b.hits, 0) };
+      });
+    shownResult = {
+      ...result,
+      matches: matches.filter((m) => !gone.has(m.path)),
+      folders: folders.map((f) => ({ ...f, shown: f.shown - (lost.get(f.path) ?? 0) })),
+    };
+  }
   const notes = [
-    matches.length >= max ? `(stopped at ${max} matches: narrow the pattern or the paths, or raise maxMatches)` : '',
-    skipped.length ? `(not shown, past the answer's size: ${skipped.join(', ')})` : '',
+    grepCutNote(grepAnswer(shownResult)),
+    dropped.length ? `(${count(dropped.length, 'file')} with ${count(dropped.reduce((n, b) => n + b.hits, 0), 'match', 'matches')} left out by the answer's size, a folder in turn: ask for fewer matches or less context, or search a folder alone)` : '',
   ].filter(Boolean);
-  return [...blocks, ...notes].join('\n\n');
+  return [...blocks.filter((_, i) => kept.has(i)).map((b) => b.text), ...notes].join('\n\n');
 }

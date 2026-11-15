@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Command } from 'commander';
 import { MAX_FILE_BYTES, MAX_PREVIEW_BYTES } from '../constants.js';
-import { GrepMatch, grepFiles, isPrivatePath, listTree, TreeNode } from '../fs/files.js';
+import { GrepAnswer, grepAnswer, GrepMatch, grepSearch, isPrivatePath, listTree, TreeNode } from '../fs/files.js';
 import { TREE_HIDDEN } from '../fs/layout.js';
 import { readSourceTextCapped } from '../ingest/source.js';
 import { originalType } from '../server/originals.js';
@@ -85,8 +85,38 @@ export function formatListing(nodes: TreeNode[]): string {
   }).join('\n');
 }
 
-export function formatGrep(matches: GrepMatch[]): string {
-  return matches.length ? matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join('\n') : '(no matches)';
+/**
+ * What a server answered a grep with, as the answer shape: a server from
+ * before that shape ignores `shape=answer` and sends the array of matches.
+ * It stopped at the first `max` lines, in the order it met them, and does not
+ * say whether more match — which the answer then says for it.
+ */
+export function grepAnswerFrom(body: GrepAnswer | GrepMatch[], max: number): GrepAnswer {
+  if (!Array.isArray(body)) return body;
+  if (body.length < max) return { matches: body, total: body.length };
+  return {
+    matches: body,
+    total: body.length,
+    cut: {
+      shown: body.length,
+      folders: [],
+      note: `The server is an older version: it stopped at the first ${body.length} matching lines it met and does not say how many more match, or where.`,
+    },
+  };
+}
+
+/** The matches as `path:line: text`, and under a cut answer where the rest are: every folder that matches, with its count. */
+export function formatGrep(answer: GrepAnswer): string {
+  if (answer.matches.length === 0) return '(no matches)';
+  const lines = answer.matches.map((m) => `${m.path}:${m.line}: ${m.text}`);
+  if (!answer.cut) return lines.join('\n');
+  // an older server's answer: no counts to give
+  if (answer.cut.folders.length === 0) return [...lines, '', `-- ${answer.cut.note}`].join('\n');
+  const p = answer.cut.partial;
+  const unreached = p ? p.folders - p.foldersReached : 0;
+  const lower = p ? ` (at least: the scan stopped after ${p.filesRead} of ${p.files} files${unreached > 0 ? `, ${unreached} of ${p.folders} folders not reached` : ''})` : '';
+  const folders = answer.cut.folders.map((f) => `  ${f.path || '.'}${f.folders ? ` (+${f.folders} folders below)` : ''}: ${f.matches} in ${f.files} files, ${f.shown} shown`);
+  return [...lines, '', `-- ${answer.cut.shown} of ${answer.total} matching lines shown${lower}, shared over the folders that hold them:`, ...folders, '-- search one folder to see its matches: knode grep <pattern> <folder>'].join('\n');
 }
 
 async function tree(deps: FileDeps, p: string, depth: number | undefined): Promise<TreeNode> {
@@ -227,10 +257,11 @@ export function registerFileCommands(program: Command, deps: FileDeps): void {
     .action(async (pattern: string, p: string | undefined, opts: { max: string; json?: boolean }) => {
       const srv = deps.server();
       const at = p ? clean(p) : undefined;
-      const matches = srv
-        ? await srv.get<GrepMatch[]>('/api/grep', { pattern, path: at, maxMatches: Number(opts.max) })
-        : grepFiles(deps.dataDir(), pattern, { path: at, maxMatches: Number(opts.max) });
-      console.log(opts.json ? JSON.stringify(matches, null, 2) : formatGrep(matches));
+      const max = Number(opts.max);
+      const answer = srv
+        ? grepAnswerFrom(await srv.get<GrepAnswer | GrepMatch[]>('/api/grep', { pattern, path: at, maxMatches: max, shape: 'answer' }), max)
+        : grepAnswer(grepSearch(deps.dataDir(), pattern, { paths: at ? [at] : undefined, maxMatches: max }));
+      console.log(opts.json ? JSON.stringify(answer, null, 2) : formatGrep(answer));
     });
 
   program

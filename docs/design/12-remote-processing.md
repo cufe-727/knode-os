@@ -192,6 +192,25 @@ processing is started, as embedding does now.
   vectors until it finishes. While a migration is under way, the HNSW walk returns fewer than `k` rows, because the
   filter applies after the index scan.
 
+  **Since 2026‑11‑15 (src/search/search.ts `vectorSearch`).** The same effect starved search of sources where
+  generated pages are the nearest vectors, so a search's vector statement turns on pgvector's iterative index scan
+  for itself (`hnsw.iterative_scan = relaxed_order`, with `hnsw.max_scan_tuples` set to the search's budget): the walk
+  goes on until `k` rows pass the filter. That scan exists from pgvector 0.8.0. What decides is the **library** the
+  server has loaded, not `pg_extension.extversion`: knode-os asks whether the setting exists
+  (`current_setting('hnsw.iterative_scan', true)`), once per store, and `serve` logs one line per workspace it opens
+  saying which behaviour is in effect and why (`describeVectorScan`). knode-os never alters the extension. What an
+  operator runs:
+
+  - *The log says "one walk of the index per search".* The library is older than 0.8.0. Install pgvector 0.8.0 or
+    later on the database server (the package, or `make install` of the release), restart PostgreSQL, then in each
+    database that has the extension: `ALTER EXTENSION vector UPDATE;`. Until then a filtered search, and the sources'
+    side of a search, get what the nearest 40 rows hold, as before this change.
+  - *The log says "the catalog is behind the library".* The library was upgraded and `ALTER EXTENSION vector UPDATE`
+    was not run. Search already uses the iterative scan; run the statement, as the extension's owner, to bring the
+    catalog (and the SQL objects of later versions) in line.
+  - Check by hand: `SELECT extversion FROM pg_extension WHERE extname = 'vector';` for the catalog, and
+    `SELECT '[1]'::vector, current_setting('hnsw.iterative_scan', true);` for the library (NULL: no iterative scan).
+
 ## 4. Embedding configuration and credentials
 
 ### 4.1 What a worker reads: `GET …/work/config`
