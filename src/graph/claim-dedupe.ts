@@ -630,6 +630,9 @@ export function yearlessMonthsOf(s: string, measure = false): Set<number> {
   return out;
 }
 
+/** Words of a plan or a target, whose month is the one aimed at. */
+const PLAN = /计划|预计|预期|目标|拟于|拟在|将于|将在|定于|推迟|延期|延后|顺延|提前|改期|调整至|调整为|有望|\bplan|\bexpect|\btarget|\bdelay|\bpostpone|\bscheduled\b/i;
+
 /** The month of the year a claim's own window lies in, when it lies in one. */
 function windowMonth(c: Pick<ClaimLite, 'valid_from' | 'valid_to'>): Set<number> {
   const from = toIso(c.valid_from);
@@ -653,6 +656,9 @@ export function monthsApart(
   monthsOf: (statement: string, measure: boolean) => Set<number> = yearlessMonthsOf,
 ): boolean {
   if (a.kind === 'prediction' || b.kind === 'prediction') return false;
+  // a plan or target names the time it aims at, which moves when the plan does: 计划6月上线 / 推迟至8月
+  // is a change of plan, the judge's to see, not two times
+  if (PLAN.test(a.statement) || PLAN.test(b.statement)) return false;
   const na = monthsOf(a.statement, Boolean(a.attribute));
   const nb = monthsOf(b.statement, Boolean(b.attribute));
   if (na.size === 0 && nb.size === 0) return false;
