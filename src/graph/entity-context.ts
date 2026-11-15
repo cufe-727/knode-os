@@ -666,7 +666,7 @@ async function contextDocs(
       if (!types.has(other) || other === r.other) types.set(other, r.other_type);
     }
     return { id: g[0].document_id, path: g[0].path, date: toIso(g[0].doc_date), language: g[0].language || null, context };
-  });
+  }).sort((x, y) => x.path.localeCompare(y.path)); // a fixed order: the clusters below must not depend on how the rows came back
   // a document with no date of its own: the middle of the dates its claims state (a weekly report
   // states its week in every figure; a plan or a look back is the odd one out)
   const undated = opts.claimDates ? docs.filter((d) => !d.date) : [];
@@ -692,26 +692,49 @@ async function namesOf(store: Store, ids: string[]): Promise<string[]> {
     .sort((x, y) => ids.indexOf(x.id) - ids.indexOf(y.id)).map((e) => e.name);
 }
 
-/** Keep the rule one name is parted by, re-apply the documents of the parted entity, and return how many were. */
-async function partEntity(
+/** One split refine has decided on: the rule, the documents that go with the parted entity, and why. */
+interface Parting {
+  rule: NamesakeRule;
+  docs: { id: string; path: string }[];
+  reason: string;
+  /** What the progress line calls the entity that is parted. */
+  of: string;
+}
+
+/**
+ * Carry out the splits one phase decided on: every rule first, then every
+ * document of every parted entity re-applied once, in path order. The
+ * decisions were all read from the graph as the phase found it, so neither
+ * the order entities were read in nor the order these are applied in changes
+ * what comes out; what one split makes visible (a team's setting now an
+ * entity of its own, in the documents of another name) is for the next pass.
+ */
+async function applyPartings(
   store: Store,
   config: KnodeConfig | undefined,
-  rule: NamesakeRule,
-  docs: { id: string; path: string }[],
-  reason: string,
+  partings: Parting[],
+  stats: EntityContextStats,
   progress: (msg: string) => void,
   relink: string[],
-): Promise<number> {
-  await store.query(
-    `INSERT INTO entity_namesakes (id, base_id, name, label, anchors, base_anchors, documents, reason)
-     VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb, $8)
-     ON CONFLICT (id) DO UPDATE SET anchors = EXCLUDED.anchors, base_anchors = EXCLUDED.base_anchors, documents = EXCLUDED.documents, reason = EXCLUDED.reason`,
-    [rule.id, rule.base_id, rule.name, rule.label, JSON.stringify(rule.anchors), JSON.stringify(rule.base_anchors), JSON.stringify(docs.map((d) => d.path).sort()), reason],
-  );
-  if (!config) return 0;
+): Promise<void> {
+  for (const p of partings) {
+    await store.query(
+      `INSERT INTO entity_namesakes (id, base_id, name, label, anchors, base_anchors, documents, reason)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb, $8)
+       ON CONFLICT (id) DO UPDATE SET anchors = EXCLUDED.anchors, base_anchors = EXCLUDED.base_anchors, documents = EXCLUDED.documents, reason = EXCLUDED.reason`,
+      [p.rule.id, p.rule.base_id, p.rule.name, p.rule.label, JSON.stringify(p.rule.anchors), JSON.stringify(p.rule.base_anchors), JSON.stringify(p.docs.map((d) => d.path).sort()), p.reason],
+    );
+    if (p.rule.id === p.rule.base_id) continue; // what the entity itself keeps: on record, nothing moves
+    stats.split++;
+    progress(`entities: ${p.of} split — ${p.reason}`);
+  }
+  if (!config) return;
+  const docs = new Map<string, { id: string; path: string }>();
+  for (const p of partings) if (p.rule.id !== p.rule.base_id) for (const d of p.docs) docs.set(d.path, d);
+  const ordered = [...docs.values()].sort((x, y) => x.path.localeCompare(y.path));
   // the documents' own links to the name (tier 0: the name found in the text) follow the split too: once, when every split of this run is made
-  relink.push(...docs.map((d) => d.path));
-  return replayDocuments(store, config, docs, progress);
+  relink.push(...ordered.map((d) => d.path));
+  stats.replayed += await replayDocuments(store, config, ordered, progress);
 }
 
 /**
@@ -750,11 +773,13 @@ async function splitNamesakes(store: Store, config: KnodeConfig | undefined, sta
      WHERE e.tx_to IS NULL AND e.canonical_id IS NULL AND e.type = 'person'
        AND NOT EXISTS (SELECT 1 FROM entities x WHERE x.canonical_id = e.id)
        AND NOT EXISTS (SELECT 1 FROM entity_namesakes n WHERE n.base_id = e.id OR n.id = e.id)
-     GROUP BY e.id, e.name HAVING count(DISTINCT m.document_id) BETWEEN $1 AND $2`,
+     GROUP BY e.id, e.name HAVING count(DISTINCT m.document_id) BETWEEN $1 AND $2
+     ORDER BY e.id`,
     [MIN_DOCS, MAX_DOCS],
   );
   if (people.length === 0) return;
   const pause = breather();
+  const partings: Parting[] = [];
   for (const p of people) {
     await pause();
     const { docs, types } = await contextDocs(store, p.id, { claimDates: wider, same });
@@ -766,10 +791,9 @@ async function splitNamesakes(store: Store, config: KnodeConfig | undefined, sta
     const rule: NamesakeRule = { id: '', base_id: p.id, name: p.name, label: otherAnchors[0], anchors: otherAnchors, base_anchors: baseAnchors };
     rule.id = slugify(namesakeName(rule));
     const reason = `同名不同人：${base.docs.length} 篇文档与 ${baseAnchors.join('、')} 同现，${other.docs.length} 篇与 ${otherAnchors.join('、')} 同现，同一时期内两组共现实体几乎不重合`;
-    stats.split++;
-    progress(`entities: ${p.name} split — ${reason}`);
-    stats.replayed += await partEntity(store, config, rule, other.docs, reason, progress, relink);
+    partings.push({ rule, docs: other.docs, reason, of: p.name });
   }
+  await applyPartings(store, config, partings, stats, progress, relink);
 }
 
 /* ----------------------------------- coded ----------------------------------- */
@@ -907,7 +931,8 @@ async function splitCoded(store: Store, config: KnodeConfig | undefined, stats: 
   const rows = await store.query<{ id: string; name: string; aliases: string[] | null }>(
     `SELECT e.id, e.name, e.aliases FROM entities e
      WHERE e.tx_to IS NULL AND e.canonical_id IS NULL AND e.type = ANY($1::text[]) AND (e.name ~ '[0-9]' OR e.aliases::text ~ '[0-9]')
-       AND NOT EXISTS (SELECT 1 FROM entity_namesakes n WHERE n.id = e.id AND n.id <> n.base_id)`,
+       AND NOT EXISTS (SELECT 1 FROM entity_namesakes n WHERE n.id = e.id AND n.id <> n.base_id)
+     ORDER BY e.id`,
     [[...CODED_TYPES]],
   );
   const candidates = rows.filter((e) => {
@@ -924,6 +949,7 @@ async function splitCoded(store: Store, config: KnodeConfig | undefined, stats: 
   );
   const documents = new Map(counted.map((r) => [r.id, r.n]));
   const pause = breather();
+  const partings: Parting[] = [];
   for (const e of candidates) {
     const n = documents.get(e.id) ?? 0;
     if (n < 2 * CODE_MIN_DOCS || n > MAX_DOCS) continue;
@@ -942,7 +968,7 @@ async function splitCoded(store: Store, config: KnodeConfig | undefined, stats: 
     }
     // the entity's own name is in every evidence row once mentions were resolved onto it: only what the mention itself wrote counts
     const own = (path: string) => (spellings.get(path) ?? []).filter((x) => x !== e.name || codeOf(e.name) === null);
-    const coded: CodedDoc[] = docs.map((d) => ({ ...d, codes: codesOf(own(d.path)) }));
+    const coded: CodedDoc[] = docs.map((d) => ({ ...d, codes: codesOf(own(d.path)) })).sort((x, y) => x.path.localeCompare(y.path));
     const split = codedClusters(coded, (id) => types.get(id));
     if (!split) continue;
     const rules = await store.query<{ id: string; label: string; anchors: string[] }>(`SELECT id, label, anchors FROM entity_namesakes WHERE base_id = $1`, [e.id]);
@@ -957,11 +983,7 @@ async function splitCoded(store: Store, config: KnodeConfig | undefined, stats: 
     const parts = split.parts.filter((p) => p !== kept && !existing.has(p.code.value));
     if (kept && parts.length > 0) {
       const reason = `同名不同物：${e.name} 的 ${docs.length} 篇文档带有 ${split.parts.length} 个不同编号；${kept.docs.length} 篇属于 ${kept.code.raw}（与 ${baseAnchors.join('、')} 同现），文档最多，保留本实体`;
-      await store.query(
-        `INSERT INTO entity_namesakes (id, base_id, name, label, anchors, base_anchors, documents, reason)
-         VALUES ($1, $1, $2, $3, $4::jsonb, $4::jsonb, $5::jsonb, $6) ON CONFLICT (id) DO NOTHING`,
-        [e.id, display, kept.code.raw, JSON.stringify(baseAnchors), JSON.stringify(kept.docs.map((d) => d.path).sort()), reason],
-      );
+      partings.push({ rule: { id: e.id, base_id: e.id, name: display, label: kept.code.raw, anchors: baseAnchors, base_anchors: baseAnchors }, docs: kept.docs, reason, of: e.name });
     }
     for (const part of parts) {
       const anchors = await namesOf(store, part.anchors);
@@ -971,11 +993,10 @@ async function splitCoded(store: Store, config: KnodeConfig | undefined, stats: 
       if (taken) continue;
       const carrying = part.docs.filter((d) => [...d.codes.values()].some((c) => c.value === part.code.value)).length;
       const reason = `同名不同物：${e.name} 的 ${docs.length} 篇文档带有 ${split.parts.length} 个不同编号；${carrying} 篇带 ${part.code.raw}${part.docs.length > carrying ? `、另 ${part.docs.length - carrying} 篇未带编号` : ''}，与 ${anchors.join('、')} 同现，其他编号的文档不与之同现`;
-      stats.split++;
-      progress(`entities: ${e.name} split — ${reason}`);
-      stats.replayed += await partEntity(store, config, rule, part.docs, reason, progress, relink);
+      partings.push({ rule, docs: part.docs, reason, of: e.name });
     }
   }
+  await applyPartings(store, config, partings, stats, progress, relink);
 }
 
 export type { NamesakeRule } from './identity.js';

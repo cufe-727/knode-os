@@ -354,3 +354,82 @@ describe('refine on reports that date themselves only in their claims', () => {
     expect((await store.query<{ canonical_id: string | null }>(`SELECT canonical_id FROM entities WHERE id = $1`, [four[0].id]))[0].canonical_id).toBe('日志保留天数');
   });
 });
+
+describe('refine decides every split of a pass from one view of the graph', () => {
+  const opened: AppContext[] = [];
+  afterAll(async () => {
+    for (const ctx of opened) {
+      await ctx.datasources.closeAll();
+      await ctx.store.close();
+    }
+  });
+
+  /**
+   * Two teams, each with two settings under codes of its own. 重试次数 always carries its code. 限流阈值 carries
+   * it in two reports of each team; in a third, which names no team, it is bare — and the only thing in that
+   * report that says whose it is is the other setting. So 限流阈值 can be parted only once 重试次数 has been.
+   */
+  function fixture(first: '重试次数' | '限流阈值'): Map<string, { text: string; reply: RawExtractReply }> {
+    const out = new Map<string, { text: string; reply: RawExtractReply }>();
+    for (const [team, n] of [['平台组', 1], ['二部平台组', 2]] as const) {
+      const limit = { name: '重试次数', type: 'component', aliases: [`K${n}-A`] };
+      const retries = (coded: boolean) => ({ name: '限流阈值', type: 'component', aliases: coded ? [`K${n}-B`] : [] });
+      const both = (coded: boolean) => (first === '重试次数' ? [limit, retries(coded)] : [retries(coded), limit]);
+      for (const k of [1, 2]) {
+        out.set(`raw/docs/周报/${team}/s${k}.md`, {
+          text: `# ${team}周报 第${k}周\n\n重试次数（K${n}-A）与限流阈值（K${n}-B）本周未调整。\n`,
+          reply: { entities: [{ name: team, type: 'organization', aliases: [] }, ...both(true)], relations: [], claims: [] },
+        });
+      }
+      out.set(`raw/docs/周报/${team}/b1.md`, {
+        text: `# 变更记录\n\n重试次数（K${n}-A）调整后，限流阈值同步下调。\n`,
+        reply: { entities: both(false), relations: [], claims: [] },
+      });
+    }
+    return out;
+  }
+
+  async function run(name: string, first: '重试次数' | '限流阈值'): Promise<{ passes: number[]; parted: Record<string, string[]> }> {
+    const dataDir = path.join(tmp, name);
+    initDataDir(dataDir);
+    const docs = fixture(first);
+    for (const [p, d] of docs) {
+      fs.mkdirSync(path.dirname(path.join(dataDir, p)), { recursive: true });
+      fs.writeFileSync(path.join(dataDir, p), d.text);
+    }
+    const ctx = await createContext(dataDir);
+    opened.push(ctx);
+    await sync(ctx, { llmGraph: false });
+    for (const d of await ctx.store.query<{ id: string }>(`SELECT id FROM documents WHERE root = 'docs'`)) await enqueueTier1(ctx.store, d.id);
+    (ctx.config.extraction as { entityLlm?: unknown }).entityLlm = undefined;
+    const llm = stubExtractor(docs);
+    for (let i = 0; i < 10; i++) if ((await runTier1Pass(ctx.store, ctx.config, llm, { batchSize: 64 })).queued === 0) break;
+    ctx.config.review.identity = 'context';
+    const passes: number[] = [];
+    for (let i = 0; i < 3; i++) passes.push((await resolveEntityContext(ctx.store, { config: ctx.config })).split);
+    const rows = await ctx.store.query<{ name: string; path: string }>(
+      `SELECT DISTINCT e.name, d.path FROM entities e JOIN entity_mentions m ON m.entity_id = e.id JOIN documents d ON d.id = m.document_id
+       WHERE e.type = 'component' AND e.tx_to IS NULL ORDER BY e.name, d.path`,
+    );
+    const parted: Record<string, string[]> = {};
+    for (const r of rows) (parted[r.name] ??= []).push(r.path.replace('raw/docs/周报/', ''));
+    return { passes, parted };
+  }
+
+  it('gives the same splits, pass by pass, whichever entity it reads first', async () => {
+    const a = await run('order-limit-first', '重试次数');
+    const b = await run('order-retries-first', '限流阈值');
+    // the first pass parts 重试次数 alone: 限流阈值 is decided on the graph as the pass found it. The second parts
+    // 限流阈值, now that the report without a team names one team's 重试次数. Not both at once when 重试次数 happens to
+    // be read first, and one a pass when it is not.
+    expect(a.passes).toEqual([1, 1, 0]);
+    expect(b.passes).toEqual(a.passes);
+    expect(b.parted).toEqual(a.parted);
+    expect(a.parted).toEqual({
+      '限流阈值': ['平台组/b1.md', '平台组/s1.md', '平台组/s2.md'],
+      '限流阈值（二部平台组 · K2-B）': ['二部平台组/b1.md', '二部平台组/s1.md', '二部平台组/s2.md'],
+      '重试次数': ['平台组/b1.md', '平台组/s1.md', '平台组/s2.md'],
+      '重试次数（二部平台组 · K2-A）': ['二部平台组/b1.md', '二部平台组/s1.md', '二部平台组/s2.md'],
+    });
+  });
+});
