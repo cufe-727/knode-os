@@ -6,8 +6,9 @@ import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { DatabaseConfig } from '../src/config.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
-import { search } from '../src/search/search.js';
+import { search, sideBudget } from '../src/search/search.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
+import { resolveScopeFilter } from '../src/store/resolver.js';
 
 /**
  * The vector channel's two sides (sources, generated pages) on PostgreSQL,
@@ -132,24 +133,61 @@ describe.skipIf(!ready)('postgres backend: the vector channel lists sources wher
     expect(await store.query(sideQuery, [question])).toHaveLength(0);
   });
 
-  it('returns sources for three quarters of a vector search, the nearest ones', async () => {
+  it('returns sources for three quarters of a vector search: a side this small is read, and exactly', async () => {
     // the nearest sources by a scan of every vector
     const exact = (await store.tx(async (q) => {
       await q.query(`SET LOCAL enable_indexscan = off`);
       return q.query<{ id: string }>(sideQuery, [question]);
     })).map((r) => r.id);
     expect(exact).toHaveLength(24);
+    // 1,500 chunks of sources in an index of 7,500: under the budget, so their vectors are read
+    expect(sideBudget(24, SOURCES + PAGES)).toBe(2000);
 
     const results = await search(store, embedder, 'anything', { k: 8, mode: 'vector', track: false, current: false });
     const found = results.map((r) => r.chunkId);
     expect(found.filter((id) => id.startsWith('p'))).toHaveLength(2);
-    const sources = found.filter((id) => id.startsWith('s'));
-    expect(sources).toHaveLength(6);
-    // an approximate index: at least five of the six are among the exact nearest dozen, and all come in order of distance
-    expect(sources.filter((id) => exact.slice(0, 12).includes(id)).length).toBeGreaterThanOrEqual(5);
+    expect(found.filter((id) => id.startsWith('s'))).toEqual(exact.slice(0, 6));
     expect(results.map((r) => r.signals.vector!)).toEqual(results.map((r) => r.signals.vector!).sort((a, b) => b - a));
     // a search for 20 gets its fifteen: the source list is as long as asked for, not what 40 rows of the index held
     const wide = await search(store, embedder, 'anything', { k: 20, mode: 'vector', track: false, current: false });
-    expect(wide.filter((r) => r.chunkId.startsWith('s'))).toHaveLength(15);
+    expect(wide.filter((r) => r.chunkId.startsWith('s')).map((r) => r.chunkId)).toEqual(exact.slice(0, 15));
+  });
+
+  it('walks the index on for a side, in the one statement a search sends', async () => {
+    // a question near the sources, and every side walked: the pages lie behind all 1,500 sources,
+    // 1,460 rows past the 40 one walk reads
+    const sent: string[] = [];
+    const query = store.query.bind(store);
+    store.query = ((sql: string, params?: unknown[]) => {
+      sent.push(sql);
+      return query(sql, params);
+    }) as typeof store.query;
+    try {
+      const both = await search(store, embedder, 'anything', { k: 8, mode: 'vector', track: false, current: false, exactSide: 0, queryVector: [1, 1, 0, 0] });
+      // the sources are the nearest: they fill the search, and one walk would have done for them
+      expect(both.every((r) => r.chunkId.startsWith('s'))).toBe(true);
+      // asked for pages alone, the walk goes on past the sources for them
+      const pages = await search(store, embedder, 'anything', { k: 8, mode: 'vector', track: false, current: false, exactSide: 0, queryVector: [1, 1, 0, 0], filter: resolveScopeFilter({ kinds: ['view'] }) });
+      expect(pages).toHaveLength(8);
+      expect(pages.every((r) => r.chunkId.startsWith('p'))).toBe(true);
+    } finally {
+      store.query = query;
+    }
+    // a search sent one statement for its vectors, with both sides and the setting in it; the setting ended with it
+    const vector = sent.filter((sql) => sql.includes('<=>'));
+    expect(vector).toHaveLength(2);
+    expect(vector[0]).toContain(`set_config('hnsw.iterative_scan', 'relaxed_order', true)`);
+    expect(vector[0]).toContain('UNION ALL');
+    expect(vector[1]).not.toContain('UNION ALL');
+    expect(await store.query(`SHOW hnsw.iterative_scan`)).toEqual([{ 'hnsw.iterative_scan': 'off' }]);
+  });
+
+  it('reads a side a filter leaves a handful of chunks, however far from the question they lie', async () => {
+    // three reports, behind all 6,000 pages and most sources: a walk would read to its limit for them
+    const far = ['s11', 's222', 's1333'];
+    const filter = resolveScopeFilter({ sources: far.map((id) => `raw/docs/${id}.md`) });
+    const results = await search(store, embedder, 'anything', { k: 8, mode: 'vector', track: false, current: false, filter });
+    expect(results.map((r) => r.chunkId).sort()).toEqual([...far].sort());
+    expect(results.map((r) => r.signals.vector!)).toEqual(results.map((r) => r.signals.vector!).sort((a, b) => b - a));
   });
 });

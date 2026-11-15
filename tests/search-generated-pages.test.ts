@@ -6,7 +6,7 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { defaultRerankConfig } from '../src/config.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
-import { cutWithSources, docLiveAt, GENERATED_SHARE, search, searchExplained, SearchMode } from '../src/search/search.js';
+import { cutWithSources, docLiveAt, GENERATED_SHARE, search, searchExplained, SearchMode, sideBudget } from '../src/search/search.js';
 import { Store, toVectorLiteral } from '../src/store/db.js';
 import { MATCH_INDEXES } from '../src/store/grams.js';
 import { resolveScopeFilter } from '../src/store/resolver.js';
@@ -165,6 +165,25 @@ describe('generated pages in search results', () => {
     expect(found.filter((id) => id.startsWith('qs')).sort()).toEqual(['qs1', 'qs2', 'qs3', 'qs4', 'qs5', 'qs6']);
     // without the phrase the words decide, and the notes hold them oftener
     expect((await ids('keyword', { query: 'Quasar uptime' })).filter((id) => id.startsWith('qn')).length).toBeGreaterThan(0);
+  });
+
+  it('ranks a side alike whether its vectors are read or the index is walked for it', async () => {
+    // an index this small is read side by side; `exactSide: 0` sends the walk's statement instead
+    const read = await search(store, embedder, QUESTION, { k: 8, mode: 'vector', track: false, current: false });
+    const walked = await search(store, embedder, QUESTION, { k: 8, mode: 'vector', track: false, current: false, exactSide: 0 });
+    expect(walked.map((r) => [r.chunkId, r.signals.vector])).toEqual(read.map((r) => [r.chunkId, r.signals.vector]));
+    expect(sidesOf(read.map((r) => r.chunkId)).sources).toHaveLength(6);
+    // a filter that leaves a side nothing sends no branch for it, and one that leaves neither side anything no statement
+    expect(await ids('vector', { sources: ['raw/docs/weekly/s3.md'] })).toEqual(['s3']);
+    expect(await ids('vector', { sources: ['raw/docs/nowhere'] })).toEqual([]);
+  });
+
+  it('gives a side a budget of rows that grows with the root of the index', () => {
+    expect(sideBudget(24, 8016)).toBe(2000);
+    expect(sideBudget(24, 200_400)).toBe(6203);
+    expect(sideBudget(24, 456_000)).toBe(9357);
+    expect(sideBudget(300, 2_000_000)).toBe(20_000);
+    expect(sideBudget(24, 0)).toBe(2000);
   });
 
   it('lists sources as candidates while the substring index is being built, too', async () => {
