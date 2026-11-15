@@ -57,7 +57,7 @@ export interface SecondRound {
   ms: number;
 }
 
-interface FactLike { subject: string; object?: string | null; statement: string }
+interface FactLike { subject: string; object?: string | null; statement: string; path?: string | null }
 
 /** The question's words none of the passages and facts hold (names it gives excluded). */
 export function missingTerms(question: string, names: string[], text: string): string[] {
@@ -156,12 +156,17 @@ export async function secondRound(
     // a passage reached only through a common entity must hold a missing word
     .filter((x) => x.words > 0 || (x.c.ents ?? []).some((e) => !common.has(e)))
     .sort((a, b) => b.key[0] - a.key[0] || b.key[1] - a.key[1] || b.key[2] - a.key[2] || a.c.chunk_id.localeCompare(b.c.chunk_id));
-  // one passage a document, so the round reaches as many documents as it may
+  // one passage a document, so the round reaches as many documents as it may; a document the first round shows
+  // already — a passage of it, a generated page citing it by path, a fact it is the source of — is not new
   const seenDoc = new Set(contexts.map((c) => c.documentId));
+  const cited = new Set([
+    ...contexts.flatMap((c) => [c.path, ...[...c.content.matchAll(/raw\/[^\s)\]>|"']+?\.md/g)].map((m) => m[0])]),
+    ...facts.map((f) => f.path).filter((p): p is string => Boolean(p)),
+  ]);
   const chunks: SearchResult[] = [];
   for (const { c } of scored) {
     if (chunks.length >= SECOND_CHUNKS) break;
-    if (seenDoc.has(c.document_id)) continue;
+    if (seenDoc.has(c.document_id) || cited.has(c.path)) continue;
     seenDoc.add(c.document_id);
     chunks.push({
       chunkId: c.chunk_id, documentId: c.document_id, path: c.path, title: c.title, content: c.content,
