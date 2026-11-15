@@ -1,6 +1,6 @@
 import { AppContext } from '../context.js';
 import { MAX_FILE_BYTES } from '../constants.js';
-import { GrepAnswer, GrepMatch, GrepResult, grepAnswer, grepSearch, shareEvenly } from '../fs/files.js';
+import { GrepAnswer, GrepMatch, GrepResult, grepAnswer, grepPartialNote, grepSearch, shareEvenly } from '../fs/files.js';
 import { readSourceTextCapped } from '../ingest/source.js';
 import { isVirtualPath, readVirtual } from '../compiler/vfs.js';
 import { readSection, ReadSlice } from '../research/read.js';
@@ -120,7 +120,7 @@ const count = (n: number, one: string, many = `${one}s`) => `${n.toLocaleString(
 export function grepCutNote(answer: GrepAnswer): string {
   const cut = answer.cut;
   if (!cut) return '';
-  const lower = cut.partial ? ` (at least: the scan stopped after ${cut.partial.filesRead.toLocaleString('en-US')} of ${count(cut.partial.files, 'file')}, a folder in turn)` : '';
+  const lower = cut.partial ? ` (at least: ${grepPartialNote(cut.partial)})` : '';
   const lines = cut.folders.map((f) => {
     const below = f.folders ? ` and ${count(f.folders, 'folder')} below it` : '';
     const unread = f.unread ? `, ${count(f.unread, 'file')} not read` : '';

@@ -149,13 +149,13 @@ describe('how much a grep reads', () => {
     expect(r.matches).toHaveLength(5);
     // the first round: one file of each of four divisions (the first's holds two lines), not five lines of one folder
     // (and the growth team's first, which holds none)
-    expect(r.partial).toEqual({ filesRead: 5, files: 122 });
+    expect(r.partial).toEqual({ filesRead: 5, files: 122, foldersReached: 5, folders: 12 });
     expect(perFolder(r.matches).size).toBe(4);
     expect(r.total).toBe(5);
     expect(r.folders!.map((f) => f.unread)).toEqual([11, 11, 11, 11]);
     const answer = grepAnswer(r);
-    expect(answer.cut!.partial).toEqual({ filesRead: 5, files: 122 });
-    expect(answer.cut!.note).toContain('at least: the scan stopped after 5 of 122 files');
+    expect(answer.cut!.partial).toEqual({ filesRead: 5, files: 122, foldersReached: 5, folders: 12 });
+    expect(answer.cut!.note).toContain('at least: the scan stopped after 5 of 122 files, a folder in turn, and never reached 7 of the 12 folders');
     expect(grepCutNote(answer)).toContain('11 files not read');
 
     // a pattern in one file is looked for in every file, however small the fill
@@ -163,6 +163,47 @@ describe('how much a grep reads', () => {
     expect(rare).toEqual({ matches: [{ path: 'raw/docs/周报/一部增长组/w01.md', line: 2, text: '拉新 1200 人。' }], total: 1 });
     // and with the default fill this tree is read whole
     expect(grepSearch(tmp, '平台组', { paths: ['raw/docs'], maxMatches: 5 }).partial).toBeUndefined();
+  });
+});
+
+describe('what a grep that stopped early says', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-grep-stop-'));
+  beforeAll(() => {
+    // five folders of two reports in Chinese: 1,000 characters each, 3,000 bytes
+    for (let f = 1; f <= 5; f++) {
+      fs.mkdirSync(path.join(dir, 'raw', 'docs', `team-${f}`), { recursive: true });
+      for (const n of [1, 2]) fs.writeFileSync(path.join(dir, 'raw', 'docs', `team-${f}`, `r${n}.md`), `平台组${'进展顺利'.repeat(249)}。`);
+    }
+  });
+  afterAll(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  it('counts what it read in bytes, not characters', () => {
+    // a fill of 5,000 bytes is reached by the second file (6,000 bytes); counted in characters it took five
+    const r = grepSearch(dir, '平台组', { paths: ['raw/docs'], maxMatches: 1, scanBytes: 5000 });
+    expect(r.partial?.filesRead).toBe(2);
+  });
+
+  it('says how many folders it never reached', () => {
+    const r = grepSearch(dir, '平台组', { paths: ['raw/docs'], maxMatches: 1, scanBytes: 5000 });
+    expect(r.partial).toEqual({ filesRead: 2, files: 10, foldersReached: 2, folders: 5 });
+    // the folders named are the two it read in; the other three hold matches it never saw
+    expect(r.folders!.map((f) => f.path)).toEqual(['raw/docs/team-1', 'raw/docs/team-2']);
+    const answer = grepAnswer(r);
+    expect(answer.cut!.note).toContain('the scan stopped after 2 of 10 files, a folder in turn, and never reached 3 of the 5 folders');
+    expect(grepCutNote(answer)).toContain('never reached 3 of the 5 folders');
+    expect(formatGrep(answer)).toContain('3 of 5 folders not reached');
+  });
+
+  it('reports a whole answer when the fill is reached with nothing left to read', () => {
+    // the answer is full and the fill reached at the last file: every file was read, so nothing is partial or cut
+    const whole = grepSearch(dir, '平台组', { paths: ['raw/docs'], maxMatches: 10, scanBytes: 0 });
+    expect(whole).toEqual({ matches: whole.matches, total: 10 });
+    expect(whole.matches).toHaveLength(10);
+    expect(grepAnswer(whole).cut).toBeUndefined();
+    // one file short of it, the last file is unread and the answer says so
+    const short = grepSearch(dir, '平台组', { paths: ['raw/docs'], maxMatches: 9, scanBytes: 0 });
+    expect(short.partial).toEqual({ filesRead: 9, files: 10, foldersReached: 5, folders: 5 });
+    expect(grepAnswer(short).cut?.note).not.toContain('never reached');
   });
 });
 

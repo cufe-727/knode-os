@@ -112,7 +112,9 @@ export function formatGrep(answer: GrepAnswer): string {
   if (!answer.cut) return lines.join('\n');
   // an older server's answer: no counts to give
   if (answer.cut.folders.length === 0) return [...lines, '', `-- ${answer.cut.note}`].join('\n');
-  const lower = answer.cut.partial ? ` (at least: the scan stopped after ${answer.cut.partial.filesRead} of ${answer.cut.partial.files} files)` : '';
+  const p = answer.cut.partial;
+  const unreached = p ? p.folders - p.foldersReached : 0;
+  const lower = p ? ` (at least: the scan stopped after ${p.filesRead} of ${p.files} files${unreached > 0 ? `, ${unreached} of ${p.folders} folders not reached` : ''})` : '';
   const folders = answer.cut.folders.map((f) => `  ${f.path || '.'}${f.folders ? ` (+${f.folders} folders below)` : ''}: ${f.matches} in ${f.files} files, ${f.shown} shown`);
   return [...lines, '', `-- ${answer.cut.shown} of ${answer.total} matching lines shown${lower}, shared over the folders that hold them:`, ...folders, '-- search one folder to see its matches: knode grep <pattern> <folder>'].join('\n');
 }

@@ -310,7 +310,16 @@ export interface GrepResult {
   /** When matches were left out: every folder that holds matches, in the order searched. */
   folders?: GrepFolder[];
   /** When the scan stopped before every file was read: how far it got. */
-  partial?: { filesRead: number; files: number };
+  partial?: GrepPartial;
+}
+
+/** How far a scan that stopped early got: of the files listed, and of the folders they are in. */
+export interface GrepPartial {
+  filesRead: number;
+  files: number;
+  /** Folders it read a file of. The others may hold matches too, and none of them is among `folders`. */
+  foldersReached: number;
+  folders: number;
 }
 
 /**
@@ -428,7 +437,9 @@ export function grepSearch(
   /** The lines of `read` that match, as far as `keep` of them; all of them counted. */
   const scan = (read: string, keep: number): { count: number; lines: { line: number; text: string }[]; bytes: number } => {
     const abs = safePath(dataDir, read);
-    if (fs.statSync(abs).size > MAX_GREP_FILE_BYTES) return { count: 0, lines: [], bytes: 0 };
+    // the fill is counted in bytes on disk: a character of Chinese is three
+    const { size } = fs.statSync(abs);
+    if (size > MAX_GREP_FILE_BYTES) return { count: 0, lines: [], bytes: 0 };
     const text = fs.readFileSync(abs, 'utf8');
     const lines = text.split('\n');
     const found: { line: number; text: string }[] = [];
@@ -437,7 +448,7 @@ export function grepSearch(
       if (!re.test(lines[i])) continue;
       if (count++ < keep) found.push({ line: i + 1, text: lines[i].trim().slice(0, 300) });
     }
-    return { count, lines: found, bytes: text.length };
+    return { count, lines: found, bytes: size };
   };
 
   // a folder in turn, one file each a round
@@ -487,7 +498,10 @@ export function grepSearch(
   for (const { file, take } of picked.sort((a, b) => a.file.at - b.file.at)) {
     for (const m of (file.held ?? scan(file.read, take).lines).slice(0, take)) matches.push({ path: file.report, line: m.line, text: m.text });
   }
-  const partial = stopped ? { filesRead, files: listed } : undefined;
+  // set only when a file listed was left unread: a fill reached at the last file is a whole scan
+  const partial: GrepPartial | undefined = stopped
+    ? { filesRead, files: listed, foldersReached: folders.filter(([, files]) => files.some((f) => f.count >= 0)).length, folders: folders.length }
+    : undefined;
   if (matches.length >= total && !partial) return { matches, total };
   return {
     matches,
@@ -548,17 +562,24 @@ export interface GrepAnswer {
     shown: number;
     /** Every folder holding matches (deep ones folded into their parents past `GREP_FOLDERS_MAX`), with its count and how many are shown. */
     folders: GrepFolder[];
-    /** The scan stopped before reading every file: `total` and the folders' counts are lower bounds. */
-    partial?: { filesRead: number; files: number };
+    /** The scan stopped before reading every file: `total` and the folders' counts are lower bounds, and folders it never reached are not among `folders`. */
+    partial?: GrepPartial;
     note: string;
   };
+}
+
+/** How far a scan that stopped got, in words: the files read, and the folders it never came to. */
+export function grepPartialNote(partial: GrepPartial): string {
+  const n = (x: number) => x.toLocaleString('en-US');
+  const unreached = partial.folders - partial.foldersReached;
+  return `the scan stopped after ${n(partial.filesRead)} of ${n(partial.files)} files, a folder in turn${unreached > 0 ? `, and never reached ${n(unreached)} of the ${n(partial.folders)} folders: they may hold matches and are not named below` : ''}`;
 }
 
 /** `result` as an interface answers with it: one shape, cut or not. */
 export function grepAnswer(result: GrepResult): GrepAnswer {
   if (!result.folders) return { matches: result.matches, total: result.total };
   const folders = foldGrepFolders(result.folders, GREP_FOLDERS_MAX);
-  const lower = result.partial ? ` (at least: the scan stopped after ${result.partial.filesRead.toLocaleString('en-US')} of ${result.partial.files.toLocaleString('en-US')} files, a folder in turn)` : '';
+  const lower = result.partial ? ` (at least: ${grepPartialNote(result.partial)})` : '';
   return {
     matches: result.matches,
     total: result.total,
