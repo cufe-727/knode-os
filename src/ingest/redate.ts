@@ -1,5 +1,5 @@
 import { readSidecarPart, replayableTier1, SidecarTier1 } from '../fs/sidecar.js';
-import { META_KEY as REKEY_META, RekeyState } from '../graph/claim-rekey.js';
+import { rekeyClaims } from '../graph/claim-rekey.js';
 import { frontmatterExtraction } from '../graph/frontmatter.js';
 import { loadOntology, normalizePredicate, Ontology } from '../graph/ontology.js';
 import { claimId, readingWeek } from '../graph/store.js';
@@ -40,7 +40,7 @@ export interface RedateOutcome {
   relations: number;
   /** Evidence rows whose stored dates are not what the old date gave, or whose words read two ways: the document is held. */
   unmatched: number;
-  /** A claim whose dates now make it a weekly reading of another id: the claim re-key (src/graph/claim-rekey.ts) is set to visit it. */
+  /** A claim whose dates now make it a weekly reading of another id: moved by the claim re-key (src/graph/claim-rekey.ts rekeyClaims). */
   rekey: boolean;
 }
 
@@ -197,12 +197,13 @@ async function planScope(q: Queryable, scopeId: string, words: Words, extractor:
  * redone, damaged), or its words do not account for every evidence row,
  * nothing is changed: the scope is held for these rules (`dateHeld`, with the
  * reason) and it is said once; the next rules, or applying it again, read it
- * again. One transaction per re-dated document; null when the scope is already current.
+ * again. One transaction per re-dated document, then the re-key of the claims
+ * that are weekly readings now; null when the scope is already current.
  */
 export async function redateDocument(
   store: Store,
   live: ScopeRow,
-  doc: { file: string; root: DocRoot; raw: string; sha: string; docId: string; at?: string },
+  doc: { file: string; root: DocRoot; raw: string; sha: string; docId: string; at?: string; actor?: string },
   parse: () => ParsedMarkdown,
   log: (msg: string) => void = () => {},
 ): Promise<RedateOutcome | null> {
@@ -267,18 +268,12 @@ export async function redateDocument(
     touched.documents.add(doc.file);
     const fold = await foldTouched(q, touched, txTime, foldOptions(store.dataDir));
     await propagate(q, fold.changed, fold.tombstoned, txTime);
-    if (moved.length) {
-      const [st] = await q.query<{ value: RekeyState }>(`SELECT value FROM meta WHERE key = $1`, [REKEY_META]);
-      const state = st?.value ?? { cursor: null, done: false };
-      const first = moved.reduce((m, id) => (id < m ? id : m));
-      if (state.done || (state.cursor !== null && first <= state.cursor)) {
-        await q.query(`INSERT INTO meta (key, value) VALUES ($1, $2::jsonb) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [REKEY_META, JSON.stringify({ cursor: null, done: false })]);
-      }
-    }
     await mark(q);
     return true;
   });
   if (!done) return null;
   log(`re-dated ${doc.file}: ${was?.slice(0, 10) ?? 'none'} → ${now?.slice(0, 10) ?? 'none'} (${out.claims} claim, ${out.relations} relation dates)`);
+  // a claim that is a weekly reading now moves to its week's id, by the claim re-key, at once
+  if (moved.length) await rekeyClaims(store, moved, { actor: doc.actor ?? 'sync', onProgress: log });
   return { ...out, status: 'redated' };
 }

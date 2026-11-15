@@ -6,7 +6,7 @@ import { AppContext, createContext } from '../src/context.js';
 import { SEGMENTER_VERSION } from '../src/constants.js';
 import { writeSidecarPart } from '../src/fs/sidecar.js';
 import { supersedeByAttribute } from '../src/graph/claim-state-store.js';
-import { rekeyState, rekeyWeeklyReadings } from '../src/graph/claim-rekey.js';
+import { rekeyState } from '../src/graph/claim-rekey.js';
 import { applyMerge } from '../src/graph/merge.js';
 import { DOC_DATE_RULES, documentIdFor } from '../src/ingest/apply.js';
 import { sync } from '../src/ingest/sync.js';
@@ -320,28 +320,33 @@ claims:
     expect(pass).toMatchObject({ indexed: 0, errors: 0 });
     expect(await dated()).toEqual(new Map([[R, '2025-09-05'], [N, null], [P, '2025-09-01']]));
     expect(logs.filter((l) => l.startsWith('re-dated'))).toEqual([`re-dated ${R}: none → 2025-09-05 (2 claim, 1 relation dates)`]);
-    // no entity, claim or relation id changed, nothing opened or closed
-    expect(await identity(ctx)).toEqual(before);
+    // no entity or relation id changed, no scope replaced; of the claims only the reading moved, by the re-key, at once
+    const after = await identity(ctx);
+    expect(after.entities).toEqual(before.entities);
+    expect(after.relations).toEqual(before.relations);
+    expect(after.scopes.filter((x) => (x as { kind?: string }).kind !== 'claim-merge')).toEqual(before.scopes);
+    const readingId = (await ctx.store.query<{ id: string }>(`SELECT id FROM claims WHERE statement = '支付组本周在岗7人。' AND tx_to IS NOT NULL`)).map((r) => r.id);
+    expect(readingId).toHaveLength(1);
+    const known = new Set(before.claims.map((c) => c.id));
+    expect(after.claims.filter((c) => known.has(c.id) && !readingId.includes(c.id))).toEqual(before.claims.filter((c) => !readingId.includes(c.id)));
+    expect(after.claims.filter((c) => !known.has(c.id))).toHaveLength(1);
+    // the re-key of that one claim, not a walk of the table: its state is as it was
+    expect(await rekeyState(ctx.store)).toEqual({ cursor: null, done: true });
     // only the re-dated document's rows fold otherwise
-    const changed = (await ctx.store.query<{ id: string; statement: string; fold_sha: string }>(`SELECT id, statement, fold_sha FROM claims`)).filter((r) => folds.get(r.id) !== r.fold_sha).map((r) => r.statement).sort();
-    expect(changed).toEqual(['孙欣负责结算中台。', '支付组本周在岗7人。']);
+    const changed = (await ctx.store.query<{ id: string; statement: string; fold_sha: string }>(`SELECT id, statement, fold_sha FROM claims WHERE tx_to IS NULL`)).filter((r) => folds.has(r.id) && folds.get(r.id) !== r.fold_sha).map((r) => r.statement).sort();
+    expect(changed).toEqual(['孙欣负责结算中台。']);
     const relChanged = (await ctx.store.query<{ id: string; description: string; fold_sha: string }>(`SELECT id, description, fold_sha FROM relations`)).filter((r) => relFolds.get(r.id) !== r.fold_sha);
     expect(relChanged.map((r) => r.description)).toEqual(['孙欣负责结算中台']);
     const reading = (await claims(ctx)).find((r) => r.statement === '支付组本周在岗7人。')!;
+    expect(reading.id).not.toBe(readingId[0]);
     expect([day(reading.valid_from), day(reading.valid_to), reading.date_source]).toEqual(['2025-09-01', '2025-09-07', 'stated']);
 
     // a second sync does nothing
+    const settled = await identity(ctx);
     const again: string[] = [];
     expect(await sync(ctx, { llmGraph: false, onProgress: (m) => again.push(m) })).toMatchObject({ indexed: 0, errors: 0 });
     expect(again.filter((l) => l.startsWith('re-dated'))).toEqual([]);
-    expect(await identity(ctx)).toEqual(before);
-
-    // the reading is now one of its week: the claim re-key, set to visit it again, moves it
-    expect(await rekeyState(ctx.store)).toEqual({ cursor: null, done: false });
-    await rekeyWeeklyReadings(ctx.store);
-    const moved = (await claims(ctx)).find((r) => r.statement === '支付组本周在岗7人。')!;
-    expect(moved.id).not.toBe(reading.id);
-    expect((await rekeyState(ctx.store)).done).toBe(true);
+    expect(await identity(ctx)).toEqual(settled);
   });
 
   it('gives a relation only the date its own words state', async () => {
