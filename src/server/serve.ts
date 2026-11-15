@@ -141,7 +141,12 @@ export async function startServer(ctx: AppContext): Promise<void> {
   };
   machine.limiter.setCapacity(processingSettings(ctx.config).maxLocalCalls);
   // an evaluation run's model work for remote workers (docs/design/27 §8): the server's, one source per kind behind every workspace's broker
-  const evalWork = new EvalWork(ctx.dataDir, { log: (msg) => log(`eval: ${msg}`) });
+  // its tasks and results are kept in the data root (docs/design/32 §5), bounded by server.remote.evalQueueMB
+  const evalQueueMB = Number(ctx.config.server.remote?.evalQueueMB);
+  const evalWork = new EvalWork(ctx.dataDir, {
+    log: (msg) => log(`eval: ${msg}`),
+    durable: Number.isFinite(evalQueueMB) && evalQueueMB > 0 ? { maxBytes: Math.round(evalQueueMB * 1024 ** 2) } : {},
+  });
   const workspaceContexts = new WorkspaceContextRegistry(ctx.dataDir, {
     // read on every open: a shared setting an administrator changed reaches the root's copy first
     templateConfig: () => ctx.config,
