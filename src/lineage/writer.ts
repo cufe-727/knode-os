@@ -13,7 +13,8 @@ import {
 } from '../graph/store.js';
 import type { PlannedCitation } from '../graph/citations.js';
 import { entityTypeIds, loadOntology, normalizePredicate, Ontology, relationSpec } from '../graph/ontology.js';
-import { resolutionMode, resolveEntityId, ResolvedEntity } from '../graph/resolve.js';
+import { codeOf, MentionContext } from '../graph/identity.js';
+import { followNamesake, NamesakeIndex, resolutionMode, resolveEntityId, ResolvedEntity } from '../graph/resolve.js';
 import { EntityCorrections, readEntityCorrections, refusedKeys, refuses } from '../graph/corrections.js';
 import { entityKeyKinds, KeyKind, mentionKeys, typesCompatible } from '../graph/normalize.js';
 import { ReviewResolution } from '../config.js';
@@ -147,6 +148,8 @@ export class ScopeWriter {
   private readonly resolveCache = new Map<string, ResolvedEntity>();
   /** Lookup keys of entities written by this scope body — the fold publishes them only after commit. */
   private readonly localKeys = new Map<string, { id: string; name: string; type: string; kind: KeyKind }>();
+  /** The names that were parted into several entities (graph/identity.ts), read once for this body. */
+  private readonly namesakes = new NamesakeIndex();
   /** review.resolution: 'exact' (spelling must match) or 'suffix' (corporate suffixes ignored). */
   private readonly resolution: ReviewResolution;
   /** Spellings a person said an entity does not answer to: never resolved onto it, here or in the graph. */
@@ -178,9 +181,15 @@ export class ScopeWriter {
    * Entity evidence. Without an explicit `id` the mention is resolved first
    * (graph/resolve.ts): an entity already known under another spelling, or one
    * merged into a survivor, receives the evidence instead of a new row, and
-   * the mention's own spelling is kept as an alias so the fold surfaces it.
+   * the mention's own spelling is kept as an alias so the fold surfaces it. A
+   * name that was parted into several entities resolves to the one its
+   * document means.
    */
-  async entity(e: ExtractedEntity, o: { extractor: string; weight?: number; segmentId?: string | null; id?: string; sameAs?: string | null }): Promise<string> {
+  async entity(
+    e: ExtractedEntity,
+    /** `context`: what the mention's document says about it — which of a parted name's entities it means (graph/identity.ts). */
+    o: { extractor: string; weight?: number; segmentId?: string | null; id?: string; sameAs?: string | null; context?: MentionContext },
+  ): Promise<string> {
     const name = e.name.trim();
     let id = o.id;
     let resolved: ResolvedEntity | null = null;
@@ -188,13 +197,27 @@ export class ScopeWriter {
       const slug = slugify(name);
       const local = this.localIds.has(slug) ? null : this.findLocal(name, e.aliases ?? [], e.type);
       if (local && local.id !== slug) resolved = { id: local.id, name: local.name, resolvedFrom: name };
-      else resolved = await resolveEntityId(this.q, { name, type: e.type, aliases: e.aliases, sameAs: o.sameAs ?? e.sameAs ?? null }, this.resolveCache, { mode: this.resolution, corrections: this.corrections });
+      else {
+        resolved = await resolveEntityId(
+          this.q,
+          { name, type: e.type, aliases: e.aliases, sameAs: o.sameAs ?? e.sameAs ?? null, context: o.context },
+          this.resolveCache,
+          { mode: this.resolution, corrections: this.corrections, namesakes: this.namesakes },
+        );
+      }
       id = resolved.id;
     }
     const type = this.entityTypes.has(e.type) ? e.type : 'concept';
-    const aliases = (e.aliases ?? []).map(String);
+    // an entity parted from its namesake by a code keeps that code alone: another one among the
+    // mention's spellings is the namesake's, repeated by an extraction that was shown its name
+    const own = resolved?.namesake ? codeOf(resolved.namesake.label) : null;
+    const keeps = (spelling: string) => {
+      const c = own ? codeOf(spelling) : null;
+      return !c || c.value === own!.value;
+    };
+    const aliases = (e.aliases ?? []).map(String).filter(keeps);
     const redirected = Boolean(resolved?.resolvedFrom);
-    if (redirected && name && !aliases.some((a) => a.toLowerCase() === name.toLowerCase())) aliases.push(name);
+    if (redirected && name && keeps(name) && !aliases.some((a) => a.toLowerCase() === name.toLowerCase())) aliases.push(name);
     const evidenceName = (redirected ? resolved?.name : undefined) ?? name ?? id;
     await this.q.query(
       `INSERT INTO entities (id, name, type, description, aliases, tx_from)
@@ -215,6 +238,16 @@ export class ScopeWriter {
     this.knownEntities.add(id);
     this.touched.entities.add(id);
     return id;
+  }
+
+  /**
+   * Which entity a link to `entity` means in this document, where that entity
+   * belongs to a name refine parted (graph/identity.ts): the one the
+   * document's own names point at, else `entity` itself.
+   */
+  async namesakeOf(entity: { id: string; name: string }, spellings: readonly string[], context: MentionContext): Promise<{ id: string; name: string }> {
+    const meant = await followNamesake(this.q, entity, { name: entity.name, spellings, context }, this.namesakes, this.corrections.size ? (id) => refuses(refusedKeys(this.corrections.get(id)), entity.name) : undefined);
+    return meant ?? entity;
   }
 
   /** An entity this body already wrote that answers to one of the mention's keys (same type, or an untyped placeholder on either side), and not one that refuses its name. */

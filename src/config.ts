@@ -1014,6 +1014,7 @@ export interface GraphConfig {
 }
 
 export type ReviewResolution = 'exact' | 'suffix';
+export type ReviewIdentity = 'context' | 'name';
 export type ReviewLlmMode = 'off' | 'suggest' | 'auto';
 export type ReviewExternal = 'off' | 'verify' | 'research';
 
@@ -1072,6 +1073,20 @@ export interface ReviewConfig {
    * suggestion a person accepts.
    */
   resolution: ReviewResolution;
+  /**
+   * How far refine goes in telling apart things of one name. 'name' (the
+   * default, also when unset): as before — people of one name are split when
+   * their documents carry dates and fall into two contexts at the same time.
+   * 'context': a workspace turns on the rest (src/graph/entity-context.ts) —
+   * an entity whose documents carry several codes under roofs of their own
+   * is parted into one entity per code, and people are also told apart where
+   * documents are dated only by the claims they state, comparing what each
+   * context is about. Every split re-applies its documents from their
+   * sidecars, logs its reason, and is undone by merging the two entities.
+   * Nothing is ever parted when a document is written; names already parted
+   * keep resolving to their entities under either setting.
+   */
+  identity?: ReviewIdentity;
   /** LLM judge over duplicate-entity candidates: off / annotate suggestions with a verdict / also merge above autoMergeMinConfidence. */
   llmJudge: ReviewLlmMode;
   /** Candidates the judge rejects with at least this confidence are dropped (and remembered) instead of filed. */

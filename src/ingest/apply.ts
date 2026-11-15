@@ -188,7 +188,8 @@ export async function applyDocScope(ctx: ApplyDocContext, file: string, root: Do
   const parsed: ParsedMarkdown = code ? { frontmatter: {}, body: raw } : parseFrontmatter(raw);
   const title = code ? codebaseTitle(file) : titleFromMarkdown(file, parsed);
   const cls = await classify(store, file, root, parsed);
-  const docDate = docDateOf(file, parsed.frontmatter);
+  // a raw document may date itself in its first lines; a wiki page, a trace or source code is dated by its metadata alone
+  const docDate = docDateOf(file, parsed.frontmatter, root === 'docs' ? parsed.body : null, opts.at);
   // what a reader would read it as: the Translate stage reads this (docs/design/17);
   // '' is "read, and in no language", which no backfill needs to read again — and code is never translated
   const language = code ? '' : detectLanguage(raw, parsed.frontmatter) ?? '';
