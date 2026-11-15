@@ -3,7 +3,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { LlmClient } from '../llm/client.js';
 import type { CallUsage } from '../llm/usage.js';
-import { mapLimit } from '../bench/util.js';
 import { Meter } from './meter.js';
 import { captureEither } from './placement.js';
 import { QuotaGuard } from './quota.js';
@@ -14,6 +13,11 @@ import { QuotaGuard } from './quota.js';
  * items per call so a pilot fits a plan's quota. Items are anonymous — the
  * caller strips what identifies a system and mixes systems within a batch —
  * and every verdict is cached by what was asked, so a rerun never asks twice.
+ *
+ * Its calls run at most `width()` at once, across everything asked of it at
+ * the same time (the three scorers of a pass run together): an evaluation run
+ * gives the slots online that take the judge's calls (docs/design/32 §11), so
+ * ten judge workers are ten calls wide; a judge with no width keeps two.
  */
 
 export const JUDGE_SYSTEM = '__judge__';
@@ -24,17 +28,76 @@ export interface JudgeOptions {
   quota?: QuotaGuard;
   cacheFile?: string;
   batchSize?: number;
+  /** A fixed width: at most this many calls at once (default 2). */
   concurrency?: number;
+  /** The width as it is now, read again as calls end and while some wait: the slots online that take the judge's calls. Wins over `concurrency`. */
+  width?: () => number;
+  /** How often the width is read again while calls wait (default 1 s). */
+  widthCheckMs?: number;
+}
+
+/**
+ * At most `width()` calls at once, across everything that goes through it.
+ * The width is read again whenever a call ends, and on a timer while calls
+ * wait: slots come online and go while a pass is under way.
+ */
+export class Gate {
+  private active = 0;
+  private readonly waiting: (() => void)[] = [];
+  private timer: NodeJS.Timeout | null = null;
+
+  constructor(private readonly width: () => number, private readonly checkMs = 1_000) {}
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    await new Promise<void>((enter) => {
+      this.waiting.push(enter);
+      this.pump();
+    });
+    try {
+      return await fn();
+    } finally {
+      this.active--;
+      this.pump();
+    }
+  }
+
+  private pump(): void {
+    const width = Math.max(1, Math.trunc(Number(this.width()) || 0));
+    while (this.waiting.length && this.active < width) {
+      this.active++;
+      this.waiting.shift()!();
+    }
+    if (this.waiting.length && !this.timer) {
+      this.timer = setInterval(() => this.pump(), Math.max(10, this.checkMs));
+      this.timer.unref?.();
+    } else if (!this.waiting.length && this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+  }
 }
 
 type Verdicts<T> = Map<string, T>;
 
+/**
+ * A reply that did not parse (cut off at its token budget, prose around it):
+ * asked again in halves. A stuck or cancelled piece is no reply at all,
+ * whatever its message says, and any other error is the call's failure.
+ */
+function unparsable(err: unknown): boolean {
+  if ((err as { final?: boolean } | null)?.final) return false;
+  return err instanceof SyntaxError || /json/i.test(err instanceof Error ? err.message : String(err));
+}
+
 export class Judge {
   private readonly cache = new Map<string, unknown>();
   private readonly batchSize: number;
+  /** One gate for every call of this judge, whichever `batch()` asked for it. */
+  private readonly gate: Gate;
 
   constructor(private readonly opts: JudgeOptions) {
     this.batchSize = opts.batchSize ?? 8;
+    this.gate = new Gate(opts.width ?? (() => opts.concurrency ?? 2), opts.widthCheckMs);
     if (opts.cacheFile && fs.existsSync(opts.cacheFile)) {
       for (const line of fs.readFileSync(opts.cacheFile, 'utf8').split('\n')) {
         if (!line.trim()) continue;
@@ -76,18 +139,29 @@ export class Judge {
     for (let i = 0; i < todo.length; i += this.batchSize) batches.push(todo.slice(i, i + this.batchSize));
     // a reply that does not parse (cut off at its token budget, prose around it) is asked again in halves, down to
     // one item, which is tried twice and then left unjudged: one bad reply must not stop a pack
+    // the first call of this batch that failed: no call of it starts after that, and it is what the batch throws
+    let failed = false;
     const ask = async (group: I[], tries = 1): Promise<void> => {
       const user = JSON.stringify({ items: group.map((item) => ({ id: item.id, ...(render(item) as object) })) }, null, 1);
       let usage: CallUsage | null = null;
-      const t0 = Date.now();
+      let t0 = Date.now();
       const call = () => this.opts.client.completeJson<{ verdicts?: (V & { id?: string })[] }>(
         [{ role: 'system', content: system }, { role: 'user', content: user }],
         { maxTokens: 900 * group.length + 600, onUsage: (u) => (usage = u) },
       );
       let reply: { verdicts?: (V & { id?: string })[] };
       // a plan's limit can last hours: wait it out (6 h at the guard's 5-minute poll) rather than lose the batch;
-      // who answered (a remote worker, src/eval/remote.ts) is noted on the way and kept with the meter event
-      const r = await captureEither(() => (this.opts.quota ? this.opts.quota.retryRefused(call, 72) : call()));
+      // who answered (a remote worker, src/eval/remote.ts) is noted on the way and kept with the meter event.
+      // The gate is held for the call alone, never across the halves a bad reply is asked again in
+      const r = await this.gate.run(async () => {
+        if (failed) return null;
+        t0 = Date.now();
+        const got = await captureEither(() => (this.opts.quota ? this.opts.quota.retryRefused(call, 72) : call()));
+        // said before the gate lets the next call in: one that waited behind a failure never starts
+        if (got.error !== undefined && !unparsable(got.error)) failed = true;
+        return got;
+      });
+      if (!r) return;
       const placed = r.placements.at(-1);
       const where = { ...(placed?.worker ? { worker: placed.worker } : {}), ...(placed?.pool ? { pool: placed.pool } : {}), backend: placed?.backend ?? this.opts.client.label };
       try {
@@ -96,9 +170,7 @@ export class Judge {
         this.opts.meter.record({ system: JUDGE_SYSTEM, stage: kind, model: this.opts.client.model || this.opts.client.label, ms: Date.now() - t0, ok: true, replayed: false, usage, ...where });
       } catch (err) {
         this.opts.meter.record({ system: JUDGE_SYSTEM, stage: kind, model: this.opts.client.model || this.opts.client.label, ms: Date.now() - t0, ok: false, replayed: false, usage, ...where });
-        // a stuck or cancelled piece is no reply at all, whatever its message says
-        if ((err as { final?: boolean } | null)?.final) throw err;
-        if (!(err instanceof SyntaxError) && !/json/i.test(err instanceof Error ? err.message : String(err))) throw err;
+        if (!unparsable(err)) throw err;
         if (group.length > 1) {
           const half = Math.ceil(group.length / 2);
           await ask(group.slice(0, half));
@@ -116,9 +188,8 @@ export class Judge {
         out.set(item.id, v as V);
       }
     };
-    await mapLimit(batches, this.opts.concurrency ?? 2, (group) => ask(group), (err) => {
-      throw err;
-    });
+    // every batch is asked for at once; the gate lets as many calls through as the judge is wide
+    await Promise.all(batches.map((group) => ask(group)));
     return out;
   }
 

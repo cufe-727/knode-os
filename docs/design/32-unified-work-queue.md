@@ -150,8 +150,8 @@ complete | renew | release` on `serve`, or straight from the run's own broker �
 - *An old command line keeps working*: no `--remote` and no `--local` means `--local codex:<slots>,<judge CLI>:<slots>`
   (default 6), said in the log and in run.json (`work.legacy`), with `--answer-concurrency` at 3. Its batches, reply
   cache keys and records are what they were; the one difference is that Codex calls and agent sessions now share the
-  `<slots>` Codex slots (before, sessions ran beside them, bounded by `--answer-concurrency`), and the judge's calls
-  are bounded by its slots as well as by the judge's own concurrency.
+  `<slots>` Codex slots (before, sessions ran beside them, bounded by `--answer-concurrency`), and the judge keeps
+  two calls at once (`--judge-concurrency` changes it), whatever `<slots>` is.
 - *`--slots`* sizes only that case (a warning with `--local` or `--remote`). *`--answer-concurrency`* is now a bound on
   how wide one system answers; without it a system answers as wide as the slots online for its pieces (at least one,
   so a piece is published and can wait), re-read every second and whenever an answer ends. A knode build is as wide
@@ -207,6 +207,15 @@ which a resume continues. Durable pieces (§5) are stage 2.
 twice on the run's own slots (`073d3de`); refusals, outages and archive uploads (`4b31fc9`); the judge re-asking a stuck
 piece (`5a05b36`); online across kinds (`1e8c75a`); a run that fails to start leaving its slots running (`ff95008`);
 cancelled llm-wiki sessions (`a6c6786`); retrieval scored after a stop or a stuck call (`705760e`).
+
+**The judge's width (2026-11-14, after the merge).** The judge asked two calls at once whatever was online: a fixed
+default in `src/eval/judge.ts` that no run set. On the 10× separation run ten judge slots were online and two were in
+use for the whole scoring pass; when it moved from grading (12 s a call at the median) to the list checks (54 s) the
+calls per minute halved, which read as concurrency dropping. Now the judge is as wide as the slots online that take
+its calls — the same rule as a system's answers — re-read as calls end and once a second while some wait, bounded by
+`--judge-concurrency` (2 for an old command line, as before); one gate bounds every call of a judge, and the three
+scorers of a pass (usage, lists, emergence) ask it together instead of one after the other. A call that fails stops
+the calls of its batch that have not started.
 
 **Not verified.** No model-backed run, no real worker on another machine, no restart of a real `serve` with pieces
 waiting (the republish path is covered only by reading the code), and no run with both `serve`'s own slots and the

@@ -76,6 +76,14 @@ function waitMinutesOption(opts: { waitMinutes?: string; offerSeconds?: string }
   return n;
 }
 
+/** `--judge-concurrency`: a bound on how many judge calls go out at once; none given, the slots online decide. */
+function judgeConcurrencyOption(opts: { judgeConcurrency?: string }): number | undefined {
+  if (opts.judgeConcurrency === undefined) return undefined;
+  const n = Number(opts.judgeConcurrency);
+  if (!Number.isInteger(n) || n < 1) throw new Error('--judge-concurrency: a whole number of calls, 1 or more');
+  return n;
+}
+
 /** `--pool` (docs/design/32 §2): a name a worker can declare. */
 function poolOption(opts: { pool?: string }): string | undefined {
   if (opts.pool === undefined) return undefined;
@@ -222,6 +230,7 @@ export function registerEvalCommands(program: Command): void {
     .option('--slots <n>', 'old command lines: with neither --remote nor --local, the run runs here as if given --local codex:<n>,claude:<n> (default 6)')
     .option('--pack-concurrency <n>', 'packs worked on at once', '1')
     .option('--answer-concurrency <n>', 'at most this many tasks one system answers at once in each pack (update batches too); otherwise as many as the slots online take (3 for an old command line)')
+    .option('--judge-concurrency <n>', 'at most this many judge calls at once; otherwise as many as the slots online that take them (2 for an old command line)')
     .option('--embedding-cap <tokens>', 'stop embedding after this many tokens in the run')
     .option('--embedding-daily-cap <tokens>', 'embed at most this many tokens per UTC day; past it, packs wait for the next day')
     .option('--no-quota', 'do not pause for Codex plan windows')
@@ -276,6 +285,7 @@ export function registerEvalCommands(program: Command): void {
         seed: opts.seed,
         packConcurrency: Number(opts.packConcurrency),
         answerConcurrency: opts.answerConcurrency !== undefined ? Number(opts.answerConcurrency) : undefined,
+        judgeConcurrency: judgeConcurrencyOption(opts),
         embeddingTokenCap: opts.embeddingCap ? Number(opts.embeddingCap) : undefined,
         embeddingDailyCap: opts.embeddingDailyCap ? Number(opts.embeddingDailyCap) : undefined,
         quota: opts.quota,
@@ -326,13 +336,14 @@ export function registerEvalCommands(program: Command): void {
     .option('--serve-url <url>', 'with --remote: serve\'s origin on this machine')
     .option('--local <slots>', "slots in this process that take the judge's calls, e.g. claude:2; without it and --remote the judge runs here on --slots")
     .option('--slots <n>', 'old command lines: with neither --remote nor --local, the judge runs here on that many slots (default 6)')
+    .option('--judge-concurrency <n>', 'at most this many judge calls at once; otherwise as many as the slots online that take them (2 for an old command line)')
     .option('--offer-seconds <s>', 'no longer applies: a call waits until a slot takes it (see --wait-minutes)')
     .option('--wait-minutes <n>', 'stop cleanly (non-zero) when a call has waited this long while no slot online takes it; 0 = no limit', '30')
     .option('--pool <name>', 'the judge\'s calls require this pool (workers started with --pool <name>, and --local slots)')
     .action(async (runDir: string, opts) => {
       let n: number;
       try {
-        n = await scoreRun(path.resolve(runDir), { judgeProvider: opts.judge, judgeModel: opts.judgeModel, onProgress: (m) => console.log(`  ${m}`), remote: remoteOption(program, opts), ...localOption(opts), waitMinutes: waitMinutesOption(opts), pool: poolOption(opts) });
+        n = await scoreRun(path.resolve(runDir), { judgeProvider: opts.judge, judgeModel: opts.judgeModel, judgeConcurrency: judgeConcurrencyOption(opts), onProgress: (m) => console.log(`  ${m}`), remote: remoteOption(program, opts), ...localOption(opts), waitMinutes: waitMinutesOption(opts), pool: poolOption(opts) });
       } catch (err) {
         if (!(err instanceof RunStoppedError)) throw err;
         console.error(`\n${err.message}`);
