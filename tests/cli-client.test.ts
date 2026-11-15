@@ -176,8 +176,10 @@ describe('the CLI against a server', () => {
     expect(folder.children?.map((c) => c.path).sort()).toEqual(['raw/docs/reports/chart.png', 'raw/docs/reports/q3.md']);
     const file = await client.get<{ content: string; truncated: boolean }>('/api/file', { path: 'raw/docs/reports/q3.md' });
     expect(file.content).toContain('Margins widened');
-    const { matches } = await client.get<{ matches: { path: string; line: number }[]; total: number }>('/api/grep', { pattern: 'copper' });
+    const matches = await client.get<{ path: string; line: number }[]>('/api/grep', { pattern: 'copper' });
     expect(matches).toEqual([expect.objectContaining({ path: 'raw/docs/reports/q3.md', line: 3 })]);
+    // a client that asks for the answer shape gets it; the request above, which does not, is what an older command line sends
+    expect(await client.get('/api/grep', { pattern: 'copper', shape: 'answer' })).toEqual({ matches, total: 1 });
 
     const text = await downloadFile(client, 'raw/docs/reports/q3.md');
     expect(Buffer.from(text.bytes).toString('utf8')).toBe('# Q3\n\nMargins widened on copper.\n');

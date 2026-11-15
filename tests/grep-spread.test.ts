@@ -4,7 +4,7 @@ import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
-import { formatGrep } from '../src/client/files.js';
+import { formatGrep, grepAnswerFrom } from '../src/client/files.js';
 import { defaultConfig } from '../src/config.js';
 import type { AppContext } from '../src/context.js';
 import { foldGrepFolders, GREP_FOLDERS_MAX, grepAnswer, grepFiles, GrepFolder, grepSearch, shareEvenly } from '../src/fs/files.js';
@@ -262,6 +262,21 @@ describe('the shape of a grep answer', () => {
     expect(perFile.cut).toMatchObject({ shown: 12, folders: [{ path: 'raw/docs/周报/一部平台组', matches: 24, files: 12, shown: 12 }] });
     // and several paths
     expect(Object.keys(await call({ pattern: '拉新', paths: ['raw/docs/周报', 'raw/docs/月报'] }))).toEqual(['matches', 'total']);
+  });
+
+  it('is read by the command line from a server of either age', () => {
+    const lines = [{ path: 'raw/docs/a.md', line: 3, text: 'copper' }, { path: 'raw/docs/b.md', line: 9, text: 'copper wire' }];
+    // a server from before the answer shape sends the array, whatever the client asks for
+    expect(grepAnswerFrom(lines, 100)).toEqual({ matches: lines, total: 2 });
+    expect(formatGrep(grepAnswerFrom(lines, 100))).toBe('raw/docs/a.md:3: copper\nraw/docs/b.md:9: copper wire');
+    expect(formatGrep(grepAnswerFrom([], 100))).toBe('(no matches)');
+    // it stopped at the limit without saying whether more match: the command line says that for it
+    const full = grepAnswerFrom(lines, 2);
+    expect(full.cut?.shown).toBe(2);
+    expect(formatGrep(full)).toBe('raw/docs/a.md:3: copper\nraw/docs/b.md:9: copper wire\n\n-- The server is an older version: it stopped at the first 2 matching lines it met and does not say how many more match, or where.');
+    // a server of this version sends the answer
+    const answer = grepAnswer(grepSearch(tmp, '拉新', { paths: ['raw/docs'] }));
+    expect(grepAnswerFrom(answer, 100)).toBe(answer);
   });
 
   it('is said by the command line too', () => {

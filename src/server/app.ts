@@ -2569,9 +2569,12 @@ export function createApp(
     try {
       const pattern = c.req.query('pattern');
       if (!pattern) return c.json({ error: 'pattern required' }, 400);
-      // {matches, total}, and `cut` when the matches are a sample of what matches (src/fs/files.ts grepAnswer)
+      // A client that asks for `shape=answer` gets {matches, total}, and `cut` when the matches are a sample
+      // (src/fs/files.ts grepAnswer). One that does not gets the array of matches this route has always
+      // answered: a command line older than the answer shape reads an object as "(no matches)".
       const at = c.req.query('path') || undefined;
-      return c.json(grepAnswer(grepSearch(ctx.dataDir, pattern, { paths: at ? [at] : undefined, maxMatches: Number(c.req.query('maxMatches') ?? 100) })));
+      const answer = grepAnswer(grepSearch(ctx.dataDir, pattern, { paths: at ? [at] : undefined, maxMatches: Number(c.req.query('maxMatches') ?? 100) }));
+      return c.json(c.req.query('shape') === 'answer' ? answer : answer.matches);
     } catch (e) {
       return c.json(err(e), 400);
     }

@@ -209,12 +209,14 @@ describe('derived text of converted originals', () => {
     expect(JSON.stringify(tree)).not.toContain('.sidecar');
     expect(JSON.stringify(tree)).not.toContain('cooked');
 
-    // /api/grep answers {matches, total}, and `cut` when the matches are a sample
     const hits = await (await get('/api/grep?pattern=Quarterly')).json();
-    expect(hits.matches.map((h: { path: string }) => h.path)).toEqual(['raw/docs/hello.pdf']);
-    expect(await (await get('/api/grep?pattern=contentSha256')).json()).toEqual({ matches: [], total: 0 });
-    expect(await (await get('/api/grep?pattern=Quarterly&path=.sidecar')).json()).toEqual({ matches: [], total: 0 });
-    expect((await (await get('/api/grep?pattern=Quarterly&path=raw/docs/hello.pdf')).json()).matches.length).toBe(1);
+    expect(hits.map((h: { path: string }) => h.path)).toEqual(['raw/docs/hello.pdf']);
+    expect(await (await get('/api/grep?pattern=contentSha256')).json()).toEqual([]);
+    expect(await (await get('/api/grep?pattern=Quarterly&path=.sidecar')).json()).toEqual([]);
+    expect((await (await get('/api/grep?pattern=Quarterly&path=raw/docs/hello.pdf')).json()).length).toBe(1);
+    // a client that says it reads the answer shape gets {matches, total, cut?}; one that does not, the array it always got
+    expect(await (await get('/api/grep?pattern=Quarterly&shape=answer')).json()).toEqual({ matches: hits, total: 1 });
+    expect(await (await get('/api/grep?pattern=contentSha256&shape=answer')).json()).toEqual({ matches: [], total: 0 });
   });
 
   it('refuses to write derived text back over the original, whatever the caller', async () => {
