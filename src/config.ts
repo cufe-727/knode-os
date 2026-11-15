@@ -741,7 +741,7 @@ export function defaultRerankConfig(): RerankConfig {
 }
 
 export function defaultAskRouterConfig(): AskRouterConfig {
-  return { classifier: 'rules', enumerateLimit: 150, maxHops: 3 };
+  return { classifier: 'rules', enumerateLimit: 150, maxHops: 4 };
 }
 
 export type DataSourceKind = 'mysql' | 'timescale' | 'duckdb' | 'http-json' | 'prometheus' | 'object';

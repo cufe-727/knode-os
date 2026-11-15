@@ -21,7 +21,7 @@ import { enumerateClaims, typedColumns } from '../src/search/enumerate.js';
 import { parseRerankResponse, rerankResults } from '../src/search/rerank.js';
 import { classifyQuestion, questionRange, routeQuestion } from '../src/search/route.js';
 import { search } from '../src/search/search.js';
-import { walkRelations } from '../src/search/walk.js';
+import { chainOrder, walkRelations, walkTerms } from '../src/search/walk.js';
 import { catalogQuery } from '../src/store/catalog.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
 import type { SearchResult } from '../src/types.js';
@@ -288,6 +288,98 @@ describe('claim enumeration', () => {
     const walk = await walkRelations(store, 'Who is the chief executive of the company that acquired Borealis Logistics?', ['borealis'], { maxHops: 1 });
     expect(walk.steps.map((s) => s.relationId)).toEqual(['r-acq']);
     expect(walk.bridges.map((b) => b.chunkId)).toEqual(['c-deal']);
+  });
+});
+
+describe('relation walk', () => {
+  // its own store: a chain across three divisions, a customer with incidents in each, and a hub group
+  let walkStore: Store;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-walk-'));
+  let rel = 0;
+  const entity = (id: string, name: string, type = 'organization') =>
+    walkStore.query(`INSERT INTO entities (id, name, type, mention_count, aliases, description) VALUES ($1, $2, $3, 1, '[]'::jsonb, '')`, [id, name, type]);
+  /** A relation, and a passage that mentions both its ends. */
+  const relate = async (source: string, target: string, description: string, weight = 1, type = 'related_to') => {
+    const id = `w${++rel}`;
+    await walkStore.query(`INSERT INTO documents (id, path, root, title, sha256, bytes, status) VALUES ($1, $2, 'docs', $1, $1, 10, 'indexed')`, [`d-${id}`, `raw/docs/${id}.md`]);
+    await walkStore.query(`INSERT INTO chunks (id, document_id, seq, content, token_count, tsv) VALUES ($1, $2, 0, $3, 3, to_tsvector('simple', $3))`, [`c-${id}`, `d-${id}`, description]);
+    for (const e of [source, target]) {
+      await walkStore.query(`INSERT INTO entity_mentions (entity_id, chunk_id, document_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, [e, `c-${id}`, `d-${id}`]);
+    }
+    await walkStore.query(`INSERT INTO relations (id, source_id, target_id, type, description, weight, document_id) VALUES ($1, $2, $3, $4, $5, $6, $7)`, [id, source, target, type, description, weight, `d-${id}`]);
+    return id;
+  };
+
+  beforeAll(async () => {
+    fs.mkdirSync(path.join(dir, '.knode'), { recursive: true });
+    walkStore = await Store.open(dir, 4);
+    await walkStore.indexing;
+    for (const [id, name] of [['d7', '第七事业部'], ['d2', '第二事业部'], ['d3', '第三事业部'], ['g7', '七部平台组'], ['g7b', '七部增长组'], ['g2', '二部平台组'], ['g3', '三部平台组'], ['cust', '华鼎零售']]) await entity(id, name);
+    for (const [id, name] of [['huang', '黄勇'], ['qian', '钱勇'], ['lin', '林婷']]) await entity(id, name, 'person');
+    for (const [id, name] of [['inc7', 'INC-001-D7T1'], ['risk', 'R-13'], ['proj', '文昌计划']]) await entity(id, name, 'other');
+    await relate('g7', 'd7', '七部平台组隶属于第七事业部。', 10, 'part_of');
+    await relate('g7b', 'd7', '七部增长组隶属于第七事业部。', 10, 'part_of');
+    await relate('g2', 'd2', '二部平台组隶属于第二事业部。', 10, 'part_of');
+    await relate('g3', 'd3', '三部平台组隶属于第三事业部。', 10, 'part_of');
+    // the customer escalated six heavier incidents in other divisions, and one in the seventh
+    for (let i = 1; i <= 6; i++) {
+      const inc = `inc-other-${i}`;
+      await entity(inc, `INC-00${i}-D${i % 2 ? 2 : 3}T1`, 'other');
+      await relate('cust', inc, '华鼎零售升级上报了该事故。', 3);
+      await relate(inc, i % 2 ? 'g2' : 'g3', '平台组报告的事故。');
+    }
+    await relate('inc7', 'cust', '事故涉及华鼎零售投诉升级。', 1);
+    await relate('inc7', 'g7', '七部平台组报告的事故。', 1);
+    await relate('huang', 'inc7', '黄勇修复了INC-001-D7T1。', 1);
+    await relate('huang', 'g7b', '黄勇本周从七部平台组调入七部增长组。', 2, 'works_at');
+    await relate('huang', 'proj', '自本周起接手项目。', 5);
+    // a risk raised by one person, followed by another, and tracked by a hub group whose incidents outweigh the person's
+    await relate('qian', 'risk', '钱勇提出R-13风险。', 1);
+    await relate('risk', 'g2', 'R-13是二部平台组跟踪的风险。', 1);
+    for (let i = 1; i <= 6; i++) {
+      await entity(`hub-${i}`, `INC-01${i}-D2T1`, 'other');
+      await relate(`hub-${i}`, 'g2', '二部平台组修复的事故。', 5);
+    }
+    await entity('inc-q', 'INC-009-D2T1', 'other');
+    await relate('qian', 'inc-q', '钱勇修复了INC-009-D2T1。', 1);
+  });
+
+  afterAll(async () => {
+    await walkStore?.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('reads a predicate in its other spellings, and leaves out the fragments of what the question names', () => {
+    const { terms, budget } = walkTerms('（第七事业部）是谁处理好的？此人名下的那个项目是在哪一周投产的？', ['第七事业部']);
+    const texts = terms.map((t) => t.text);
+    expect(texts).toEqual(expect.arrayContaining(['修复', '负责', '上线']));
+    expect(texts).not.toContain('事业');
+    // a predicate the question uses twice may be walked twice
+    const twice = walkTerms('提出风险R-13的人修复过一起由客户升级的事故。同一个客户还在另一个组升级过事故——那一起是谁修复的？');
+    expect(twice.budget.get(twice.terms.find((t) => t.text === '升级')!.key)).toBe(2);
+    expect(budget.get(terms.find((t) => t.text === '修复')!.key)).toBe(1);
+  });
+
+  it('prefers, among a named entity\'s relations, the one whose far end lies near the other entity the question names', async () => {
+    const q = '（第七事业部）华鼎零售升级的那起事故，是谁处理好的？此人后来调到了另一个组，并在那里接手了一个项目，那个项目叫什么？';
+    const walk = await walkRelations(walkStore, q, ['d7', 'cust'], { maxHops: 3 });
+    const hop = (n: number) => walk.steps.filter((s) => s.hop === n).map((s) => `${s.source}→${s.target}`);
+    // the six heavier incidents of other divisions do not crowd out the seventh division's
+    expect(hop(1)).toContain('INC-001-D7T1→华鼎零售');
+    // 处理好 reads the relation that says 修复
+    expect(hop(2)).toContain('黄勇→INC-001-D7T1');
+    expect(hop(3)).toEqual(expect.arrayContaining(['黄勇→文昌计划', '黄勇→七部增长组']));
+    // the passages, best chain first and from its first hop down
+    const order = chainOrder(walk.steps).map((i) => walk.steps[i].hop);
+    expect(order.slice(0, 3)).toEqual([1, 2, 3]);
+    expect(walk.bridges[0].trace?.bridgeEntities).toEqual(expect.arrayContaining(['华鼎零售']));
+  });
+
+  it('lets every branch take its best step, so a hub cannot take a hop whole', async () => {
+    const walk = await walkRelations(walkStore, '（第二事业部）提出风险R-13的人修复过哪起事故？', ['d2', 'risk'], { maxHops: 2 });
+    expect(walk.steps.filter((s) => s.hop === 1).map((s) => s.source)).toEqual(expect.arrayContaining(['钱勇']));
+    // the group's six heavier incidents match as well, but the person who raised the risk still takes their own step
+    expect(walk.steps.filter((s) => s.hop === 2).map((s) => `${s.source}→${s.target}`)).toContain('钱勇→INC-009-D2T1');
   });
 });
 
