@@ -6,7 +6,7 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { defaultRerankConfig } from '../src/config.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
-import { cutWithSources, describeVectorScan, docLiveAt, GENERATED_SHARE, generatedPlaces, search, searchExplained, SearchMode, sideBudget, vectorScan } from '../src/search/search.js';
+import { cutWithSources, describeVectorScan, docLiveAt, GENERATED_SHARE, generatedPlaces, search, searchExplained, SearchMode, sideBudget, sidesOf as sideSqlOf, vectorScan } from '../src/search/search.js';
 import { Store, toVectorLiteral } from '../src/store/db.js';
 import { MATCH_INDEXES } from '../src/store/grams.js';
 import { resolveScopeFilter } from '../src/store/resolver.js';
@@ -290,6 +290,40 @@ describe('lists the generator keeps, and pages a person wrote under the same nam
     expect((await found({ generatedShare: 0, k: 2 })).sort()).toEqual(['hub', 'my-mentions']);
     // among the wiki's pages the shelf is a generated one: it gets a page's share, the person's pages the rest
     expect((await found({ kinds: ['wiki'], generatedShare: 0, k: 2 })).sort()).toEqual(['hub', 'my-mentions']);
+  });
+
+  it('names a few hand-written index pages in its condition, in order', async () => {
+    const sides = await sideSqlOf(lists);
+    expect(sides.listsUndecided).toBe(false);
+    expect(sides.generated('d')).toContain(`NOT (d.path = ANY(ARRAY['wiki/projects/index.md']::text[]))`);
+  });
+
+  it('knows every index.md a person wrote, however many, without naming them in a statement', async () => {
+    // 520 hand-written index pages: a lookup of the first 500 it met left twenty-one of them to count as lists
+    await lists.query(
+      `INSERT INTO documents (id, path, root, kind, title, sha256, bytes, status)
+       SELECT 'd-own' || i, 'wiki/own/topic-' || i || '/index.md', 'wiki', 'source', 'own' || i, 'sha-own' || i, 10, 'indexed' FROM generate_series(1, 520) i`,
+    );
+    await lists.query(
+      `INSERT INTO chunks (id, document_id, seq, content, token_count, tsv)
+       SELECT 'own' || i, 'd-own' || i, 0, 'Handwritten topic page number ' || i || '.', 3, to_tsvector('simple', 'Handwritten topic page') FROM generate_series(1, 520) i`,
+    );
+    // a store's side SQL is kept a minute: this handle on the same index asks afresh
+    const fresh = Object.create(lists) as Store;
+    const sides = await sideSqlOf(fresh);
+    // more than a condition names: the names are left to be decided for each search's candidates
+    expect(sides.listsUndecided).toBe(true);
+    expect(sides.generated('d')).toBe(`(d.kind = 'view' OR FALSE)`);
+    const keyword = (query: string, opts: { kinds?: string[]; k?: number; generatedShare?: number } = {}) =>
+      search(fresh, embedder, query, { k: opts.k ?? 8, mode: 'keyword', track: false, current: false, generatedShare: opts.generatedShare, filter: opts.kinds ? resolveScopeFilter({ kinds: opts.kinds }) : undefined })
+        .then((rs) => rs.map((r) => r.chunkId));
+    // every one of them is a source: the first and the last are found
+    expect(await keyword('Handwritten topic page number 520', { k: 3 })).toContain('own520');
+    expect(await keyword('Handwritten topic page number 1', { k: 3 })).toContain('own1');
+    // the generator's shelf is still not answered from, and is still a generated page to a search that asks for the wiki's
+    expect((await keyword('Quillon roadmap')).sort()).toEqual(['entity', 'hub', 'my-mentions']);
+    expect((await keyword('Quillon roadmap', { kinds: ['wiki'] })).sort()).toEqual(['hub', 'my-mentions', 'shelf']);
+    expect((await keyword('Quillon roadmap', { kinds: ['wiki'], generatedShare: 0, k: 2 })).sort()).toEqual(['hub', 'my-mentions']);
   });
 
   it('leaves every other reader of live documents as it was', () => {

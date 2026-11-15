@@ -176,55 +176,112 @@ export function generatedPlaces(k: number, share: number, topIsPage = false): nu
  *              list.
  *
  * A navigation list is an index.md or log.md of the wiki in which the
- * generator keeps a region (`pages` holds `<file>#<region>` with a kind ending
- * in _index or _shelf, or wiki_contents). Ingest files every index.md as a
+ * generator keeps a region: `pages` holds `<file>#<region>` with a kind ending
+ * in _index or _shelf, or wiki_contents. Ingest files every index.md as a
  * source the graph does not read, whoever wrote it, so the name alone does
  * not say: an index.md a person wrote, with no such region, is a source like
- * any page of theirs. Those are few, and are what is looked up (`sidesOf`).
+ * any page of theirs.
+ *
+ * Which it is, is asked of `pages`, without a lookup in the channels' own
+ * statements (`sidesOf`, once a minute per store):
+ *
+ * - No index.md of the wiki is a person's (the usual case): the name decides.
+ * - A few are (`AUTHORED_LISTS_INLINE` at most): their paths, in order, are
+ *   named in the condition as the exceptions.
+ * - More are: the condition leaves every file of that name with the sources,
+ *   and `withoutLists` asks `pages` which of a search's candidates are the
+ *   generator's lists, once the channels have answered. Exact however many
+ *   there are, at the price of the places a list took among a channel's
+ *   candidates.
+ *
+ * Two earlier forms, and why not. The person-written files looked up and all
+ * written into every statement: the lookup took the first 500 in no order,
+ * so past 500 which pages counted as lists was chance, and the statement
+ * grew with them. Then a subquery on `pages` in the condition itself, by the
+ * file's key or as one list of files: exact and bounded, and free on
+ * PostgreSQL, but the embedded database keeps no statistics and planned a
+ * join around it that took 11 to 37 s for one vector search of 8,016 chunks.
  */
 export interface SideSql {
   generated(alias: string): string;
   listing(alias: string): string;
+  /** The names are not decided in SQL: `withoutLists` decides them for a search's candidates. */
+  listsUndecided: boolean;
 }
 
 const NAMED_AS_LIST = `~ '(^|/)(index|log)[.]md$'`;
+/** SQL: the files the generator keeps a list region in, from the `<file>#<region>` rows of `pages`. */
+const LIST_FILES = `SELECT split_part(kept.path, '#', 1) FROM pages kept
+       WHERE kept.tx_to IS NULL AND kept.status <> 'archived' AND position('#' in kept.path) > 0
+         AND (kept.kind ~ '(_index|_shelf)$' OR kept.kind = 'wiki_contents')`;
+/** Person-written index.md pages a condition names at most; past it they are told from lists after recall. */
+export const AUTHORED_LISTS_INLINE = 50;
 
-function sideSql(authoredLists: string[]): SideSql {
-  const authored = authoredLists.length ? `ARRAY[${authoredLists.map((x) => `'${x.replace(/'/g, "''")}'`).join(', ')}]::text[]` : null;
-  const list = (a: string) => `(${a}.root = 'wiki' AND ${a}.path ${NAMED_AS_LIST}${authored ? ` AND NOT (${a}.path = ANY(${authored}))` : ''})`;
+/** `authored`: the wiki's index.md and log.md files that are not the generator's, in order; null when there are more than are named, or no `pages` to ask. */
+function sideSql(authored: string[] | null, undecided: boolean): SideSql {
+  const named = (a: string) => `${a}.root = 'wiki' AND ${a}.path ${NAMED_AS_LIST}`;
+  const list = (a: string) => {
+    if (undecided) return 'FALSE';
+    if (!authored || authored.length === 0) return `(${named(a)})`;
+    return `(${named(a)} AND NOT (${a}.path = ANY(ARRAY[${authored.map((x) => `'${x.replace(/'/g, "''")}'`).join(', ')}]::text[])))`;
+  };
   return {
     generated: (a) => `(${a}.kind = 'view' OR ${list(a)})`,
     listing: (a) => `((${a}.kind = 'view' AND ${a}.path LIKE 'wiki/mentions/%') OR ${list(a)})`,
+    listsUndecided: undecided,
   };
 }
 
 const sideSqls = new WeakMap<object, { sql: SideSql; at: number }>();
 
 /**
- * The side SQL of a store, with the index.md and log.md files of its wiki
- * that no generator keeps a region in — a person's — looked up at most once
- * a minute.
+ * The side SQL of a store. Which index.md and log.md files of its wiki a
+ * person wrote — the ones the generator keeps no list region in — is asked
+ * at most once a minute: the first `AUTHORED_LISTS_INLINE` + 1 by path, which
+ * says whether they can be named or must be decided per search.
  */
 export async function sidesOf(store: Store): Promise<SideSql> {
   const hit = sideSqls.get(store);
   if (hit && Date.now() - hit.at < 60_000) return hit.sql;
-  let authored: string[] = [];
+  let sql = sideSql(null, false);
   try {
-    authored = (await store.query<{ path: string }>(
+    const authored = (await store.query<{ path: string }>(
       `SELECT d.path FROM documents d
-       WHERE d.root = 'wiki' AND d.path ${NAMED_AS_LIST}
-         AND NOT EXISTS (
-           SELECT 1 FROM pages g
-           WHERE g.tx_to IS NULL AND g.status <> 'archived' AND split_part(g.path, '#', 1) = d.path
-             AND (g.kind ~ '(_index|_shelf)$' OR g.kind = 'wiki_contents'))
-       LIMIT 500`,
+       WHERE d.root = 'wiki' AND d.path ${NAMED_AS_LIST} AND d.path NOT IN (${LIST_FILES})
+       ORDER BY d.path COLLATE "C" LIMIT ${AUTHORED_LISTS_INLINE + 1}`,
     )).map((r) => r.path);
+    sql = authored.length > AUTHORED_LISTS_INLINE ? sideSql(null, true) : sideSql(authored, false);
   } catch {
-    // a store without the pages table (an old schema): every index.md is taken for a list
+    // a store without the pages table (an old schema): every index.md is taken for a list, as its name says
   }
-  const sql = sideSql(authored);
   sideSqls.set(store, { sql, at: Date.now() });
   return sql;
+}
+
+/**
+ * The fused candidates of a search without the generator's lists, where the
+ * side SQL left the names undecided (`SideSql.listsUndecided`): the
+ * candidates named index.md or log.md are looked up in `pages`, and the
+ * lists among them are dropped — or, in a search that asks for the wiki's
+ * pages, kept and counted as generated pages. One small statement, and only
+ * when a candidate has such a name.
+ */
+async function withoutLists(store: Store, candidates: SearchResult[], generated: Set<string>, keep: boolean): Promise<SearchResult[]> {
+  const named = candidates.filter((r) => r.path.startsWith('wiki/') && /(^|\/)(index|log)[.]md$/.test(r.path));
+  if (named.length === 0) return candidates;
+  const rows = await store.query<{ id: string }>(
+    `SELECT d.id FROM documents d WHERE d.id = ANY($1::text[]) AND d.path IN (${LIST_FILES})`,
+    [[...new Set(named.map((r) => r.documentId))]],
+  );
+  const lists = new Set(rows.map((r) => r.id));
+  if (lists.size === 0) return candidates;
+  if (!keep) return candidates.filter((r) => !lists.has(r.documentId));
+  for (const r of candidates) {
+    if (!lists.has(r.documentId)) continue;
+    r.generated = true;
+    generated.add(r.chunkId);
+  }
+  return candidates;
 }
 
 /** True when a search asked for the wiki's own pages: kind `view` or `wiki`, or a source prefix inside wiki/. */
@@ -1261,7 +1318,9 @@ export async function searchExplained(
   // heat adds at most heat.searchWeight to a score: it breaks near-ties, it
   // never lifts a result above one the channels clearly prefer
   const heatCfg = opts.heat ?? defaultConfig().heat;
-  const candidates = [...fused.values()];
+  const candidates = sides.listsUndecided
+    ? await withoutLists(store, [...fused.values()], generated, wantsListings(opts.filter ?? NO_FILTER))
+    : [...fused.values()];
   await boostByHeat(store, candidates, heatCfg);
 
   const ranked = candidates.sort((a, b) => b.score - a.score);
