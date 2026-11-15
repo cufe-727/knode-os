@@ -6,7 +6,7 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { defaultRerankConfig } from '../src/config.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
-import { cutWithSources, describeVectorScan, docLiveAt, GENERATED_SHARE, generatedPlaces, search, searchExplained, SearchMode, sideBudget, sidesOf as sideSqlOf, vectorScan } from '../src/search/search.js';
+import { cutWithSources, describeVectorScan, docLiveAt, GENERATED_SHARE, generatedPlaces, search, searchExplained, SearchMode, sidesOf as sideSqlOf, vectorScan } from '../src/search/search.js';
 import { Store, toVectorLiteral } from '../src/store/db.js';
 import { MATCH_INDEXES } from '../src/store/grams.js';
 import { resolveScopeFilter } from '../src/store/resolver.js';
@@ -168,7 +168,8 @@ describe('generated pages in search results', () => {
   });
 
   it('ranks a side alike whether its vectors are read or the index is walked for it', async () => {
-    // an index this small is read side by side; `exactSide: 0` sends the walk's statement instead
+    // an index this small is read side by side; `exactSide: 0` sends the statement a large one gets:
+    // the nearest forty chunks for both sides, and the index walked on for the sources if they are short
     const read = await search(store, embedder, QUESTION, { k: 8, mode: 'vector', track: false, current: false });
     const walked = await search(store, embedder, QUESTION, { k: 8, mode: 'vector', track: false, current: false, exactSide: 0 });
     expect(walked.map((r) => [r.chunkId, r.signals.vector])).toEqual(read.map((r) => [r.chunkId, r.signals.vector]));
@@ -194,25 +195,19 @@ describe('generated pages in search results', () => {
     const fresh = Object.create(store) as Store;
     const query = store.query.bind(store);
     fresh.query = ((sql: string, params?: unknown[]) => {
-      if (/SELECT count\(\*\)::int FROM \(\s*SELECT 1 FROM documents d JOIN chunks c/.test(sql)) counts.push(sql);
+      if (/SELECT count\(\*\)::int FROM \(\s*SELECT 1 FROM documents d/.test(sql)) counts.push(sql);
       return query(sql, params);
     }) as typeof store.query;
-    // a search for 8 asks each channel for 24 and a walk's direct route for 36: on a large index two budgets,
-    // and the count was kept under the budget it was made for (here the budgets are given, the index being small)
-    for (const exactSide of [100, 300, 100, 5000, 300]) await search(fresh, embedder, QUESTION, { k: 8, mode: 'vector', track: false, current: false, exactSide });
+    // a search for 8, a walk's direct route for 12, a search for 40: one index, counted once —
+    // its documents, and, there being few, their chunks
+    for (const k of [8, 12, 8, 40, 12]) await search(fresh, embedder, QUESTION, { k, mode: 'vector', track: false, current: false });
     await search(fresh, embedder, QUESTION, { k: 8, mode: 'sag', track: false, current: false });
-    expect(counts).toHaveLength(1);
+    expect(counts).toHaveLength(2);
+    expect(counts[0]).not.toContain('JOIN chunks');
+    expect(counts[1]).toContain('JOIN chunks');
     // a filtered search is counted for itself, each time
     for (const k of [8, 12]) await search(fresh, embedder, QUESTION, { k, mode: 'vector', track: false, current: false, filter: resolveScopeFilter({ kinds: ['doc'] }) });
-    expect(counts).toHaveLength(3);
-  });
-
-  it('gives a side a budget of rows that grows with the root of the index', () => {
-    expect(sideBudget(24, 8016)).toBe(2000);
-    expect(sideBudget(24, 200_400)).toBe(6203);
-    expect(sideBudget(24, 456_000)).toBe(9357);
-    expect(sideBudget(300, 2_000_000)).toBe(20_000);
-    expect(sideBudget(24, 0)).toBe(2000);
+    expect(counts).toHaveLength(6);
   });
 
   it('lists sources as candidates while the substring index is being built, too', async () => {
@@ -382,10 +377,10 @@ describe('which way the vector index is walked', () => {
 
   it('says in one line which behaviour is in effect, why, and what an operator runs', async () => {
     expect(await describeVectorScan(serverSaying('off', '0.8.7'))).toBe(
-      'vector search: the index is walked on until each side of a search has its candidates (pgvector 0.8.7 in the catalog; the library has hnsw.iterative_scan).',
+      'vector search: one walk of the index serves both sides of a search, and is carried on for the sources when the nearest chunks are generated pages (pgvector 0.8.7 in the catalog; the library has hnsw.iterative_scan).',
     );
     const behind = await describeVectorScan(serverSaying('off', '0.7.4'));
-    expect(behind).toContain('the index is walked on');
+    expect(behind).toContain('is carried on for the sources');
     expect(behind).toContain('The catalog is behind the library: ALTER EXTENSION vector UPDATE');
     const old = await describeVectorScan(serverSaying(null, '0.7.4'));
     expect(old).toContain('one walk of the index per search (pgvector 0.7.4 in the catalog; the library on this server has no hnsw.iterative_scan');

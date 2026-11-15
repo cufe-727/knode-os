@@ -6,7 +6,7 @@ import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { DatabaseConfig } from '../src/config.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
-import { search, sideBudget } from '../src/search/search.js';
+import { NEAREST_OF_ALL, search, SIDE_ROWS_MAX } from '../src/search/search.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
 import { resolveScopeFilter } from '../src/store/resolver.js';
 
@@ -140,8 +140,8 @@ describe.skipIf(!ready)('postgres backend: the vector channel lists sources wher
       return q.query<{ id: string }>(sideQuery, [question]);
     })).map((r) => r.id);
     expect(exact).toHaveLength(24);
-    // 1,500 chunks of sources in an index of 7,500: under the budget, so their vectors are read
-    expect(sideBudget(24, SOURCES + PAGES)).toBe(2000);
+    // 1,500 chunks of sources: few enough to read, so their vectors are read
+    expect(SOURCES).toBeLessThanOrEqual(SIDE_ROWS_MAX);
 
     const results = await search(store, embedder, 'anything', { k: 8, mode: 'vector', track: false, current: false });
     const found = results.map((r) => r.chunkId);
@@ -180,6 +180,59 @@ describe.skipIf(!ready)('postgres backend: the vector channel lists sources wher
     expect(vector[0]).toContain('UNION ALL');
     expect(vector[1]).not.toContain('UNION ALL');
     expect(await store.query(`SHOW hnsw.iterative_scan`)).toEqual([{ 'hnsw.iterative_scan': 'off' }]);
+  });
+
+  /** The plan of the vector statement a search sends, run: one line a plan node. */
+  const planOf = async (opts: { queryVector?: number[] }): Promise<{ results: string[]; plan: string[] }> => {
+    const sent: { sql: string; params?: unknown[] }[] = [];
+    const query = store.query.bind(store);
+    store.query = ((sql: string, params?: unknown[]) => {
+      if (sql.includes('<=>')) sent.push({ sql, params });
+      return query(sql, params);
+    }) as typeof store.query;
+    let results: string[];
+    try {
+      results = (await search(store, embedder, 'anything', { k: 8, mode: 'vector', track: false, current: false, exactSide: 0, ...opts })).map((r) => r.chunkId);
+    } finally {
+      store.query = query;
+    }
+    expect(sent).toHaveLength(1);
+    const plan = (await store.query<{ 'QUERY PLAN': string }>(`EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) ${sent[0].sql}`, sent[0].params)).map((r) => r['QUERY PLAN']);
+    return { results, plan };
+  };
+  const walks = (plan: string[]) => plan.filter((line) => line.includes('Index Scan using embeddings_hnsw_idx'));
+
+  it('walks on for the sources when the nearest chunks are pages, as far as its limit', async () => {
+    // neither side read (`exactSide: 0`), the question among the pages: the sources lie behind all 6,000
+    const { results, plan } = await planOf({});
+    expect(results).toHaveLength(8);
+    expect(results.every((id) => id.startsWith('p'))).toBe(true);
+    // two walks of the index: the nearest forty of all, and the sources' walk on, which ends at its limit
+    const rows = walks(plan).map((line) => Number(/actual rows=(\d+)/.exec(line)![1]));
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toBe(NEAREST_OF_ALL);
+    expect(rows[1]).toBeGreaterThan(SIDE_ROWS_MAX / 2);
+    expect(rows[1]).toBeLessThanOrEqual(SIDE_ROWS_MAX * 1.2);
+  });
+
+  it('reads forty rows of the index and no more when the nearest chunks hold the sources', async () => {
+    // the question among the sources: the nearest forty are sources, and the walk on for them never starts
+    const { results, plan } = await planOf({ queryVector: [1, 1, 0, 0] });
+    expect(results).toHaveLength(8);
+    expect(results.every((id) => id.startsWith('s'))).toBe(true);
+    const [near, more] = walks(plan);
+    expect(Number(/actual rows=(\d+)/.exec(near)![1])).toBe(NEAREST_OF_ALL);
+    expect(more).toContain('never executed');
+  });
+
+  it('finds no page beside the sources when none is among the nearest forty, and all of them when asked for pages', async () => {
+    // a question among the sources: the nearest 40 chunks hold no page
+    const both = await search(store, embedder, 'anything', { k: 8, mode: 'vector', track: false, current: false, generatedShare: 1, queryVector: [1, 1, 0, 0] });
+    expect(both.every((r) => r.chunkId.startsWith('s'))).toBe(true);
+    // a search for pages is not held to one walk: it walks on past the 1,500 sources
+    const pages = await search(store, embedder, 'anything', { k: 8, mode: 'vector', track: false, current: false, queryVector: [1, 1, 0, 0], filter: resolveScopeFilter({ kinds: ['view'] }) });
+    expect(pages).toHaveLength(8);
+    expect(pages.every((r) => r.chunkId.startsWith('p'))).toBe(true);
   });
 
   it('reads a side a filter leaves a handful of chunks, however far from the question they lie', async () => {

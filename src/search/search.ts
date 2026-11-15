@@ -49,8 +49,8 @@ export interface SearchOptions {
   generatedShare?: number;
   /**
    * Chunks a side of the vector channel may hold and still be ranked by
-   * reading its vectors, over `sideBudget`; 0 walks the index for every
-   * side. For measuring, and for tests of the walk on a small index.
+   * reading its vectors, over `SIDE_ROWS_MAX`; 0 reads no side that way.
+   * For measuring, and for tests of the walk on a small index.
    */
   exactSide?: number;
 }
@@ -507,7 +507,7 @@ export async function describeVectorScan(store: Store): Promise<string> {
   const behind = versionBefore(scan.catalog, 0, 8)
     ? ' The catalog is behind the library: ALTER EXTENSION vector UPDATE, run in the database by its owner, brings it in line; search does not wait for it.'
     : '';
-  return `vector search: the index is walked on until each side of a search has its candidates (${catalog}; the library has hnsw.iterative_scan).${behind}`;
+  return `vector search: one walk of the index serves both sides of a search, and is carried on for the sources when the nearest chunks are generated pages (${catalog}; the library has hnsw.iterative_scan).${behind}`;
 }
 
 function scansIteratively(store: Store): Promise<boolean> {
@@ -515,34 +515,27 @@ function scansIteratively(store: Store): Promise<boolean> {
 }
 
 /**
- * The rows a side of the vector channel may cost: a side with this many
- * searchable chunks at most is ranked by reading its vectors, and a larger
- * one by walking the vector index for this many rows at most.
+ * The rows a side of the vector channel may cost beyond the first walk: a
+ * side with this many searchable chunks at most is ranked by reading its
+ * vectors, and the index is walked on for a side for this many rows at most.
  *
- * Walking the index for a side that holds few chunks, or none near the
- * question, reads on to the scan's limit. Measured on 200,400 chunks
- * (PostgreSQL 17, pgvector 0.8.7), a search asked for wiki pages that are
- * not views — 5,850 chunks, none of them near a question — took 231 ms at
- * the median where main, which stops at the nearest 40 rows whatever they
- * are, took 2 ms and found nothing. A walk costs about 10 µs a row of its
- * limit (pgvector's own 20,000: 200 ms; 10,000: 100 ms; 5,000: 52 ms and
- * still 24 rows there; 2,000: 2 rows) and reading a side's vectors about
- * 10 µs a chunk (5,850 chunks: 50 ms).
- *
- * Reading is the cheaper while the side is smaller than the walk would be
- * long. A side that is the fraction f of an index of N chunks, lying as near
- * the question as any other, gives up `k` rows in k / f rows walked — so it
- * is read while its size is under √(k · N), and a side whose chunks lie far
- * from the question takes a walk several times that. The budget is
- * √(8 · k · N): eight times the room a side at the boundary needs, and the
- * most either way of ranking a side reads (6,200 rows at 200,400 chunks and
- * the 24 a default search asks a channel for, about 60 ms at the worst). It
- * is held between 2,000, under which reading costs nothing worth counting,
- * and pgvector's own limit.
+ * Both are paid in blocks. On a copy of the finance index (562,563 chunks,
+ * 68,794 of them of generated pages; PostgreSQL 17 with 128 MB of shared
+ * buffers, pgvector 0.8.7) a row the walk goes on to costs about ten blocks
+ * — the index page, the vector, the chunk, its document — and a question not
+ * asked before finds few of them in memory: 1,200 rows walked were 23,800
+ * blocks and 160 ms, 9,300 rows 98,000 blocks and half a second. The limit
+ * was the root of the index's size once (10,400 rows there), from
+ * measurements on an index that fitted in memory. 2,000 rows are 20,000
+ * blocks at the worst, for a side that is not near the question at all.
  */
-export function sideBudget(k: number, chunks: number): number {
-  return Math.min(20_000, Math.max(2000, Math.round(Math.sqrt(8 * Math.max(1, k) * Math.max(0, chunks)))));
-}
+export const SIDE_ROWS_MAX = 2000;
+
+/**
+ * The nearest chunks of all that a search reads first, for both sides: one
+ * walk of the vector index at pgvector's own width (`hnsw.ef_search`).
+ */
+export const NEAREST_OF_ALL = 40;
 
 interface SideSizes {
   /** Searchable chunks of sources, counted as far as the cap. */
@@ -550,73 +543,96 @@ interface SideSizes {
   generated: number;
 }
 
-/** The most a side is ever counted to: the ceiling of `sideBudget`. */
-const SIDE_COUNT_MAX = 20_000;
-
 const wholeSides = new WeakMap<object, SideSizes & { at: number }>();
 
 /**
  * How many chunks each side of this search can return, counted as far as
  * `cap` + 1: what the search's own conditions leave (`searchable`), so a
  * side its filter empties, or the index holds nothing answerable of, counts
- * none. A filtered search is counted for itself, as far as its own cap (a
- * side past the cap costs 3 to 8 ms on 200,400 chunks, a small one 1 ms).
+ * none, and one small enough to read says so. A search without a filter is
+ * the whole index, counted once a minute per store; a filtered search is
+ * counted for itself.
  *
- * A search without a filter counts the whole index, which is the same
- * whatever the search asks for: it is counted as far as the largest budget
- * there is and kept a minute per store, for every cap. Kept under the cap it
- * was made for, it was counted again whenever the budget changed — a search
- * for 8 and a walk's direct route for 12 have different budgets on a large
- * index, and take turns.
+ * Documents are counted first, and a side's chunks only when its documents
+ * are within the cap: a side of more documents than that has more chunks
+ * than that, and counting 2,001 chunks through their documents took 213 ms
+ * on the finance copy with nothing in memory — once a minute, on whichever
+ * search came first.
  */
 async function sideSizes(store: Store, sides: SideSql, cap: number, asOf?: TimeInput, filter: ResolvedScopeFilter = NO_FILTER): Promise<SideSizes> {
-  const whole = !toIso(asOf) && isEmptyFilter(filter);
+  const whole = cap === SIDE_ROWS_MAX && !toIso(asOf) && isEmptyFilter(filter);
   const hit = whole ? wholeSides.get(store) : undefined;
   if (hit && Date.now() - hit.at < 60_000) return hit;
-  const p = new Params();
-  const cond = searchable('d', p, sides, asOf, filter);
-  const most = p.add((whole ? SIDE_COUNT_MAX : cap) + 1);
-  const side = (generated: boolean) => `(SELECT count(*)::int FROM (
-       SELECT 1 FROM documents d JOIN chunks c ON c.document_id = d.id
+  const counted = async (chunks: boolean, which: boolean[]): Promise<number[]> => {
+    const p = new Params();
+    const cond = searchable('d', p, sides, asOf, filter);
+    const most = p.add(cap + 1);
+    const side = (generated: boolean) => `(SELECT count(*)::int FROM (
+       SELECT 1 FROM documents d${chunks ? ' JOIN chunks c ON c.document_id = d.id' : ''}
        WHERE ${cond} AND ${generated ? '' : 'NOT '}${sides.generated('d')} LIMIT ${most}) held)`;
-  const [row] = await store.query<SideSizes>(`SELECT ${side(false)} AS sources, ${side(true)} AS generated`, p.list);
-  const sizes = { sources: row?.sources ?? 0, generated: row?.generated ?? 0 };
+    const [row] = await store.query<Record<string, number>>(`SELECT ${which.map((generated, i) => `${side(generated)} AS n${i}`).join(', ')}`, p.list);
+    return which.map((_, i) => row?.[`n${i}`] ?? 0);
+  };
+  const [sourceDocs, pageDocs] = await counted(false, [false, true]);
+  const sizes = { sources: sourceDocs, generated: pageDocs };
+  // a side of few documents: how many chunks they are
+  const few = [false, true].filter((generated) => { const n = generated ? pageDocs : sourceDocs; return n > 0 && n <= cap; });
+  if (few.length > 0) {
+    const chunks = await counted(true, few);
+    few.forEach((generated, i) => { sizes[generated ? 'generated' : 'sources'] = chunks[i]; });
+  }
   if (whole) wholeSides.set(store, { ...sizes, at: Date.now() });
   return sizes;
 }
 
 /**
  * Vector recall: cosine distance over pgvector, the nearest `k` chunks of
- * sources and the nearest `k` of generated pages, as one list by similarity.
- * A side is a branch of one statement: a large side an ordered scan with its
- * own limit, which the vector index serves, a small one (`sideBudget`) its
- * own vectors read and sorted; a window over both sides would read every
- * vector.
+ * sources and of generated pages as one list by similarity, in one statement.
  *
- * The side, like any filter here, is tested after the index is walked, and
- * one walk of an HNSW index ends at `hnsw.ef_search` (40) rows: where pages
- * are the nearest, the nearest 40 hold a handful of sources, and both sides
- * read the same 40. On a copy of the 10× separation index in PostgreSQL 17
- * (pgvector 0.8.7), over 200 question vectors asked for 24 sources:
+ * What it must do. A filter — the side is one — is tested after the index is
+ * walked, and one walk of an HNSW index ends at `hnsw.ef_search` (40) rows.
+ * Where pages are the nearest chunks, the nearest 40 hold a handful of
+ * sources: on a copy of the 10× separation index in PostgreSQL, 3.9 of the 24
+ * asked for, and a gold document in the top 8 for 79 of 297 questions where
+ * PGlite, which scans every vector, found 104. So the sources must be walked
+ * on for (`hnsw.iterative_scan = relaxed_order`: the index is read on until
+ * `k` rows pass the filter; such a scan may hand rows over a little out of
+ * order, so they are sorted here).
  *
- *   one walk                   3.9 rows, 197 queries short, 0.16 of the exact 24, 1.8 ms
- *   iterative, strict_order   24 rows,     0 short,          0.90,                 6.2 ms
- *   iterative, relaxed_order  24 rows,     0 short,          0.96,                 6.2 ms
+ * What it must not cost. Walking on for each side, as this did at first,
+ * is right where both sides lie near the question and ruinous where one does
+ * not: on a copy of the finance index pages are an eighth of the chunks and
+ * seldom among the nearest, and the pages' walk went on for 1,200 rows at the
+ * median and up to 9,300 for its 24 — a search took 219 to 242 ms at the
+ * median and 680 ms at the 95th percentile on a server restarted before it,
+ * where the build before any of this took 65 to 80 and 137 to 177.
  *
- * and the replay found a gold document in the top 8 for 79 of 297 questions
- * where the same index in PGlite, which scans every vector, found 104. So the
- * scans run with `hnsw.iterative_scan = relaxed_order`: the index is walked
- * on until `k` rows pass the filter (or `sideBudget` rows are read). That
- * scan may hand rows over a little out of order, so they are sorted here.
+ * So, for a search of both sides of a large index:
  *
- * The setting is made by the statement itself, for the statement: a CTE
- * calls `set_config(…, true)`, which lasts to the end of the transaction —
- * here the statement's own — and each branch reads the CTE in a condition
- * that holds no column, which the executor tests once, before it starts the
- * branch's scan. It was a transaction a side at first (BEGIN, SET LOCAL,
- * SELECT, COMMIT, on a pooled connection each): eight statements where main
- * sends one, on every search. tests/search-generated-pages-postgres.test.ts
- * holds that the one statement does walk on.
+ * - One walk, the nearest `NEAREST_OF_ALL` chunks of all, serves both sides:
+ *   the pages among them are the pages' side — a page that is not among the
+ *   nearest forty chunks is not near the question, and the keyword and graph
+ *   channels still list pages by their own measure — and the sources among
+ *   them are the sources', when there are `k`.
+ * - Only when there are not is the index walked on for the sources, for
+ *   `SIDE_ROWS_MAX` rows at most: a branch of the statement whose condition
+ *   (fewer than `k` sources among the nearest) holds no column, so the
+ *   executor tests it once and, the sources being there, never starts the
+ *   scan. On the finance copy it never ran in 60 questions, and the statement
+ *   reads 1,400 blocks where the earlier one read 23,800 and the build before
+ *   read 1,330; on the 10× index it runs for most questions, and the replay
+ *   stands (hybrid 94 / 105 of 297 in the top 5 / top 8, 93 / 103 before).
+ *
+ * A search for pages alone walks on for them, as a search for sources does. A
+ * side of `SIDE_ROWS_MAX` chunks at most — a filter's, or a small index's —
+ * is ranked by reading its vectors, exactly.
+ *
+ * The scan's settings are made by the statement itself, for the statement: a
+ * CTE calls `set_config(…, true)`, which lasts to the end of the transaction
+ * — here the statement's own — and the branch that walks on reads the CTE in
+ * a condition the executor tests before it starts the scan.
+ * tests/search-generated-pages-postgres.test.ts holds, on a real server, that
+ * the statement walks on when it must and reads forty rows when it need not.
  */
 async function vectorSearch(
   store: Store,
@@ -632,15 +648,26 @@ async function vectorSearch(
   const qv = queryVector ?? (await embedder.embed([query]))[0];
   // a search for certain kinds reads the sides they are on, and no side that holds nothing it can return
   const kinds = filter?.kinds;
-  const budget = sideBudget(k, await chunkTotal(store));
-  const exactMax = exactSide ?? budget;
-  const held = await sideSizes(store, sides, exactMax, asOf, filter);
-  const wanted = [false, true].filter((generated) => (generated
-    ? held.generated > 0 && (!kinds || kinds.includes('view'))
-    : held.sources > 0 && (!kinds || kinds.some((kind) => kind !== 'view'))));
-  if (wanted.length === 0) return [];
-  const walked = wanted.filter((generated) => (generated ? held.generated : held.sources) > exactMax);
-  const iterative = walked.length > 0 && (await scansIteratively(store));
+  const wantsSources = !kinds || kinds.some((kind) => kind !== 'view');
+  const wantsPages = !kinds || kinds.includes('view');
+  const readMax = exactSide ?? SIDE_ROWS_MAX;
+  const held = await sideSizes(store, sides, readMax, asOf, filter);
+  /**
+   * How a side is ranked: its vectors read; its chunks among the nearest of all, with the index walked
+   * on when those are short of `k` (sources); the same without walking on (pages beside sources); or the
+   * index walked on for it alone (pages, in a search for pages).
+   */
+  const way = (generated: boolean): 'none' | 'read' | 'near' | 'walk' => {
+    const size = generated ? held.generated : held.sources;
+    if (size === 0 || !(generated ? wantsPages : wantsSources)) return 'none';
+    if (size <= readMax) return 'read';
+    return generated && !wantsSources ? 'walk' : 'near';
+  };
+  const sources = way(false);
+  const pages = way(true);
+  if (sources === 'none' && pages === 'none') return [];
+  const walksOn = sources === 'near' || pages === 'walk';
+  const iterative = walksOn && (await scansIteratively(store));
 
   const p = new Params([toVectorLiteral(qv)]);
   // only vectors of the query's own space: while a new model's vectors are still coming in
@@ -649,19 +676,19 @@ async function vectorSearch(
   const cond = searchable('d', p, sides, asOf, filter);
   const lim = p.add(k);
   const onSide = (generated: boolean) => `${generated ? '' : 'NOT '}${sides.generated('d')}`;
-  // a large side: the index, walked on
-  const walk = (generated: boolean) => `(SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content,
-            1 - (e.embedding <=> $1::${VECTOR_TYPE}) AS raw, ${generated} AS generated
+  const columns = `c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content`;
+  const setting = iterative ? ' AND (SELECT mode FROM scan) IS NOT NULL' : '';
+  // the index, walked on until the side has its `k` (or `SIDE_ROWS_MAX` rows have been read)
+  const walk = (generated: boolean, when = '') => `(SELECT ${columns}, 1 - (e.embedding <=> $1::${VECTOR_TYPE}) AS raw, ${generated} AS generated, true AS walked
      FROM embeddings e
      JOIN chunks c ON c.id = e.chunk_id
      JOIN documents d ON d.id = c.document_id
-     WHERE e.model = ${model} AND ${cond} AND ${onSide(generated)}${iterative ? ' AND (SELECT mode FROM scan) IS NOT NULL' : ''}
+     WHERE e.model = ${model} AND ${cond} AND ${onSide(generated)}${when}${setting}
      ORDER BY e.embedding <=> $1::${VECTOR_TYPE}
      LIMIT ${lim})`;
   // a small side: its own vectors, read from its documents. The inner query has no order (and OFFSET 0
   // keeps it a step of its own), so the planner has no use for the vector index there
-  const read = (generated: boolean) => `(SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content,
-            1 - nearest.far AS raw, ${generated} AS generated
+  const read = (generated: boolean) => `(SELECT ${columns}, 1 - nearest.far AS raw, ${generated} AS generated, false AS walked
      FROM (
        SELECT held.chunk_id, held.far FROM (
          SELECT c.id AS chunk_id, e.embedding <=> $1::${VECTOR_TYPE} AS far
@@ -676,16 +703,50 @@ async function vectorSearch(
      ) nearest
      JOIN chunks c ON c.id = nearest.chunk_id
      JOIN documents d ON d.id = c.document_id)`;
-  const scan = iterative
-    ? `WITH scan AS MATERIALIZED (
-       SELECT set_config('hnsw.iterative_scan', 'relaxed_order', true) AS mode, set_config('hnsw.max_scan_tuples', '${budget}', true) AS most)\n     `
-    : '';
-  const rows = await store.query<RankedChunk>(
-    `${scan}${wanted.map((generated) => (walked.includes(generated) ? walk(generated) : read(generated))).join('\n     UNION ALL\n     ')}`,
+
+  const ctes: string[] = [];
+  const branches: string[] = [];
+  if (sources === 'near' || pages === 'near') {
+    // One walk of the index for both sides: the nearest chunks of all, each with its side. The inner
+    // query has no condition on the side, so its limit ends the walk whatever the statement's setting.
+    const both = sources === 'near' && pages === 'near';
+    ctes.push(`near AS MATERIALIZED (
+       SELECT ${columns}, 1 - nearest.far AS raw, ${sides.generated('d')} AS generated, false AS walked
+       FROM (
+         SELECT e.chunk_id, e.embedding <=> $1::${VECTOR_TYPE} AS far
+         FROM embeddings e
+         WHERE e.model = ${model}
+         ORDER BY e.embedding <=> $1::${VECTOR_TYPE}
+         LIMIT ${NEAREST_OF_ALL}
+       ) nearest
+       JOIN chunks c ON c.id = nearest.chunk_id
+       JOIN documents d ON d.id = c.document_id
+       WHERE ${cond}${both ? '' : ` AND ${onSide(pages === 'near')}`})`);
+    branches.push(`(SELECT * FROM near)`);
+    // and for the sources, when those nearest do not hold `k` of them, the index walked on: a branch
+    // whose condition holds no column, so the executor tests it once and, the sources being there, never
+    // starts the scan
+    if (sources === 'near') branches.push(walk(false, ` AND (SELECT count(*) FROM near WHERE NOT generated) < ${lim}`));
+  }
+  if (sources === 'read') branches.push(read(false));
+  if (pages === 'read') branches.push(read(true));
+  if (pages === 'walk') branches.push(walk(true));
+  if (iterative) {
+    ctes.push(`scan AS MATERIALIZED (
+       SELECT set_config('hnsw.iterative_scan', 'relaxed_order', true) AS mode, set_config('hnsw.max_scan_tuples', '${SIDE_ROWS_MAX}', true) AS most)`);
+  }
+  const rows = await store.query<RankedChunk & { walked: boolean }>(
+    `${ctes.length ? `WITH ${ctes.join(',\n     ')}\n     ` : ''}${branches.join('\n     UNION ALL\n     ')}`,
     p.list,
   );
-  const of = (generated: boolean) => rows.filter((r) => Boolean(r.generated) === generated).sort((x, y) => y.raw - x.raw);
+  // where the index was walked on for the sources, that list is the sources': it holds the nearest ones too
+  const walkedSources = rows.some((r) => r.walked && !r.generated);
+  const of = (generated: boolean) => rows
+    .filter((r) => Boolean(r.generated) === generated && (generated || !walkedSources || r.walked))
+    .sort((x, y) => y.raw - x.raw)
+    .slice(0, k);
   return mergeSides(of(false), of(true));
+
 }
 
 /**
