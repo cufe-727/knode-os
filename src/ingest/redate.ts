@@ -1,6 +1,7 @@
 import { readSidecarPart, replayableTier1, SidecarTier1 } from '../fs/sidecar.js';
 import { META_KEY as REKEY_META, RekeyState } from '../graph/claim-rekey.js';
 import { frontmatterExtraction } from '../graph/frontmatter.js';
+import { loadOntology, normalizePredicate, Ontology } from '../graph/ontology.js';
 import { claimId, readingWeek } from '../graph/store.js';
 import { propagate } from '../lineage/deps.js';
 import { foldTouched } from '../lineage/fold.js';
@@ -30,14 +31,14 @@ export function documentDate(file: string, root: DocRoot, parsed: ParsedMarkdown
 }
 
 export interface RedateOutcome {
-  /** `same`: the date reads as stored; `redated`: changed in place; `unreadable`: a stored extraction could not be read again, nothing changed. */
-  status: 'same' | 'redated' | 'unreadable';
+  /** `same`: the date reads as stored; `redated`: changed in place; `unreadable`: a stored extraction could not be read again; `held`: its words do not account for its evidence. Nothing changed in the last two. */
+  status: 'same' | 'redated' | 'unreadable' | 'held';
   was: string | null;
   now: string | null;
   /** Evidence rows given new dates. */
   claims: number;
   relations: number;
-  /** Evidence whose stored dates are not what the old date gave (left as it is), or whose words read two ways. */
+  /** Evidence rows whose stored dates are not what the old date gave, or whose words read two ways: the document is held. */
   unmatched: number;
   /** A claim whose dates now make it a weekly reading of another id: the claim re-key (src/graph/claim-rekey.ts) is set to visit it. */
   rekey: boolean;
@@ -65,10 +66,11 @@ function relationDates(r: { validFrom?: unknown; validTo?: unknown }, ref: strin
 
 const str = (v: unknown): string | null => (typeof v === 'string' && v ? v : null);
 const sameDates = (a: Record<string, string | null>, b: Record<string, string | null>) => Object.keys(a).every((k) => (a[k] ?? null) === (b[k] ?? null));
+const nameKey = (v: unknown) => String(v ?? '').normalize('NFKC').trim().toLowerCase();
 
 interface Words {
   claims: { statement: string; startDate?: unknown; endDate?: unknown; eventDate?: unknown }[];
-  relations: { description?: string; validFrom?: unknown; validTo?: unknown }[];
+  relations: { source: string; target: string; type: string; description?: string; validFrom?: unknown; validTo?: unknown }[];
 }
 
 /** A stored tier-1 extraction that can be read again: the one the live scope carries, whole. */
@@ -78,77 +80,102 @@ function readableTier1(t1: SidecarTier1 | null, child: ScopeRow, sha: string): W
   return { claims: t1.claims ?? [], relations: t1.relations };
 }
 
-interface EvidenceRow { id: string; kind: 'claim' | 'relation'; target_id: string; attrs: Record<string, unknown>; subject_id: string | null }
+interface EvidenceRow {
+  id: string;
+  kind: 'claim' | 'relation';
+  target_id: string;
+  attrs: Record<string, unknown>;
+  subject_id: string | null;
+  /** A relation's endpoints: their names and aliases, normalized. */
+  ends: [string[], string[]] | null;
+}
+
+/** What a scope's re-date writes: evidence rows with their new attrs, or the rows the words cannot account for. */
+interface ScopePlan {
+  updates: { id: string; kind: 'claim' | 'relation'; target: string; attrs: Record<string, unknown>; moves: boolean }[];
+  unmatched: number;
+}
 
 /**
- * Re-date one scope's evidence from the words it was read from: every row
- * whose stored dates are what the old reference date gave gets what the new
- * one gives. A row the words do not account for, or account for two ways
- * (one statement twice with other dates), is left as it is.
+ * Plan the re-date of one scope's evidence from the words it was read from.
+ * A claim row is the extraction's claim of its statement whose dates under the
+ * old reference date are the row's (date_source, which follows from them, is
+ * not compared, nor observed_at where evidence written before it was recorded
+ * lacks it); a
+ * relation row is the extraction's relation of its type, description and
+ * endpoints whose old dates are the row's. Every claim row must be accounted
+ * for, one way: its observed_at moves with the document. Relation rows are
+ * read only when one of the extraction's relations states a date relative to
+ * the document; one that states none keeps none.
  */
-async function redateScope(q: Queryable, scopeId: string, words: Words, extractor: string | null, was: string | null, now: string | null, out: RedateOutcome, touched: ReturnType<typeof emptyTouched>, moved: string[]): Promise<void> {
+async function planScope(q: Queryable, scopeId: string, words: Words, extractor: string | null, was: string | null, now: string | null, ontology: Ontology): Promise<ScopePlan> {
+  const plan: ScopePlan = { updates: [], unmatched: 0 };
   const claims = new Map<string, { old: ClaimDates; next: ClaimDates }[]>();
   for (const c of words.claims) {
     const s = typeof c.statement === 'string' ? c.statement.trim() : '';
     if (!s) continue;
-    const list = claims.get(s) ?? [];
-    list.push({ old: claimDates(c, was), next: claimDates(c, now) });
-    claims.set(s, list);
+    claims.set(s, [...(claims.get(s) ?? []), { old: claimDates(c, was), next: claimDates(c, now) }]);
   }
-  const relations = new Map<string, { old: RelationDates; next: RelationDates }[]>();
-  for (const r of words.relations) {
-    const old = relationDates(r, was);
-    const next = relationDates(r, now);
-    if (sameDates(old, next)) continue; // a stated date, or none: the reference date changes nothing
-    const key = r.description ?? '';
-    relations.set(key, [...(relations.get(key) ?? []), { old, next }]);
-  }
+  const relations = words.relations.filter((r) => r && typeof r.source === 'string' && typeof r.target === 'string').map((r) => {
+    const norm = normalizePredicate(ontology, r.type);
+    const [a, b] = norm.flip ? [r.target, r.source] : [r.source, r.target];
+    return { type: norm.type, description: r.description ?? '', a: nameKey(a), b: nameKey(b), old: relationDates(r, was), next: relationDates(r, now) };
+  });
+  const relationsMove = relations.some((r) => !sameDates(r.old, r.next));
   const rows = await q.query<EvidenceRow>(
-    `SELECT e.id::text AS id, e.kind, e.target_id, e.attrs, c.subject_id FROM evidence e
+    `SELECT e.id::text AS id, e.kind, e.target_id, e.attrs, c.subject_id,
+            CASE WHEN e.kind = 'relation' THEN jsonb_build_array(
+              (SELECT jsonb_build_array(s.name) || s.aliases FROM entities s WHERE s.id = r.source_id),
+              (SELECT jsonb_build_array(t.name) || t.aliases FROM entities t WHERE t.id = r.target_id)) END AS ends
+     FROM evidence e
      LEFT JOIN claims c ON e.kind = 'claim' AND c.id = e.target_id
+     LEFT JOIN relations r ON e.kind = 'relation' AND r.id = e.target_id
      WHERE e.scope_id = $1 AND e.tx_to IS NULL AND e.kind IN ('claim', 'relation') ${extractor ? 'AND e.extractor = $2' : ''}`,
     extractor ? [scopeId, extractor] : [scopeId],
   );
+  const one = <T>(fits: { next: T }[]): T | null => {
+    const distinct = [...new Map(fits.map((x) => [JSON.stringify(x.next), x.next])).values()];
+    return distinct.length === 1 ? distinct[0] : null;
+  };
   for (const row of rows) {
     const a = row.attrs ?? {};
     if (row.kind === 'claim') {
-      const stored: ClaimDates = { valid_from: str(a.valid_from), valid_to: str(a.valid_to), event_at: str(a.event_at), observed_at: str(a.observed_at), date_source: str(a.date_source) };
-      const fits = (claims.get(String(a.statement ?? '')) ?? []).filter((x) => sameDates(x.old, stored));
-      const next = [...new Map(fits.map((x) => [JSON.stringify(x.next), x.next])).values()];
-      if (next.length !== 1) {
-        out.unmatched++;
+      const stored: Partial<ClaimDates> = { valid_from: str(a.valid_from), valid_to: str(a.valid_to), event_at: str(a.event_at) };
+      // date_source follows from these and the reference date, so it is never compared; observed_at, where recorded, says which date wrote the row
+      if ('observed_at' in a) stored.observed_at = str(a.observed_at);
+      const fits = (claims.get(String(a.statement ?? '')) ?? []).filter((x) => sameDates(stored as Record<string, string | null>, x.old));
+      const next = one(fits);
+      if (!next) {
+        plan.unmatched++;
         continue;
       }
-      if (sameDates(next[0], stored)) continue;
-      const { date_source, ...dates } = next[0];
+      if (sameDates(next, { ...stored, date_source: str(a.date_source), observed_at: str(a.observed_at) } as ClaimDates)) continue;
+      const { date_source, ...dates } = next;
       const attrs: Record<string, unknown> = { ...a, ...dates };
       delete attrs.date_source;
       if (date_source) attrs.date_source = date_source;
-      await q.query(`UPDATE evidence SET attrs = $2::jsonb WHERE id = $1`, [row.id, JSON.stringify(attrs)]);
-      out.claims++;
-      touched.claims.add(row.target_id);
-      // the id the writer would give it now (a weekly reading carries its week): the re-key's to move, not this
+      // the id the writer would give it now (a weekly reading carries its week), as src/graph/claim-rekey.ts newIdOf reads it
       const statement = String(a.statement ?? '');
-      // (as src/graph/claim-rekey.ts newIdOf reads a piece of evidence)
       const id = row.subject_id ? claimId(row.subject_id, statement, readingWeek({
         statement, eventAt: dates.event_at, validFrom: dates.valid_from, validTo: dates.valid_to, observedAt: dates.observed_at,
       })) : row.target_id;
-      if (id !== row.target_id) moved.push(row.target_id);
+      plan.updates.push({ id: row.id, kind: 'claim', target: row.target_id, attrs, moves: id !== row.target_id });
     } else {
-      const candidates = relations.get(String(a.description ?? ''));
-      if (!candidates) continue;
+      if (!relationsMove) continue;
+      const [src, dst] = (row.ends ?? [[], []]).map((names) => new Set((Array.isArray(names) ? names : []).map(nameKey)));
       const stored: RelationDates = { valid_from: str(a.valid_from), valid_to: str(a.valid_to) };
-      const fits = candidates.filter((x) => sameDates(x.old, stored));
-      const next = [...new Map(fits.map((x) => [JSON.stringify(x.next), x.next])).values()];
-      if (next.length !== 1) {
-        if (fits.length) out.unmatched++;
+      const fits = relations.filter((r) => r.type === a.type && r.description === String(a.description ?? '')
+        && ((src.has(r.a) && dst.has(r.b)) || (src.has(r.b) && dst.has(r.a))) && sameDates(r.old, stored));
+      const next = one(fits);
+      if (!next) {
+        plan.unmatched++;
         continue;
       }
-      await q.query(`UPDATE evidence SET attrs = $2::jsonb WHERE id = $1`, [row.id, JSON.stringify({ ...a, ...next[0] })]);
-      out.relations++;
-      touched.relations.add(row.target_id);
+      if (sameDates(next, stored)) continue;
+      plan.updates.push({ id: row.id, kind: 'relation', target: row.target_id, attrs: { ...a, ...next }, moves: false });
     }
   }
+  return plan;
 }
 
 /**
@@ -167,8 +194,10 @@ async function redateScope(q: Queryable, scopeId: string, words: Words, extracto
  *
  * A document whose date reads the same is only marked as checked. When a
  * stored extraction its live scope carries cannot be read again (missing, being
- * redone, damaged), nothing is changed: it is marked and said once. One
- * transaction per re-dated document; null when the scope is already current.
+ * redone, damaged), or its words do not account for every evidence row,
+ * nothing is changed: the scope is held for these rules (`dateHeld`, with the
+ * reason) and it is said once; the next rules, or applying it again, read it
+ * again. One transaction per re-dated document; null when the scope is already current.
  */
 export async function redateDocument(
   store: Store,
@@ -177,7 +206,7 @@ export async function redateDocument(
   parse: () => ParsedMarkdown,
   log: (msg: string) => void = () => {},
 ): Promise<RedateOutcome | null> {
-  if (live.meta.dateRules === DOC_DATE_RULES) return null;
+  if (live.meta.dateRules === DOC_DATE_RULES || (live.meta.dateHeld as { rules?: number } | undefined)?.rules === DOC_DATE_RULES) return null;
   const parsed = parse();
   const now = toIso(documentDate(doc.file, doc.root, parsed, doc.at));
   const [row] = await store.query<{ doc_date: string | Date | null }>(`SELECT doc_date FROM documents WHERE id = $1`, [doc.docId]);
@@ -202,23 +231,40 @@ export async function redateDocument(
     }
     const [held] = await store.query(`SELECT 1 FROM evidence WHERE scope_id = $1 AND tx_to IS NULL AND kind IN ('claim', 'relation') LIMIT 1`, [child.id]);
     if (!held) continue;
-    await mark(store);
+    await store.query(`UPDATE scopes SET meta = meta || $2::jsonb WHERE id = $1`, [live.id, JSON.stringify({ dateHeld: { rules: DOC_DATE_RULES, was, now, reason: 'unreadable extraction' } })]);
     log(`${doc.file}: its date reads ${now?.slice(0, 10) ?? 'none'} now, was ${was?.slice(0, 10) ?? 'none'}, but its stored extraction cannot be read again: left as it is until it is applied again`);
     return { ...out, status: 'unreadable' };
   }
+
+  // read first, so a document is re-dated whole or not at all
+  const ontology = loadOntology(store.dataDir);
+  const plans: ScopePlan[] = [];
+  for (const s of sources) plans.push(await planScope(store, s.scopeId, s.words, s.extractor, was, now, ontology));
+  out.unmatched = plans.reduce((n, p) => n + p.unmatched, 0);
+  if (out.unmatched) {
+    // nothing changed; held for these rules with the reason, so a later rule (or a re-apply) reads it again
+    await store.query(`UPDATE scopes SET meta = meta || $2::jsonb WHERE id = $1`, [live.id, JSON.stringify({ dateHeld: { rules: DOC_DATE_RULES, was, now, reason: 'unmatched evidence', unmatched: out.unmatched } })]);
+    log(`${doc.file}: its date reads ${now?.slice(0, 10) ?? 'none'} now, was ${was?.slice(0, 10) ?? 'none'}, but ${out.unmatched} of its evidence rows are not what its stored words gave: left as it is`);
+    return { ...out, status: 'held' };
+  }
+  const updates = plans.flatMap((p) => p.updates);
+  out.claims = updates.filter((u) => u.kind === 'claim').length;
+  out.relations = updates.filter((u) => u.kind === 'relation').length;
+  const moved = [...new Set(updates.filter((u) => u.moves).map((u) => u.target))];
+  out.rekey = moved.length > 0;
+  const txTime = new Date().toISOString();
 
   const done = await store.tx(async (q) => {
     await lockLedger(q);
     // applied again since the caller looked: that apply read the date itself
     if ((await findLiveScope(q, 'doc', doc.file))?.id !== live.id) return false;
-    // counted afresh: a transaction rolled back for a deadlock runs again
-    Object.assign(out, { claims: 0, relations: 0, unmatched: 0, rekey: false });
     const touched = emptyTouched();
-    const moved: string[] = [];
-    for (const s of sources) await redateScope(q, s.scopeId, s.words, s.extractor, was, now, out, touched, moved);
+    for (const u of updates) {
+      await q.query(`UPDATE evidence SET attrs = $2::jsonb WHERE id = $1`, [u.id, JSON.stringify(u.attrs)]);
+      (u.kind === 'claim' ? touched.claims : touched.relations).add(u.target);
+    }
     await q.query(`UPDATE documents SET doc_date = $2::timestamptz WHERE id = $1`, [doc.docId, now]);
     touched.documents.add(doc.file);
-    const txTime = new Date().toISOString();
     const fold = await foldTouched(q, touched, txTime, foldOptions(store.dataDir));
     await propagate(q, fold.changed, fold.tombstoned, txTime);
     if (moved.length) {
@@ -228,12 +274,11 @@ export async function redateDocument(
       if (state.done || (state.cursor !== null && first <= state.cursor)) {
         await q.query(`INSERT INTO meta (key, value) VALUES ($1, $2::jsonb) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [REKEY_META, JSON.stringify({ cursor: null, done: false })]);
       }
-      out.rekey = true;
     }
     await mark(q);
     return true;
   });
   if (!done) return null;
-  log(`re-dated ${doc.file}: ${was?.slice(0, 10) ?? 'none'} → ${now?.slice(0, 10) ?? 'none'} (${out.claims} claim, ${out.relations} relation dates${out.unmatched ? `, ${out.unmatched} left as stored` : ''})`);
+  log(`re-dated ${doc.file}: ${was?.slice(0, 10) ?? 'none'} → ${now?.slice(0, 10) ?? 'none'} (${out.claims} claim, ${out.relations} relation dates)`);
   return { ...out, status: 'redated' };
 }

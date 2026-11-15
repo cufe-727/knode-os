@@ -8,7 +8,7 @@ import { writeSidecarPart } from '../src/fs/sidecar.js';
 import { supersedeByAttribute } from '../src/graph/claim-state-store.js';
 import { rekeyState, rekeyWeeklyReadings } from '../src/graph/claim-rekey.js';
 import { applyMerge } from '../src/graph/merge.js';
-import { documentIdFor } from '../src/ingest/apply.js';
+import { DOC_DATE_RULES, documentIdFor } from '../src/ingest/apply.js';
 import { sync } from '../src/ingest/sync.js';
 import { toDateString } from '../src/store/temporal.js';
 
@@ -342,5 +342,86 @@ claims:
     const moved = (await claims(ctx)).find((r) => r.statement === '支付组本周在岗7人。')!;
     expect(moved.id).not.toBe(reading.id);
     expect((await rekeyState(ctx.store)).done).toBe(true);
+  });
+
+  it('gives a relation only the date its own words state', async () => {
+    const S = 'raw/docs/reports/s.md';
+    const ctx = await open('relations', [[S, '# 支付组点评\n\n支付组负责结算中台，也负责风控引擎。\n']]);
+    dating.off = true;
+    await sync(ctx, { llmGraph: false });
+    tier1(ctx, S, await shaOf(ctx, S), {
+      entities: [{ name: '支付组', type: 'organization' }, { name: '结算中台', type: 'project' }, { name: '风控引擎', type: 'project' }],
+      // one type, no description: one states a date relative to the document, the other none
+      relations: [{ source: '支付组', target: '结算中台', type: 'related_to', validFrom: '去年' }, { source: '支付组', target: '风控引擎', type: 'related_to' }],
+      claims: [],
+    });
+    await sync(ctx, { llmGraph: false });
+    dating.off = false;
+    dating.override.set(S, '2025-03-01T00:00:00.000Z');
+    await olderRules(ctx);
+    await sync(ctx, { llmGraph: false });
+    const rows = await ctx.store.query<{ target: string; valid_from: unknown }>(
+      `SELECT t.name AS target, r.valid_from FROM relations r JOIN entities t ON t.id = r.target_id WHERE r.tx_to IS NULL ORDER BY t.name`,
+    );
+    expect(rows.map((r) => [r.target, day(r.valid_from)])).toEqual([['结算中台', '2024-01-01'], ['风控引擎', null]]);
+  });
+
+  it('re-dates evidence written before its date source was recorded', async () => {
+    const O = 'raw/docs/reports/o.md';
+    const ctx = await open('old-evidence', [[O, '# 支付组周报\n\n支付组在岗7人，上月在岗5人。\n']]);
+    dating.off = false;
+    dating.override.set(O, '2025-03-07T00:00:00.000Z');
+    await sync(ctx, { llmGraph: false });
+    tier1(ctx, O, await shaOf(ctx, O), {
+      entities: [{ name: '支付组', type: 'organization' }],
+      relations: [],
+      claims: [
+        { subject: '支付组', statement: '支付组在岗7人。', type: 'other', status: 'fact', kind: 'fact' },
+        { subject: '支付组', statement: '支付组上月在岗5人。', type: 'other', status: 'fact', kind: 'fact', startDate: '上月', endDate: '上月' },
+      ],
+    });
+    await sync(ctx, { llmGraph: false });
+    // as written before date_source was recorded
+    await ctx.store.query(`UPDATE evidence SET attrs = attrs - 'date_source' WHERE kind = 'claim'`);
+    dating.override.set(O, '2025-04-04T00:00:00.000Z');
+    await olderRules(ctx);
+    await sync(ctx, { llmGraph: false });
+    const rows = await claims(ctx);
+    const by = (s: string) => rows.find((r) => r.statement === s)!;
+    expect([day(by('支付组在岗7人。').effective_at), by('支付组在岗7人。').date_source]).toEqual(['2025-04-04', 'document']);
+    expect([day(by('支付组上月在岗5人。').valid_from), day(by('支付组上月在岗5人。').valid_to), by('支付组上月在岗5人。').date_source]).toEqual(['2025-03-01', '2025-03-31', 'stated']);
+  });
+
+  it('is held, unchanged, when its stored words do not account for its evidence', async () => {
+    const H = 'raw/docs/reports/h.md';
+    const ctx = await open('held', [[H, '# 支付组周报\n\n支付组在岗7人。\n']]);
+    dating.off = true;
+    await sync(ctx, { llmGraph: false });
+    tier1(ctx, H, await shaOf(ctx, H), {
+      entities: [{ name: '支付组', type: 'organization' }],
+      relations: [],
+      claims: [{ subject: '支付组', statement: '支付组在岗7人。', type: 'other', status: 'fact', kind: 'fact' }],
+    });
+    await sync(ctx, { llmGraph: false });
+    // a row as no reading of its words writes it
+    await ctx.store.query(`UPDATE evidence SET attrs = attrs || '{"valid_from": "2020-01-01T00:00:00.000Z"}'::jsonb WHERE kind = 'claim'`);
+    const before = await identity(ctx);
+    const attrs = await ctx.store.query(`SELECT attrs FROM evidence WHERE tx_to IS NULL ORDER BY id`);
+    dating.off = false;
+    dating.override.set(H, '2025-09-05T00:00:00.000Z');
+    await olderRules(ctx);
+    const logs: string[] = [];
+    await sync(ctx, { llmGraph: false, onProgress: (m) => logs.push(m) });
+    expect(await identity(ctx)).toEqual(before);
+    expect(await ctx.store.query(`SELECT attrs FROM evidence WHERE tx_to IS NULL ORDER BY id`)).toEqual(attrs);
+    expect(day((await ctx.store.query<{ doc_date: unknown }>(`SELECT doc_date FROM documents WHERE id = $1`, [documentIdFor(H)]))[0].doc_date)).toBeNull();
+    expect(logs.filter((l) => l.includes(H))).toHaveLength(1);
+    const scope = (await ctx.store.query<{ meta: Record<string, unknown> }>(`SELECT meta FROM scopes WHERE kind = 'doc' AND key = $1 AND status = 'active'`, [H]))[0];
+    expect(scope.meta).toMatchObject({ dateHeld: { rules: DOC_DATE_RULES, reason: 'unmatched evidence', unmatched: 1 } });
+    expect(scope.meta.dateRules).toBeUndefined();
+    // said once: the next pass under these rules leaves it alone
+    const again: string[] = [];
+    await sync(ctx, { llmGraph: false, onProgress: (m) => again.push(m) });
+    expect(again.filter((l) => l.includes(H))).toEqual([]);
   });
 });
