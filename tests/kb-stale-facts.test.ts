@@ -97,6 +97,10 @@ describe('back-references to the previous report', () => {
     expect(backReferenceIn("Last week's cache stampede was fixed by Fang Jie")).toBe('cache stampede');
     expect(backReferenceIn('上周那起INC-001-T1已由方杰修复')).toBeNull();
     expect(backReferenceIn('方杰本周完成接口评审')).toBeNull();
+    // the "上周" an extraction dropped or wrote out as that week's dates
+    expect(backReferenceIn('推送重复事故已由夏杰修复。')).toBe('推送重复');
+    expect(backReferenceIn('叶敏已修复2025年6月2日至6月8日发生的推送重复事故，根因是一处空指针。')).toBe('推送重复');
+    expect(backReferenceIn('INC-018-D7T3已由叶鹏修复。')).toBeNull();
   });
 
   it('links the fixer to the one identified incident of that description in the same series the period before', async () => {
