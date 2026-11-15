@@ -1,6 +1,6 @@
 # 32 — One work queue: producers publish, work waits, workers decide where it runs
 
-Status: stage 1 (D1–D5, §2–§4) built on 2026-11-14 on branch `claude/work-queue-stage-1-d8ecd2`, not merged or deployed; §11 says what was built and decided. Stages 2 and 3 are designs.
+Status: stage 1 (D1–D5, §2–§4) built on 2026-11-14 and merged (§11). Stage 2 (D6, §5) built on 2026-11-15 on branch `claude/work-queue-stage-2`, not merged or deployed; §12 says what was built and decided. Stage 3 is a design.
 
 ## Problem
 
@@ -233,4 +233,110 @@ the calls of its batch that have not started.
 **Not verified.** No model-backed run, no real worker on another machine, no restart of a real `serve` with pieces
 waiting (the republish path is covered only by reading the code), and no run with both `serve`'s own slots and the
 run's competing for one account.
+
+## 12. Stage 2 as built (2026-11-15)
+
+Commits on `claude/work-queue-stage-2`: the decision (`cd1619f`), the store and serve's side (`308e262`), the run's
+side (`66b59b6`), `eval drop` and Tasks (`3f7eec0`). Tests in `tests/work-queue-durable.test.ts` (the store, a
+restart of serve with a run waiting, a run that exits and resumes, two producers, compatibility) and a Tasks case in
+`tests/explore-tasks.test.ts`.
+
+**The store** (`src/work/eval-store.ts`, decided in §5): `<root>/.knode/eval-queue/<run>/<key>.json` holds a task
+(kind, the run's scope, state, publish time, deadline, the spec while it waits) and `<key>.result.json` its outcome.
+Every write is whole (a temporary file renamed); a result is written before the state, so a task that reads `waiting`
+beside a result that parses is done at load. `owner.json` (pid and nonce, created exclusively) makes one process the
+owner; a second `serve` keeps its evaluation work in memory and says why in its log, in `/eval/v1/status`
+(`tasks.durable: false, reason`) and on the Tasks card; an owner whose process is gone is taken over.
+
+**The task's life** (`EvalSource` in `src/work/eval.ts`, with the store):
+
+- *Published* by run and key. A key waiting or out is that task: the newer spec (a resumed run's tools endpoint) and
+  the later deadline win. A key done is its stored result, and counts as collected. A key stuck or dropped waits
+  again: publishing it again is a resume asking again, as stage 1's resume did. A key done by one of the run's own
+  slots (`local: true` on the outcome) also waits again: its value lived in the process that ran it, and the process
+  that ran it never publishes it again (it has the value).
+- *Leased* in memory only. After a restart every task the store holds waiting is waiting, strikes counted afresh; the
+  old lease is unknown, so its late answer is refused (`unknown or expired lease`) and the piece is done once, by the
+  lease that is current.
+- *Waiting for its run*: a session that calls the run's tools (its MCP bridge lives in the run) is leased only while
+  its run is attached — it published, polled or read its status within 60 s, or holds a stage-1 offer. Everything
+  else is leased whether or not the run is there.
+- *Deadline*: 24 h from its publish unless the producer names one (`deadlineMs`, at most seven days); each poll that
+  asks after it pushes it on by the same span (written to the store when within half of it). A task still waiting at
+  its deadline is dropped, never run; one out finishes and its result is kept.
+- *Kept*: a result for seven days after it was done, or a day after it was first collected; a dropped task a day.
+  Pruned every ten minutes and at load. Collecting does not delete: a run that collected and died before recording
+  collects it again.
+- *Bounded*: `server.remote.evalQueueMB` (default 2048) over tasks and results. A publish past it first removes
+  results already collected, oldest first; still past it, it is refused with 507 and a message naming the setting and
+  `eval drop`, and the run stops with that word (`ServeRefusedError`). A result of a task out now is always stored.
+- *Archives* (`.knode/eval-archives/`) a waiting session needs are kept however old they are.
+
+**The producer channel** gains `POST /eval/v1/tasks` ({run, scope, deadlineMs, specs}, at most 200: each answer is
+the task's state or its stored result), `POST /tasks/poll` ({run, keys, waitMs}: held up to 25 s until one is done;
+keys serve does not have come back `missing`), `POST /runs/<run>/detach` and `DELETE /runs/<run>?scope=`. `/status`
+says `tasks: {version: 2, durable, reason, tasks, bytes, maxBytes}`. `/offer` and `/runs/<run>/cancel` stay.
+
+**The run** (`ServeQueue` and `RemoteEval` in `src/eval/remote.ts`):
+
+- *Keys*. Stage 1's keys were random; now a piece's key is a digest of what it is — the run directory (so two run
+  directories of one name never share pieces), kind, CLI, model, effort, speed, eligibility, pool, label, the system
+  and task it is for (a repeat's task carries `~r<n>`), the caller's content (a call's messages, JSON flag, schema,
+  effort and stage; a judge call's messages; a session's prompt, sandbox, steps and label) and the spec's (prompt,
+  schema, archive, tools) — with `-<n>` for the n-th piece just like it in this process. That is the reply cache's
+  identity (src/eval/shim.ts) plus the occurrence. A resume that asks what its records lack in the order it asks
+  finds the same keys. The known limit: two identical pieces under one tag (a judge audit asking one prompt twice)
+  where a resume asks only the second get the first's result, as the reply cache would.
+- *Publishing*: pieces join a batch (100, every 20 ms) and one poll waits for all those published; a new batch
+  restarts the poll with the larger set. Serve not answering ends every published piece `unreachable`: as in stage
+  1 the run counts serve as gone (nothing online, its own slots included, the wait limit running) and publishes them
+  again with backoff, and serve answers with the same tasks or their results.
+- *A run that stops* (a signal, `--wait-minutes`, a refusal, its caller's cancel) detaches: only what it alone can
+  serve is withdrawn — its own slots' pieces and sessions on its tools, whose tokens end — and the rest stays for a
+  worker, its results kept for the resume. Before, every piece was withdrawn. `eval drop <run-dir>` withdraws the
+  rest.
+- *The run's own slots* lease as before, through serve's queue or the run's own broker. The run's own broker
+  (`OwnQueue`, no `--remote` or no serve) stays in memory: an `EvalSource` with no store, as in stage 1; nothing of it
+  outlives the run, and going away cancels everything.
+
+**What is not durable, and why.** A knowledge-base build's model calls (knode's extraction passes, the llm-wiki
+builder's sessions) are published like any piece, so each call out survives a restart of serve and its result waits
+for the build; but the build itself is the run's process, which publishes the next pass only once it has the one
+before. Across a restart of serve the build waits and goes on; across an exit of the run it resumes where its own
+checkpoints say (`eval-build-resume`), and the calls it asks again with the same content get the stored results
+(a call it asks with other content — a pass that depends on a different earlier answer — is a new piece). Its
+sessions that write (the llm-wiki builder) are the run's own slots' and are asked again. Pieces only the run can
+serve, and leases, are not durable by design.
+
+**Behaviour an existing run script feels.**
+
+- Stopping a `--remote` run (Ctrl-C, the wait limit) leaves its pieces that workers can do in serve: workers may
+  finish them while it is stopped, and a resume within a day (their deadline) collects them instead of asking again.
+  `eval drop <run-dir>` removes them, and the run's results in serve.
+- Running a run directory again after clearing its records gets the results serve kept for it (seven days), as
+  its reply cache would; `eval drop` first to ask again.
+- A restart of serve while a run waits loses nothing that was waiting or done; a piece a worker had out is done
+  again from the start by the next lease.
+- Nothing changes without `--remote` (the run's own broker).
+
+**Compatibility.** A run from stage 1 against this serve uses `/offer` as before (its piece is kept in the store
+while its request is open and dropped when it closes it); its random keys never meet. This run against a serve from
+stage 1 (no `tasks` in status) uses `/offer`, logs that pieces are one request each, and on stopping cancels its pieces
+as stage 1 did. A serve restarted onto stage 1 mid-run refuses `/tasks` with 404 and the run stops with that. Workers
+need no change: the lease protocol, tasks and outcomes are as they were (outcomes gain an optional `local`).
+
+**Not verified.** No restart of the live serve, no real worker on another machine (the tests' worker leases through
+the sources as `/remote/v1` does; the spawned-worker suite in `tests/remote-eval.test.ts` runs against the durable
+store), no model-backed run, no run large enough to meet the size bound, and no two serve processes as separate
+processes (two owners in one process and a dead owner's file are tested; the pid check across processes is read, not
+run).
+
+**What stage 3 now needs.** Durable pieces let a run die and come back; what still needs the run alive is what only
+it can serve: the knode tool host and its index (design 31 D4: on PostgreSQL serve could host a build's tools from
+its schema, and the sessions that call them stop waiting for the run), the run's own backends behind `eligible:
+local` pieces (stand-ins, chains, connections, replay), and the build's progress (its passes). So: (1) serve hosts a
+build's tools, (2) a run becomes a job in serve that holds its records' directory and its producer state (the
+occurrence counts above are the producer's state today), (3) `eval run` submits and follows it, (4) the judge and the
+run's own slots become serve's slots, bounded by `processing.maxLocalCalls` (§10). The store needs nothing more: a job
+is one more producer on the same channel.
 
