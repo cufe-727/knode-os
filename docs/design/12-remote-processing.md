@@ -205,7 +205,8 @@ processing is started, as embedding does now.
   nothing in memory, against 76 to 81 before any of this and 48 to 56 now. No server setting is involved, and
   none needs changing.
 
-  A search its caller narrowed to kinds or places (`kinds`, `sources`) is costed for itself (since 2026‑11‑16;
+  A search its caller narrowed — to kinds or places (`kinds`, `sources`), to a trust tier or an actor's reading
+  (`trust`, `actor`), or to a date (`asOf`) — is costed for itself (since 2026‑11‑16;
   `scopedRows`): the side is the caller's choice and may lie anywhere from the question, so the 2,000 rows a search
   of everything spends on a side are not its bound. A side of up to √(8 · k · chunks) chunks is ranked by reading
   its vectors (10,400 on the finance index for the 24 a search of 8 asks for), a larger one by walking the index on

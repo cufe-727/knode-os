@@ -568,7 +568,8 @@ export const SCOPED_ROWS_MAX = 20000;
 
 /**
  * The rows a side may cost in a search its caller narrowed (to kinds, to
- * places): a side of this many chunks at most is ranked by reading its
+ * places, to a trust tier or an actor, to a date): a side of this many chunks
+ * at most is ranked by reading its
  * vectors, and the index is walked on for a larger one for this many rows.
  *
  * A row read and a row walked cost about the same: on the finance copy
@@ -685,7 +686,8 @@ async function sideSizes(store: Store, sides: SideSql, cap: number, asOf?: TimeI
  * leaves none — walks on for the pages, as a search for sources does. A side
  * of `SIDE_ROWS_MAX` chunks at most is ranked by reading its vectors, exactly.
  *
- * A search its caller narrowed (to kinds, to places) is another matter: the
+ * A search its caller narrowed (to kinds, to places, to a trust tier or an
+ * actor's reading, to a date) is another matter: the
  * side is the caller's choice, and may lie anywhere from the question. Its
  * shared walk is of the nearest chunks the filter leaves; a side is read up
  * to `scopedRows` chunks and walked on for as many rows where it is larger
@@ -721,8 +723,11 @@ async function vectorSearch(
   const kinds = filter?.kinds;
   const wantsSources = !kinds || kinds.some((kind) => kind !== 'view');
   const wantsPages = !kinds || kinds.includes('view');
-  // a search its caller narrowed to kinds or to places may cost what finding those takes
-  const narrowed = Boolean(filter?.kinds || filter?.sources);
+  // A search its caller narrowed may cost what finding its side takes: narrowed to kinds or to places,
+  // to a trust tier or to what an actor may read, or to what was live at a date. Each leaves a part of
+  // the index that may lie anywhere from the question — a search as of a date whose live documents lay
+  // away from it was held to the 2,000 rows of a search of everything, and returned nothing.
+  const narrowed = Boolean(toIso(asOf)) || !isEmptyFilter(filter ?? NO_FILTER);
   const walkMax = narrowed ? scopedRows(k, await chunkTotal(store)) : SIDE_ROWS_MAX;
   const readMax = exactSide ?? walkMax;
   const held = await sideSizes(store, sides, readMax, asOf, filter);

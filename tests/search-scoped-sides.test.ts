@@ -125,6 +125,13 @@ describe.each(BACKENDS)('scoped searches on %s', (backend) => {
       );
     }
     await store.query(indexdef);
+    // raw/docs/far is the one folder a tracked import brought in, in 2020: a search as of 2021 sees it alone,
+    // and so does a search for trusted sources
+    await store.query(
+      `INSERT INTO scopes (id, kind, key, sha, status, applied_at, trust)
+       SELECT 'sc-' || id, 'doc', path, 'x', 'applied', '2020-01-01T00:00:00Z', 'trusted' FROM documents WHERE path LIKE 'raw/docs/far/%'`,
+    );
+    await store.query(`UPDATE documents SET scope_id = 'sc-' || id WHERE path LIKE 'raw/docs/far/%'`);
     await store.query(`ANALYZE`);
   }, 240_000);
 
@@ -280,6 +287,21 @@ describe.each(BACKENDS)('scoped searches on %s', (backend) => {
         expect((await partialOf(on, { sources: ['raw/docs/far'] }, AMONG_PAGES)).channels.vector?.partial).toBeUndefined();
       }
       expect((await partialOf(store, { sources: ['raw/docs/main'] }, AMONG_REPORTS)).channels.vector?.partial).toBeUndefined();
+    });
+
+    it('costs a search as of a date, for a trust tier or for an actor as it costs one narrowed to a folder', async () => {
+      // each leaves raw/docs/far alone, 2,500 chunks away from the question: more than a search of everything
+      // spends on a side, within what a narrowed one reads
+      const nearest = await exact('raw/docs/far', AMONG_PAGES, 8);
+      const base = { k: 8, track: false, current: false, queryVector: AMONG_PAGES };
+      for (const narrowing of [{ asOf: '2021-01-01T00:00:00Z' }, { filter: resolveScopeFilter({ trust: 'trusted' }) }, { filter: resolveScopeFilter({ actor: 'reader' }) }]) {
+        const results = await search(store, embedder, 'chunk', { ...base, mode: 'vector', ...narrowing });
+        expect(results.map((r) => r.chunkId)).toEqual(nearest);
+        // a hybrid search has its vector channel's 24 beside the others'
+        const hybrid = await searchExplained(store, embedder, 'chunk', { ...base, mode: 'hybrid', ...narrowing });
+        expect(hybrid.channels.vector).toMatchObject({ hits: 24 });
+        expect(hybrid.results).toHaveLength(8);
+      }
     });
 
     it('gives each side of a scoped search its candidates', async () => {
