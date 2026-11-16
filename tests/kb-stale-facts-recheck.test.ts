@@ -237,3 +237,38 @@ describe('a refine slice that fails', () => {
     expect(skipped?.map((s) => s.root)).toEqual(['丁项目', '丙项目', '乙项目', '甲项目'].sort((a, b) => (a < b ? -1 : 1)));
   });
 });
+
+describe('owner changes worded in ways the clause reading does not cover', () => {
+  const first: [string, string, string] = ['云业务由张三负责', '负责人', '张三'];
+  it.each([
+    ['原由张三负责的云业务现由李四负责', '李四'],
+    ['云业务负责人变更为李四', '李四'],
+    ['张三不再负责云业务，改由李四接手', '李四'],
+    ['李四接管了张三负责的云业务', '李四'],
+  ])('lands on the series of the thing it names: %s', async (later, value) => {
+    const ctx = await twoDocs(`worded-${later}`, '比亚迪', [first], [[later, '负责人', value]]);
+    expect(await currentStatements(ctx)).toEqual([later]);
+  });
+
+  it('reads an English owner line with "now" as the same thing', async () => {
+    const ctx = await twoDocs('worded-en', 'BYD', [['Cloud is owned by Zhang San', 'lead', 'Zhang San']], [['Cloud is now owned by Li Si', 'lead', 'Li Si']]);
+    expect(await currentStatements(ctx)).toEqual(['Cloud is now owned by Li Si']);
+  });
+
+  it('keeps two owners named together both current, and a later owner supersedes them both', async () => {
+    const ctx = await twoDocs('co-owners', '比亚迪', [['云业务由王五负责', '负责人', '王五']], [['张三、李四共同负责云业务', '负责人', '张三'], ['云业务由张三和李四共同负责', '负责人', '李四']]);
+    // two owners of one thing on one day: both current, neither supersedes the other
+    expect(await currentStatements(ctx)).toEqual(['张三、李四共同负责云业务', '云业务由张三和李四共同负责'].sort());
+  });
+
+  it('settles a reading on the one known thing the statement names, else leaves it', async () => {
+    const { settleSeriesObjects } = await import('../src/graph/claim-state.js');
+    const row = (statement: string, about: string, object = '') => ({ statement, about, object });
+    expect(settleSeriesObjects([row('云业务由张三负责', '云业务'), row('原由张三负责的云业务现由李四负责', '')])).toEqual(['~云业务', '~云业务']);
+    // an object a claim carries is a known thing too: the reading joins its series
+    expect(settleSeriesObjects([row('云业务由张三负责', '', 'cloud'), row('云业务改由李四负责', '云业务')], [{ key: 'cloud', names: ['云业务'] }])).toEqual(['cloud', 'cloud']);
+    // two known things named, or none: as read
+    expect(settleSeriesObjects([row('云业务由张三负责', '云业务'), row('电池业务由李四负责', '电池业务'), row('云业务和电池业务由王五负责', '')])).toEqual(['~云业务', '~电池业务', '']);
+    expect(settleSeriesObjects([row('云业务由张三负责', '云业务'), row('由李四负责', '')])).toEqual(['~云业务', '']);
+  });
+});

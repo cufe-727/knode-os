@@ -1,7 +1,7 @@
 import { breather } from '../pool.js';
 import { Store } from '../store/db.js';
 import { EvidenceAtRow, foldClaimEvidence, groupBy, toDateString, toIso } from '../store/temporal.js';
-import { CLAIM_STATE_VERSION, sameValue, seriesObject, statementObject, subjectSpellingsOf, unifyAttributeKeys } from './claim-state.js';
+import { CLAIM_STATE_VERSION, isTextKey, sameValue, seriesObject, settleSeriesObjects, statementObject, subjectSpellingsOf, unifyAttributeKeys } from './claim-state.js';
 import { packSubjectBatches } from './subject-batches.js';
 
 /**
@@ -207,10 +207,26 @@ export function seriesSupersession(series: StateRow[]): Map<string, string | nul
 
 /** The object part of a claim's series: its object (seriesObject), else what its owner or state statement is about. */
 export function seriesKeyObject(r: Pick<StateRow, 'attribute' | 'object_id' | 'object_name' | 'object_type' | 'value_text' | 'statement'>, spellings: readonly string[]): string {
-  const object = seriesObject(r.attribute, { id: r.object_id, name: r.object_name, type: r.object_type }, r.value_text);
-  if (object) return object;
-  const about = statementObject(r.statement ?? '', r.attribute, spellings, r.value_text);
-  return about ? `~${about}` : '';
+  return seriesKeyObjects([r], spellings)[0];
+}
+
+/**
+ * The object part of the series of each of one subject's claims: its object,
+ * else what its owner or state statement is about, settled against the
+ * things the subject's other claims are about (settleSeriesObjects).
+ */
+export function seriesKeyObjects(rows: readonly Pick<StateRow, 'attribute' | 'object_id' | 'object_name' | 'object_type' | 'value_text' | 'statement'>[], spellings: readonly string[]): string[] {
+  const read = rows.map((r) => {
+    const object = seriesObject(r.attribute, { id: r.object_id, name: r.object_name, type: r.object_type }, r.value_text);
+    return { statement: r.statement ?? '', object, about: object ? '' : statementObject(r.statement ?? '', r.attribute, spellings, r.value_text), text: isTextKey(r.attribute) };
+  });
+  const objects = rows.flatMap((r, i) => (read[i].object && r.object_name ? [{ key: read[i].object, names: [r.object_name] }] : []));
+  // only owner and state claims are read for what they are about
+  const owner = read.map((r, i) => i).filter((i) => read[i].text);
+  const settled = settleSeriesObjects(owner.map((i) => read[i]), objects);
+  const out = read.map((r) => r.object);
+  owner.forEach((i, k) => (out[i] = settled[k]));
+  return out;
 }
 
 /**
@@ -262,7 +278,12 @@ export async function supersedeByAttribute(store: Store, opts: { claimsPerBatch?
     );
     const spellings = new Map<string, string[]>();
     for (const n of names) (spellings.get(n.root) ?? spellings.set(n.root, []).get(n.root)!).push(n.name, ...(n.aliases ?? []));
-    for (const series of groupBy(rows, (r) => `${r.subject}\u0000${r.attribute}\u0000${seriesKeyObject(r, spellings.get(r.subject) ?? [])}\u0000${r.kind}`).values()) {
+    const keyOf = new Map<string, string>();
+    for (const [subject, list] of groupBy(rows, (r) => r.subject)) {
+      const keys = seriesKeyObjects(list, spellings.get(subject) ?? []);
+      list.forEach((r, i) => keyOf.set(r.id, keys[i]));
+    }
+    for (const series of groupBy(rows, (r) => `${r.subject}\u0000${r.attribute}\u0000${keyOf.get(r.id)}\u0000${r.kind}`).values()) {
       await pause();
       const want = seriesSupersession(series);
       for (const r of series) {

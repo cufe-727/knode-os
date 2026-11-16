@@ -93,7 +93,7 @@ export function seriesObject(attribute: string | null | undefined, object: Serie
 const KIND_WORDS = /^(?:风险|事故|故障|项目|公司|集团|系统|平台|团队|小组|部门|工程|方案|计划|risk|incident|project|company|the)+|(?:风险|事故|故障|项目|公司|集团|系统|平台|团队|小组|部门)+$/giu;
 
 /** Where an owner or a state is said, what stands before it is what the owner or state is of. */
-const OWNER_AT = /(?:改为|转为|仍然|依然|统一|继续|暂时|正式|后续|今后|改|现|交|转|仍|已|将|拟|均|暂){0,2}\s*(?:由|归)\s*[\p{Script=Han}A-Za-z·]{2,12}?\s*(?:负责|牵头|主导|跟进)|(?:的)?(?:负责人|牵头人|责任人|跟进人)\s*(?:为|是|：|:)|\b(?:is )?(?:led|owned|run) by\b|\b(?:lead|owner)\s+(?:is|was|:)/iu;
+const OWNER_AT = /(?:改为|转为|仍然|依然|统一|继续|暂时|正式|后续|今后|改|现|交|转|仍|已|将|拟|均|暂){0,2}\s*(?:由|归)\s*[\p{Script=Han}A-Za-z·]{2,12}?\s*(?:负责|牵头|主导|跟进)|(?:的)?(?:负责人|牵头人|责任人|跟进人)\s*(?:(?:变更|更换|调整|改|换|变)为|为|是|：|:)|\b(?:is )?(?:led|owned|run) by\b|\b(?:lead|owner)\s+(?:is|was|:)/iu;
 const STATE_AT = /(?:的)?(?:状态|阶段)\s*(?:为|是|：|:)|\b(?:status|stage|phase)\s+(?:is|was|:)/iu;
 
 /**
@@ -118,6 +118,7 @@ export function statementObject(statement: string, attribute: string | null | un
     if (active === null) return '';
     before = active;
   }
+  before = normalizeReading(before);
   // the subject written in the clause: what follows it is the thing ("比亚迪云业务由…"), what precedes it a lead
   // phrase ("经评审R-03状态为…"); a gloss in brackets is the subject's ("R-03（支付超时）")
   const named = lastSpelling(before, spellings);
@@ -130,8 +131,31 @@ export function statementObject(statement: string, attribute: string | null | un
   before = before.replace(DATE_WORDS, ' ').replace(/\s+/g, '').replace(LEADING_FUNCTION, '').replace(TRAILING_FUNCTION, '').replace(/^(?:的|之|其)+|(?:的|之)+$/u, '');
   // the kind word a name is written with ("风险R-54", "项目Orion") is not another thing
   before = before.replace(KIND_WORDS, '');
+  before = normalizeReading(before);
   if (/^(?:the|its|their)$/i.test(before)) return '';
   return before.length >= 2 ? fold(before) : '';
+}
+
+/**
+ * What is read, without the particles and adverbs around it that are not the
+ * thing: 了 / 的 before it, an adverb left alone ("原由张三负责的…" leaves "原"),
+ * "now" / "currently" and a trailing "is" ("Cloud is now owned by" → Cloud),
+ * and "张三负责的云业务" → 云业务.
+ */
+function normalizeReading(text: string): string {
+  let t = text.trim();
+  for (let prev = ''; prev !== t; ) {
+    prev = t;
+    t = t
+      .replace(/^(?:了|的)+/u, '')
+      // an adverb alone ("原" of "原由张三负责…"); not the first character of a name (现金业务)
+      .replace(/^(?:现|改|暂|原|仍|已|将|now|currently)$/iu, '')
+      .replace(/^(?:now|currently|still)\s+/i, '')
+      .replace(/\s+(?:is|was|are|were|now|currently|still|being|has been|have been)$/i, '')
+      .replace(/^[\p{Script=Han}A-Za-z·、和与及]{0,12}?(?:负责|主导|牵头|管理|主管|分管|跟进)的/u, '')
+      .trim();
+  }
+  return t;
 }
 
 /** A bracketed gloss: "R-03（支付超时）", "云业务(含海外)". */
@@ -143,7 +167,7 @@ const BRACKETED = /\([^()]*\)|\[[^\[\]]*\]|【[^【】]*】/gu;
 const LEAD_PHRASE = /^(?:(?:自|从|于)[^起]{0,16}?(?:起|开始)|经(?:过)?[\p{Script=Han}A-Za-z]{0,8}?(?:评审|审议|审批|批准|决定|决议|讨论|研究|协商|确认|同意|评估|复核|会议)(?:后|通过)?)/u;
 
 /** Verbs an owner takes a thing on with, written after the owner: "张三负责云业务", "李四接手电池业务". */
-const OWNER_VERB = /^\s*(?:将|已|仍|现|也|继续|正式|开始|改为|转为){0,2}\s*(?:负责|主导|牵头|跟进|接手|接管|分管|主管)(?![人方])/u;
+const OWNER_VERB = /^(?:\s*(?:、|和|与|及)\s*[\p{Script=Han}A-Za-z·]{2,4}?)*\s*(?:将|已|仍|现|也|继续|正式|开始|改为|转为|共同|一起|联合){0,2}\s*(?:负责|主导|牵头|跟进|接手|接管|分管|主管)(?![人方])/u;
 
 /** In the active voice, the clause after the owner's verb with its "…的工作" tail dropped; null when the owner is not written so. */
 function activeOwnerObject(text: string, valueText: string | null | undefined): string | null {
@@ -167,6 +191,56 @@ function lastSpelling(text: string, spellings: readonly string[]): { start: numb
     if (i >= 0 && (!best || i + sp.length > best.end)) best = { start: i, end: i + sp.length };
   }
   return best;
+}
+
+/** A claim as series identity reads it: the object it carries (seriesObject), else what its statement is about (statementObject). */
+export interface SeriesReading {
+  statement: string;
+  /** seriesObject's answer: an object id, or "". */
+  object: string;
+  /** statementObject's reading, when `object` is "". */
+  about: string;
+}
+
+/**
+ * The object part of each owner or state claim's series among one subject's
+ * claims, settled against the things that subject's claims are known to be
+ * about. Clause reading misses wordings ("原由张三负责的云业务现由李四负责",
+ * "张三不再负责云业务，改由李四接手"), and a claim read as about nothing, or as
+ * about something no other claim is about, would be a series of its own and
+ * leave two current owners. So such a claim goes to the series of the one
+ * known thing its statement names — an object another claim carries
+ * (`objects`: key and names) or a reading of another claim; the longest when
+ * one contains another. Two named, or none: as read ("" is the subject's own
+ * series: "由李四负责" says nothing of 云业务). A reading another claim shares,
+ * or the name of a carried object, is known already and stays.
+ * Returns "~reading", an object key, or "" for each row.
+ */
+export function settleSeriesObjects(rows: readonly SeriesReading[], objects: readonly { key: string; names: readonly string[] }[] = []): string[] {
+  const read = new Map<string, number>();
+  for (const r of rows) if (!r.object && r.about) read.set(r.about, (read.get(r.about) ?? 0) + 1);
+  const known: { key: string; name: string }[] = [
+    ...objects.flatMap((o) => o.names.map((n) => ({ key: o.key, name: fold(n.replace(/[（(][^）)]*[）)]$/u, '')) }))),
+    ...[...read.keys()].map((r) => ({ key: `~${r}`, name: r })),
+  ].filter((k) => k.name.length >= 2);
+  return rows.map((r) => {
+    if (r.object) return r.object;
+    const carried = [...new Set(known.filter((k) => !k.key.startsWith('~') && k.name === r.about).map((k) => k.key))];
+    if (r.about && carried.length === 1) return carried[0];
+    if (r.about && (read.get(r.about) ?? 0) >= 2) return `~${r.about}`;
+    const text = fold(r.statement).replace(/\s+/g, '');
+    const hits = known.filter((k) => k.name !== r.about && text.includes(k.name.replace(/\s+/g, '')));
+    const longest = hits.filter((h) => !hits.some((o) => o.name !== h.name && o.name.includes(h.name)));
+    const keys = [...new Set(longest.map((h) => h.key))];
+    if (keys.length === 1) return keys[0];
+    return r.about ? `~${r.about}` : '';
+  });
+}
+
+/** Whether a key is an owner or a state (its synonym head is 负责人, 状态, 阶段 …): such claims are read for what they are about. */
+export function isTextKey(attribute: string | null | undefined): boolean {
+  const head = attributeHead(attribute);
+  return !!head && TEXT_KEYS.has(head);
 }
 
 /** The head of a key's synonym group (跟进人 → 负责人), or the key. */
