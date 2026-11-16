@@ -104,6 +104,12 @@ const NOT_CHAINS: string[] = [
   '九哥是谁，他的持仓表现怎么样',
   '李想是谁？他对纯电怎么看',
   'Who is Jensen Huang? What did he say about China?',
+  // round three (2026-11-16): a ranking before the reference keeps its route; "its" after a who-opening is what the question named
+  '比亚迪去年营收最高的业务是什么，它的毛利率是多少？',
+  '平台组修复事故最多的工程师是谁，他今年调去哪了？',
+  'Who owns Instagram, and what is its revenue?',
+  'Which customer spent the most last year, and what is its CEO\'s name?',
+  'Which bank has the highest deposit rate, and is its app any good?',
 ];
 
 /** Real phrasing that does chain: the later clause asks about what the first part has to find. */
@@ -135,6 +141,12 @@ const CHAINS: string[] = [
   '谁是理想汽车的CFO？她之前在哪家公司任职？',
   '比亚迪的一位高管离职了，他去了哪里？',
   '有一名分析师上调了评级，他的理由是什么',
+  // round three (2026-11-16): a superlative that picks one partner of a named company describes what to find, not a ranking
+  '小鹏汽车最大的股东是谁？他还投资了哪些车企',
+  '比亚迪最大的客户是谁？它的CEO是谁',
+  'Who is the largest shareholder of Xpeng? What else does he invest in?',
+  '腾讯最大股东是谁，它还持有哪些公司',
+  'Which bank underwrote Arm\'s IPO, and who is its CEO?',
 ];
 
 describe('the chain rule on real phrasing', () => {
@@ -153,6 +165,9 @@ describe('the chain rule on real phrasing', () => {
       ['List all incidents in 2025. Who fixed them?', 'list'],
       ['Which bank has the highest deposit rate? Is that bank safe?', 'aggregate'],
       ['Which companies did Berkshire buy last year, and what did they pay?', 'list'],
+      ['比亚迪去年营收最高的业务是什么，它的毛利率是多少？', 'aggregate'],
+      ['平台组修复事故最多的工程师是谁，他今年调去哪了？', 'aggregate'],
+      ['Which customer spent the most last year, and what is its CEO\'s name?', 'aggregate'],
     ];
     for (const [q, kind] of expected) expect(classifyQuestion(q).kind, q).toBe(kind);
   });

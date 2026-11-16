@@ -108,6 +108,17 @@ const MULTIHOP = [
  */
 /** What an English indefinite or back-reference can stand for. */
 const EN_NOUN = '(?:person|engineer|employee|colleague|analyst|executive|founder|investor|partner|lawyer|doctor|project|team|customer|client|supplier|vendor|incident|risk|company|firm|bank|fund|agency|owner|manager|product)';
+/**
+ * The other side of a company's standing relation: "小鹏汽车最大的股东", "the
+ * largest shareholder of Xpeng". A superlative on one of these picks the one
+ * partner the documents name, not a ranking the question computes.
+ */
+const PARTNER_ROLE = '(?:股东|客户|供应商|买家|债权人|投资人|投资方|投资者|合作伙伴|合作方|竞争对手|对手|子公司|经销商|代工厂|承销商|持有人|重仓股)';
+const PARTNER_ROLE_EN = '(?:shareholders?|stockholders?|investors?|customers?|clients?|suppliers?|vendors?|creditors?|lenders?|partners?|competitors?|rivals?|subsidiar(?:y|ies)|backers?|holders?|holdings?|buyers?|underwriters?)';
+const PARTNER_SUPERLATIVE: [RegExp, string][] = [
+  [new RegExp(`最大(?:的)?(?:单一)?(${PARTNER_ROLE})`, 'g'), '的$1'],
+  [new RegExp(`\\b(?:largest|biggest|top)\\s+(${PARTNER_ROLE_EN})\\b`, 'gi'), '$1'],
+];
 const ENTITY_NOUN = '(?:人|工程师|同事|员工|负责人|项目|客户|甲方|供应商|事故|故障|隐患|风险|公司|企业|产品|团队|小组|组|部门|合同|订单)';
 
 /** Introducers that may stand anywhere in an earlier clause; an explicit back-reference may follow any of them. */
@@ -131,6 +142,8 @@ const CHAIN_OPENING = [
   new RegExp(`^\\s*(?:请问|那么|并且|而且|又|是|由)?\\s*(?:谁|哪(?:一)?[个位家名项件组](?!些)|有?(?<!第)[一另]\\s*(?:[位名家]|[起个项件]\\s*(?:[^，。？?；;、\\s]{0,12}?的)?${ENTITY_NOUN}))`),
   // "这家公司的创始人是谁，他…": the clause asks who or which one of something it describes (not "马斯克是谁？他…")
   /的[^，,。？?；;的]{0,10}是(?:谁|哪(?:一)?[个位家名])\s*[，,。？?；;：:—]?\s*$/,
+  // "腾讯最大股东是谁，它…": the one partner a superlative picks
+  new RegExp(`最大(?:的)?(?:单一)?${PARTNER_ROLE}是(?:谁|哪(?:一)?[个位家名])\\s*[，,。？?；;：:—]?\\s*$`),
   // "收购了华为荣耀的那家公司，它…": the clause is a described thing and nothing else
   /的那(?:一)?[个位家起项名件只][^，,。？?；;的什么谁哪吗呢怎如多几]{0,6}\s*[，,—]?\s*$/,
 ];
@@ -139,6 +152,10 @@ const CHAIN_OPENING = [
 const CHAIN_OPENING_EN = [
   new RegExp(`^\\s*(?:and\\s+|then\\s+|so\\s+)?(?:who(?:m)?\\b(?!\\s+(?:are|were)\\b)|which\\s+(?!\\w+s\\b)\\w+|(?:a|an|another|one)\\s+(?:[\\w-]+\\s+)?${EN_NOUN}\\b)`, 'i'),
 ];
+
+/** An English opening that asks which one thing ("Which bank underwrote…", "A fund bought…"): a later "its" stands for it, where after "who" it is what the question named. */
+const CHAIN_OPENING_EN_THING = new RegExp(`^\\s*(?:and\\s+|then\\s+|so\\s+)?(?:which\\s+(?!\\w+s\\b)\\w+|(?:a|an|another|one)\\s+(?:[\\w-]+\\s+)?${EN_NOUN}\\b)`, 'i');
+const CHAIN_THING_PRONOUN_EN = /\bits\b/i;
 
 /** A reference back that names what it refers to as one thing: needs an introducer in an earlier clause. */
 const CHAIN_BACK = [
@@ -186,6 +203,7 @@ function chainAt(question: string): number {
   let introduced = false;
   let asked = false;
   let askedWho = false;
+  let askedThing = false;
   for (let i = 0; i < starts.length; i++) {
     const at = starts[i];
     const clause = question.slice(at, starts[i + 1] ?? question.length);
@@ -193,6 +211,7 @@ function chainAt(question: string): number {
       const back = (introduced && CHAIN_BACK.some((re) => re.test(clause)))
         || (asked && CHAIN_PRONOUN.some((re) => re.test(clause)))
         || (askedWho && CHAIN_PERSON_PRONOUN.some((re) => re.test(clause)))
+        || (askedThing && CHAIN_THING_PRONOUN_EN.test(clause))
         || [...labels].some((l) => clause.includes(l));
       if (back) return at;
     }
@@ -200,6 +219,7 @@ function chainAt(question: string): number {
     const sentence = i === 0 || /[。？?！!；;\n]\s*$|\.\s+$/.test(question.slice(Math.max(0, at - 3), at));
     if (CHAIN_INTRO.some((re) => re.test(clause))) introduced = true;
     if (CHAIN_OPENING.some((re) => re.test(clause)) || (sentence && !NAMED_WHO_EN.test(clause) && CHAIN_OPENING_EN.some((re) => re.test(clause)))) asked = true;
+    if (sentence && CHAIN_OPENING_EN_THING.test(clause)) askedThing = true;
     if (CHAIN_ASKS_WHO.some((re) => re.test(clause)) && !NAMED_WHO.test(clause)) askedWho = true;
     for (const m of clause.matchAll(CHAIN_LABEL)) labels.add(m[1]);
   }
@@ -214,6 +234,7 @@ const COMPARISON = [
 
 /** A count, a list or a comparison: what finds the thing without a walk (the aggregate and list routes, or the names given). */
 function countsOrLists(text: string): boolean {
+  for (const [re, role] of PARTNER_SUPERLATIVE) text = text.replace(re, role);
   return AGGREGATE.some((re) => re.test(text)) || isListQuestion(text) || COMPARISON.some((re) => re.test(text));
 }
 
