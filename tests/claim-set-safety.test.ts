@@ -1,14 +1,14 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { defaultConfig, KnodeConfig } from '../src/config.js';
 import { tier0Known } from '../src/graph/concepts.js';
 import { entityKeyKinds } from '../src/graph/normalize.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
 import type { ChatMessage, LlmClient } from '../src/llm/client.js';
 import { ask } from '../src/search/ask.js';
-import { computeClaimSet, documentOwners, readSetQuestion, SET_BLOCK_CHARS } from '../src/search/claimset.js';
+import { computeClaimSet, documentOwners, readSetQuestion, SET_BLOCK_CHARS, todayIso } from '../src/search/claimset.js';
 import { classifyQuestion } from '../src/search/route.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
 
@@ -289,6 +289,32 @@ describe('bounded work: SQL over indexes and a time budget (review item 5)', () 
     const s = await computeClaimSet(spied, q, classifyQuestion(q), ['catl'], { now: '2026-11-16', budgetMs: 60_000 });
     expect(s!.lines.filter((l) => l.startsWith('- ')).map((l) => l.slice(2).split(' ')[0])).toEqual(['王强']);
     expect(most).toBeLessThan(20000);
+  });
+
+  it('stops within its budget while statements are still slow, rather than after them', async () => {
+    const query = store.query.bind(store);
+    const slow = Object.assign(Object.create(Object.getPrototypeOf(store)), store, {
+      query: async <T>(sql: string, p?: unknown[]) => { await new Promise((r) => setTimeout(r, 300)); return query<T>(sql, p); },
+    }) as Store;
+    let why = '';
+    const t = Date.now();
+    const s = await computeClaimSet(slow, '宁德时代有哪些客户？', classifyQuestion('宁德时代有哪些客户？'), ['catl'], { budgetMs: 500, skipped: (w) => { why = w; } });
+    expect(s).toBeNull();
+    expect(why).toBe('over its time budget');
+    // it stops waiting on the statement under way when the budget runs out: well before a dozen statements at 300 ms
+    expect(Date.now() - t).toBeLessThan(900);
+  });
+
+  it('reads today in the local time zone', () => {
+    const tz = process.env.TZ;
+    process.env.TZ = 'Asia/Shanghai';
+    vi.useFakeTimers({ now: new Date('2025-12-31T18:00:00Z') }); // 2026-01-01 02:00 in Shanghai
+    try {
+      expect(todayIso()).toBe('2026-01-01');
+    } finally {
+      vi.useRealTimers();
+      if (tz === undefined) delete process.env.TZ; else process.env.TZ = tz;
+    }
   });
 
   it('computes nothing once its time budget is spent', async () => {

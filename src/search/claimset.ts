@@ -148,7 +148,11 @@ const ASKING_WORDS = new RegExp([
   '\\b(?:which|what|who|how many|how much|list|every|all|each|per|by|the|a|an|of|in|on|at|as of|was|were|is|are|did|does|do|has|have|had|to|for|and|or|this year|company-wide)\\b',
 ].join('|'), 'gi');
 
-const todayIso = () => new Date().toISOString().slice(0, 10);
+/** Today in the local time zone (YYYY-MM-DD): a question asked on 1 January in Shanghai is not asked on 31 December. */
+export const todayIso = () => {
+  const t = new Date();
+  return `${t.getFullYear()}-${pad(t.getMonth() + 1)}-${pad(t.getDate())}`;
+};
 const lastDay = (y: number, m: number) => new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
 const span = (y: number, m1: number, m2: number, text: string) => ({ from: `${y}-${pad(m1)}-01`, to: lastDay(y, m2), text });
 
@@ -673,7 +677,47 @@ function matchAttributes(keys: Set<string>, rest: string): Set<string> {
  * question asks for none, names no scope and no company, or none of its words
  * reach a claim of the scope.
  */
+/** The time budget ran out while a statement was under way. */
+class BudgetSpent extends Error {}
+
+/**
+ * The store as a computed set reads it: a statement still under way when the deadline passes is no longer waited
+ * for (the computation ends, nothing computed). An embedded database finishes it on its own; a server's pool goes on.
+ */
+function withDeadline(store: Store, deadline: number): Store {
+  const query = async <T>(sql: string, params?: unknown[]): Promise<T[]> => {
+    const left = deadline - Date.now();
+    if (left <= 0) throw new BudgetSpent();
+    const running = store.query<T>(sql, params);
+    running.catch(() => undefined); // abandoned past the deadline, it must not fail unheard
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([running, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new BudgetSpent()), left); })]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  return Object.assign(Object.create(store) as Store, { query });
+}
+
 export async function computeClaimSet(
+  store: Store,
+  question: string,
+  routed: Pick<QuestionRoute, 'kind' | 'range'>,
+  named: string[],
+  opts: Parameters<typeof computeWithin>[4] = {},
+): Promise<ComputedSet | null> {
+  const budget = opts.budgetMs ?? SET_BUDGET_MS;
+  try {
+    return await computeWithin(withDeadline(store, Date.now() + budget), question, routed, named, opts);
+  } catch (err) {
+    if (!(err instanceof BudgetSpent)) throw err;
+    opts.skipped?.('over its time budget');
+    return null;
+  }
+}
+
+async function computeWithin(
   store: Store,
   question: string,
   routed: Pick<QuestionRoute, 'kind' | 'range'>,
@@ -888,15 +932,21 @@ export async function computeClaimSet(
     return (!from || d >= from) && (!to || d <= to);
   };
 
-  // every source of a claim, its merged members' included
-  const sourceRows = await store.query<{ id: string; key: string }>(
-    `SELECT DISTINCT COALESCE(c.canonical_id, c.id) AS id, s.key
-     FROM claims c
-     JOIN evidence ev ON ev.kind = 'claim' AND ev.target_id = c.id AND ev.tx_to IS NULL
-     JOIN scopes s ON s.id = ev.scope_id AND s.kind = ANY($2::text[])
-     WHERE c.id = ANY($1::text[]) OR c.canonical_id = ANY($1::text[]) ORDER BY 2`,
-    [matched.map((c) => c.id), SOURCE_SCOPES],
+  // every source of a claim, its merged members' included: indexed steps over id arrays (an OR over the claim and its
+  // members kept the planner off both indexes)
+  const matchedIds = matched.map((c) => c.id);
+  const mergedIn = await store.query<{ id: string; canonical_id: string }>(`SELECT id, canonical_id FROM claims WHERE canonical_id = ANY($1::text[])`, [matchedIds]);
+  const repOf = new Map<string, string>([...matchedIds.map((id) => [id, id] as [string, string]), ...mergedIn.map((r) => [r.id, r.canonical_id] as [string, string])]);
+  const evRows = await store.query<{ target_id: string; scope_id: string }>(
+    `SELECT DISTINCT target_id, scope_id FROM evidence WHERE kind = 'claim' AND tx_to IS NULL AND target_id = ANY($1::text[])`, [[...repOf.keys()]],
   );
+  const scopeKeys = new Map((await store.query<{ id: string; key: string }>(
+    `SELECT id, key FROM scopes WHERE id = ANY($1::text[]) AND kind = ANY($2::text[])`, [[...new Set(evRows.map((r) => r.scope_id))], SOURCE_SCOPES],
+  )).map((r) => [r.id, r.key]));
+  const sourceRows = [...new Map(evRows.filter((r) => scopeKeys.has(r.scope_id)).map((r) => {
+    const row = { id: repOf.get(r.target_id)!, key: scopeKeys.get(r.scope_id)! };
+    return [`${row.id}|${row.key}`, row] as const;
+  })).values()].sort((a, b) => a.key.localeCompare(b.key));
   const sources = new Map<string, string[]>();
   for (const r of sourceRows) (sources.get(r.id) ?? sources.set(r.id, []).get(r.id)!).push(r.key);
   await learn(sourceRows.map((r) => r.key));
