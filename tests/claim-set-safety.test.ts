@@ -193,6 +193,22 @@ describe('nothing computed when what is asked is not tied to the claims with con
   });
 });
 
+describe('merged spellings are their survivor (review item 3)', () => {
+  it('never lists a merged spelling of the scope as an item, and finds what was filed under it', async () => {
+    // namedEntities gives the survivor and every spelling merged into it
+    const s = await set('宁德时代有哪些客户？', ['catl', 'catl-v']);
+    const items = s!.lines.filter((l) => l.startsWith('- ')).map((l) => l.slice(2).split(' ')[0]);
+    expect(items).not.toContain('CATL');
+    // "比亚迪是CATL的客户" names the merged spelling, in a document of its own
+    expect(items.sort()).toEqual(['宝马', '比亚迪', '特斯拉']);
+    expect(s!.scope).toBe('宁德时代');
+  });
+
+  it('takes no merged spelling for what the question asks about', async () => {
+    expect(await set('How many ways could this go wrong for 宁德时代?', ['catl', 'catl-v'])).toBeNull();
+  });
+});
+
 describe('the switches', () => {
   it('computes no set unless the workspace or the call turns computed sets on', async () => {
     const q = '宁德时代有哪些客户？';

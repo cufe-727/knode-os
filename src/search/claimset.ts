@@ -358,6 +358,35 @@ const fmt = (n: number) => String(Number(n.toFixed(6)));
 /** Dated first, oldest first; undated last. */
 const byDate = (a: string | null, b: string | null) => (a && b ? a.localeCompare(b) : a ? -1 : b ? 1 : 0);
 
+/** Merge levels followed at most from a spelling to its survivor. */
+const MERGE_DEPTH = 4;
+
+/** Each id's survivor: the entity it was merged into, followed to the end (itself when it was not merged). */
+async function survivorsOf(store: Store, ids: string[]): Promise<Map<string, string>> {
+  const out = new Map(ids.map((id) => [id, id]));
+  let open = [...new Set(ids)];
+  for (let i = 0; i < MERGE_DEPTH && open.length; i++) {
+    const rows = await store.query<{ id: string; canonical_id: string }>(`SELECT id, canonical_id FROM entities WHERE id = ANY($1::text[]) AND canonical_id IS NOT NULL`, [open]);
+    if (rows.length === 0) break;
+    const step = new Map(rows.map((r) => [r.id, r.canonical_id]));
+    for (const [id, at] of out) if (step.has(at)) out.set(id, step.get(at)!);
+    open = [...new Set(rows.map((r) => r.canonical_id))];
+  }
+  return out;
+}
+
+/** The survivors and every spelling merged into them, at any depth. */
+async function spellingsOf(store: Store, survivors: string[]): Promise<string[]> {
+  const all = new Set(survivors);
+  let open = [...all];
+  for (let i = 0; i < MERGE_DEPTH && open.length; i++) {
+    const rows = await store.query<{ id: string }>(`SELECT id FROM entities WHERE canonical_id = ANY($1::text[])`, [open]);
+    open = rows.map((r) => r.id).filter((id) => !all.has(id));
+    for (const id of open) all.add(id);
+  }
+  return [...all];
+}
+
 /**
  * The organisations a question's named entities scope it to, each with its
  * members: the named organisations, less one that holds another named one
@@ -423,7 +452,7 @@ async function docsOf(store: Store, paths: string[]): Promise<Map<string, DocInf
        ev AS MATERIALIZED (
          SELECT sc.key, ev.target_id FROM evidence ev JOIN sc ON sc.id = ev.scope_id WHERE ev.kind = 'claim' AND ev.tx_to IS NULL
        ), per AS (
-         SELECT ev.key AS path, cl.subject_id AS org, count(*) AS n
+         SELECT ev.key AS path, COALESCE(e.canonical_id, e.id) AS org, count(*) AS n
          FROM ev
          JOIN claims cl ON cl.id = ev.target_id AND cl.tx_to IS NULL AND cl.canonical_id IS NULL
          JOIN entities e ON e.id = cl.subject_id AND e.type = 'organization'
@@ -480,10 +509,13 @@ export async function computeClaimSet(
   if (!read) return null;
   const typed = await typedColumns(store);
   if (!typed.attribute || !typed.effective) return null; // a store before claim state: nothing to compute over
+  // a merged spelling is its survivor: as scope, as what is asked about, and as the subject of a claim filed under it
+  const survivorOf = await survivorsOf(store, named);
+  named = [...new Set(named.map((id) => survivorOf.get(id) ?? id))];
   const { roots, members, parent } = await scopeOf(store, named);
   if (roots.length === 0 && !read.company) return null;
 
-  const memberIds = [...members.keys()];
+  const memberIds = await spellingsOf(store, [...members.keys()]);
   const scoped = roots.length > 0;
   const docs = new Map<string, DocInfo>();
   const learn = async (paths: string[]) => {
@@ -509,7 +541,8 @@ export async function computeClaimSet(
   // the scope is what the question asks about ("T1-C1", "R-01")
   const scopeNamed = named.filter((id) => members.has(id) || [...members.keys()].some((m) => parent.get(m) === id) || [...parent.values()].includes(id));
   const namedWhat = new Set(named.filter((id) => !scopeNamed.includes(id)));
-  const surfaces = scopeNamed.length ? await store.query<{ name: string; aliases: unknown }>(`SELECT name, aliases FROM entities WHERE id = ANY($1::text[])`, [scopeNamed]) : [];
+  // every spelling of the scope is its name ("CATL有哪些客户" names 宁德时代's merged spelling)
+  const surfaces = scopeNamed.length ? await store.query<{ name: string; aliases: unknown }>(`SELECT name, aliases FROM entities WHERE id = ANY($1::text[])`, [await spellingsOf(store, scopeNamed)]) : [];
   const names = surfaces.flatMap((e) => [e.name, ...(Array.isArray(e.aliases) ? e.aliases.filter((a): a is string => typeof a === 'string') : [])])
     .filter((n) => n.length >= 2 && !CODE.test(n)).sort((a, b) => b.length - a.length);
   let rest = read.rest;
@@ -517,11 +550,13 @@ export async function computeClaimSet(
   rest = rest.replace(/\s+/g, ' ').trim();
 
   const col = (role: 'attribute' | 'valueNum' | 'valueText' | 'unit' | 'effective', cast: string) => (typed[role] ? `cl.${typed[role]}::${cast}` : `NULL::${cast}`);
-  const select = `SELECT cl.id, cl.subject_id, se.name AS subject, se.type AS subject_type, cl.object_id, oe.name AS object, oe.type AS object_type,
+  const select = `SELECT cl.id, COALESCE(sv.id, se.id) AS subject_id, COALESCE(sv.name, se.name) AS subject, COALESCE(sv.type, se.type) AS subject_type,
+            COALESCE(ov.id, oe.id) AS object_id, COALESCE(ov.name, oe.name) AS object, COALESCE(ov.type, oe.type) AS object_type,
             cl.statement, ${col('attribute', 'text')} AS attribute, ${col('valueNum', 'float8')} AS value_num, ${col('valueText', 'text')} AS value_text,
             ${col('unit', 'text')} AS unit, COALESCE(${col('effective', 'timestamptz')}, cl.event_at, cl.valid_from) AS eff,
             cl.superseded_by, cl.correction, cl.kind, cl.status, cl.valid_from, cl.valid_to
-     FROM claims cl JOIN entities se ON se.id = cl.subject_id LEFT JOIN entities oe ON oe.id = cl.object_id`;
+     FROM claims cl JOIN entities se ON se.id = cl.subject_id LEFT JOIN entities sv ON sv.id = se.canonical_id
+     LEFT JOIN entities oe ON oe.id = cl.object_id LEFT JOIN entities ov ON ov.id = oe.canonical_id`;
   let cands: Cand[];
   let matchedAttrs: Set<string>;
   if (scoped) {
