@@ -191,6 +191,20 @@ describe('the second round', () => {
     expect(r).toBeNull();
   });
 
+  it('reads no word statistics while the keyword index is not ready: no scan of every passage', async () => {
+    const seen: string[] = [];
+    const query = store.query.bind(store);
+    const notReady = Object.assign(Object.create(Object.getPrototypeOf(store)), store, {
+      matchIndexes: new Set<string>(),
+      query: async <T>(sql: string, p?: unknown[]) => { seen.push(sql); return query<T>(sql, p); },
+    }) as Store;
+    const r = await secondRound(notReady, 'What was the budget of Orion?', {
+      named: ['orion'], contexts: [result('orion-2', 'Orion launched in week 32.')], facts: [], chain: false,
+    });
+    expect(r).toBeNull();
+    expect(seen.some((sql) => /lower\(c\.content\)|FROM chunks c WHERE/i.test(sql))).toBe(false);
+  });
+
   it('gives an ordinary lookup whose passages hold its words no round, however its words split into pairs', async () => {
     const r = await secondRound(store, 'Orion三季度毛利率是多少？', {
       named: ['orion'], contexts: [result('orion-2', 'Orion第三季度的毛利率为24%')], facts: [], chain: false,

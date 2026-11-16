@@ -1,6 +1,7 @@
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { SearchResult } from '../types.js';
 import { factsForQuestion, QuestionFact } from './facts.js';
+import { matchIndexReady, termGrams } from '../store/grams.js';
 import { chunksForTerms, CJK_QUERY_STOP, keywordTerms, LATIN_QUERY_STOP, termCount, termStats } from './search.js';
 
 /** The keyword index's cap on a term's passages (search.ts): a word in this many is no word that narrows. */
@@ -181,11 +182,14 @@ export async function secondRound(
   const said = questionWords(question).filter((t) => !names.join(' ').toLowerCase().includes(t));
   let asked0: string[] = [];
   let missing: string[] = [];
-  if (said.length) {
+  // only off the keyword index: while it is still building (or for a word it holds no grams of) the statistics would
+  // be a scan of every passage — seconds a question at half a million chunks — so no word counts as missing then
+  const indexed = matchIndexReady(store, 'chunks') ? said.filter((t) => termGrams(t).length > 0) : [];
+  if (indexed.length) {
     const unheld = missingTerms(question, names, text);
     statements++;
-    const { df } = await termStats(store, said).catch(() => ({ df: said.map(() => 0) }));
-    const retrievable = new Set(said.filter((_, i) => df[i] > 0 && df[i] < KEYWORD_DF_CAP));
+    const { df } = await termStats(store, indexed).catch(() => ({ df: indexed.map(() => 0) }));
+    const retrievable = new Set(indexed.filter((_, i) => df[i] > 0 && df[i] < KEYWORD_DF_CAP));
     asked0 = said.filter((t) => retrievable.has(t));
     missing = unheld.filter((t) => retrievable.has(t));
   }
