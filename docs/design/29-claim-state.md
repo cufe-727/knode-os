@@ -367,3 +367,80 @@ What the measurement showed and this branch does not change:
 - The backfill needs 23 nights at 50,000 claims; after it 202,886 claims carry an attribute and 43,881 are superseded.
 - The entity audit reads every entity in each review (0.45 GB for a moment); the wiki lint holds the event loop for
   4 to 15 s, the views for 2 to 4 s.
+
+## 9. The 10× fixes after review (2026‑11‑16, branch `claude/kb-stale-facts-review`)
+
+The 10× benchmark fixes merged in main 7a299bf were reviewed against real
+finance text and several of their rules were fitted to the weekly reports.
+What the rules are now:
+
+- **Series identity.** A series is one attribute of one thing: subject, the
+  attribute's canonical key, the object, kind. The object is left out only
+  where it is not a thing the attribute belongs to: it is the value itself
+  (负责人 = 廖欣 with 廖欣 as object), or a person named on a 状态 / 阶段 line
+  (who handles it). The duplicate audit settles two claims as `same` by rule
+  only toward one object (`seriesObject`, `seriesRelation`).
+- **Key unification.** Two keys of one unit and the same qualifiers are one
+  only when a synonym group holds both, when they differ by 的 / spaces / a
+  neutral last word (数, 数量, 水平; the change word after 环比 / 同比), or when
+  both name the subject: its name without a split's suffix, a tail of it, its
+  code, the aliases of an entity named by a code, and 配置值 / 取值 only for a
+  subject that carries a code. Containment, bigram similarity and a shared
+  head word no longer join keys (股价 / 基准情景终点股价, 零售价格 / 批发价格).
+  The canonical key is chosen by rule: the synonym head, else the subject's
+  name, else the shortest key. On 484 finance subjects with two or more keys
+  this joins 11 keys (main's rule joined 176).
+- **Identifiers.** Only identifiers of one numbered series (letters, a
+  separator, a counter: INC-001-T1, R-07, GPT-4) are kept apart; codes that
+  run letters into digits (H100, CU2501, FY24) and a prefix in front
+  (vivoX100, SHFE.CU2501) are not. A series identifier resolves by itself
+  alone, and an entity named by one is reached only by an identifier it
+  answers to. Refine merges an entity named only by a code into the one
+  entity that answers to it (the split part labelled with it, else the single
+  carrier of the code as an alias), in either identity mode.
+- **Back-references** (`src/graph/backrefs.ts`) are off unless
+  `review.backReferences` lists periodic-report folders (`periodic`) or asks to
+  `detect` series; only claims that state a fix take part, only an
+  identified, unfixed event of the previous report is linked, and the run is
+  incremental. A link is a child scope of the scope carrying the fix claim:
+  disposed with that document, with its trust and acl, its document and
+  passage as the relation's source.
+
+10× benchmark, fresh no-model rebuild + refine's model-free steps
+(`review.identity: "context"`; link step with the reports folder marked, or
+with `detect`, same result): settings whose current value is the script's
+50 of 90 (65 with the head-word rule, which the review showed joins different
+measures on real text), risk state 120 of 120, risk owner 120 of 120,
+incidents with an entity of their own 210 of 210, fix claims crediting
+another person 0, id-less fixes linked 74 of 75 with 0 wrong links, stated
+renames one entity 25 of 25, series with more than one current value 58 of
+1,066 (all with an undated monthly-summary value).
+
+### What an existing workspace sees, without anyone asking
+
+**At its next ingest** (a document added, changed or removed):
+- Mentions in the documents applied are resolved by the identifier rules
+  above. Entities already written are not touched: an incident merged into
+  another before the upgrade stays merged until its documents are applied
+  again (a re-extraction or `sync --reapply`).
+- Supersession and attribute keys are refreshed for the subjects the pass
+  touched (`supersedeForClaims`), with the new series identity and keys.
+- A removed or replaced document takes its back-reference links with it.
+- No back-reference link is made: the step runs in refine only, and only if
+  the workspace set `review.backReferences`.
+
+**At its next refine** (the nightly pass, or `knode-os refine`):
+- `claim_attribute_keys` is rewritten whole by the new rule. Stored keys move
+  through the mapping; no claim is read again and `CLAIM_STATE_VERSION` is
+  unchanged. Keys main had joined by containment or bigrams fall apart again
+  (on finance: 176 joins become 11), so some series split into the measures
+  they were.
+- Supersession is marked again over every series: owners and states toward
+  different objects become current side by side again; owners and states
+  read under 跟进人 / 风险状态 / 处理状态 join their 负责人 / 状态 series.
+- An entity named only by a code merges into the one entity that answers to
+  that code, if there is exactly one (reversible, logged with its reason; not
+  made again after a person undoes it). In a workspace on `"name"` this is new.
+- The back-reference step does nothing unless `review.backReferences` is set.
+  With it set, its first run reads every document (no cursor yet), later runs
+  only what was applied since.
