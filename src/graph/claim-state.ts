@@ -37,7 +37,7 @@ const ATTRIBUTE_SYNONYMS: readonly string[][] = [
   ['headcount', 'staff', 'team size', 'staff count', 'employees'],
   ['负责人', '负责', '主负责人', '牵头人', '项目负责人', '责任人', '跟进人', '跟进负责人', 'owner'],
   ['lead', 'owner', 'project lead'],
-  ['状态', '现状', '当前状态', '项目状态'],
+  ['状态', '现状', '当前状态', '项目状态', '风险状态', '事故状态', '处理状态', '跟进状态'],
   ['status', 'state'],
   ['阶段', '当前阶段', '所处阶段'],
   ['stage', 'phase'],
@@ -407,8 +407,10 @@ function neutralKey(key: string): string {
  * 基准情景终点股价, 首席执行官 / 临时首席执行官), and two keys of one head word
  * are two measures (批发价格 / 零售价格). The relation is closed transitively,
  * so the order keys come in decides nothing, and a group's canonical key is
- * chosen by rule, not by count: the subject's own name, else the shortest key
- * (ties: code-point order).
+ * chosen by rule, not by count: its synonym head (负责人, 状态, 级别), else the
+ * subject's own name, else the shortest key (ties: code-point order). A key
+ * alone is mapped to its synonym head too, so stored keys of an older reading
+ * (跟进人) move with the mapping, without re-reading their claims.
  * Returns key → canonical key, with the reason, for keys that change.
  */
 export function unifyAttributeKeys(uses: AttributeUse[], spellings: readonly string[] = []): Map<string, { canonical: string; reason: string }> {
@@ -444,9 +446,10 @@ export function unifyAttributeKeys(uses: AttributeUse[], spellings: readonly str
   const out = new Map<string, { canonical: string; reason: string }>();
   for (const members of groups.values()) {
     const keys = members.map((i) => info[i]);
+    const head = keys.find((k) => k.synonym)?.synonym;
     const named = keys.find((k) => own.includes(fold(k.use.attribute)))?.use.attribute;
     const shortest = [...keys].sort((a, b) => a.use.attribute.length - b.use.attribute.length || (a.use.attribute < b.use.attribute ? -1 : 1))[0].use.attribute;
-    const canonical = named ?? shortest;
+    const canonical = head ?? named ?? shortest;
     for (const i of members) {
       const k = info[i];
       if (k.use.attribute === canonical) continue;

@@ -144,3 +144,33 @@ describe('attribute keys of real subjects', () => {
     expect(await pairs([['阈值', 1, '毫秒'], ['超时阈值', 1, '毫秒'], ['配置值', 1, '毫秒']], 'T1-C3', ['核心接口超时阈值', '超时线'])).toEqual(['超时阈值→阈值', '配置值→阈值']);
   });
 });
+
+describe('stored keys of an older reading', () => {
+  it('move to their synonym head through the key mapping, and the owner rule applies to them', async () => {
+    const ctx = await workspace('stored-keys', {
+      'raw/docs/a.md': dated('周报1', '2025-03-10', `entities:
+  - { name: R-07, type: event }
+  - { name: 赖艳, type: person }
+claims:
+  - { subject: R-07, object: 赖艳, statement: R-07由赖艳负责, type: risk }
+`),
+      'raw/docs/b.md': dated('周报2', '2025-03-17', `entities:
+  - { name: R-07, type: event }
+  - { name: 钱博, type: person }
+claims:
+  - { subject: R-07, object: 钱博, statement: R-07由钱博负责, type: risk }
+`),
+    });
+    await refreshClaimState(ctx.store);
+    // as a workspace read before 跟进人 was a synonym of 负责人 holds them: the claims themselves are not read again
+    await ctx.store.query(`UPDATE claims SET attribute = '跟进人', superseded_by = NULL WHERE tx_to IS NULL AND attribute = '负责人'`);
+    const { refreshAttributeKeys } = await import('../src/graph/claim-state-store.js');
+    const { markSupersededClaims } = await import('../src/wiki/refine.js');
+    await refreshAttributeKeys(ctx.store);
+    await markSupersededClaims(ctx.store);
+    const keys = await ctx.store.query<{ attribute: string; canonical: string }>(`SELECT attribute, canonical FROM claim_attribute_keys`);
+    expect(keys).toEqual([{ attribute: '跟进人', canonical: '负责人' }]);
+    const current = await ctx.store.query<{ statement: string }>(`SELECT statement FROM claims WHERE tx_to IS NULL AND attribute = '跟进人' AND superseded_by IS NULL`);
+    expect(current.map((r) => r.statement)).toEqual(['R-07由钱博负责']);
+  });
+});

@@ -111,7 +111,6 @@ export async function refreshAttributeKeys(store: Store, opts: { subjects?: stri
     const keys = [...groupBy(list, (u) => u.attribute).entries()].map(([attribute, rows]) => ({
       attribute, count: rows.reduce((n, r) => n + r.n, 0), units: [...new Set(rows.flatMap((r) => r.units))],
     }));
-    if (keys.length < 2) continue;
     const map = unifyAttributeKeys(keys, spellings.get(root) ?? []);
     for (const u of list) {
       const m = map.get(u.attribute);

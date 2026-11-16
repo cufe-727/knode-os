@@ -109,13 +109,17 @@ describe('reading a claim as attribute + value', () => {
     expect(m.get('初始对账批次间隔')?.canonical).toBe('初始间隔');
   });
 
-  it('reads a severity as one key however it is called', () => {
+  it('reads a severity as one key however it is called, and names a group by its synonym head', () => {
     expect(normalizeAttribute('事故等级')).toBe('级别');
     const m = unifyAttributeKeys([
       { attribute: '事故级别', count: 3, units: [''] },
       { attribute: '事故等级', count: 2, units: [''] },
     ]);
-    expect(m.size).toBe(1);
+    expect(m.get('事故等级')?.canonical).toBe('级别');
+    expect(m.get('事故级别')?.canonical).toBe('级别');
+    // a stored key alone moves to its head: an owner stays an owner however it was read
+    expect(unifyAttributeKeys([{ attribute: '跟进人', count: 9, units: [''] }, { attribute: '负责人', count: 3, units: [''] }]).get('跟进人')?.canonical).toBe('负责人');
+    expect(unifyAttributeKeys([{ attribute: '跟进人', count: 9, units: [''] }]).get('跟进人')?.canonical).toBe('负责人');
     // a qualified state is not the state
     expect(unifyAttributeKeys([{ attribute: '审批状态', count: 9, units: [''] }, { attribute: '状态', count: 3, units: [''] }]).size).toBe(0);
   });
