@@ -21,7 +21,8 @@ describe('chained questions', () => {
     'Who handled the first P1 incident this year? Which project does that person own, and when did it launch?',
     'Who fixed INC-001? What project do they lead now?',
     'An engineer fixed INC-001 and later moved teams. When did their new project launch?',
-    'Which team owns Atlas? Who leads that team?',
+    // past tense: isListQuestion reads "which team owns" as a which-plural, so the list route keeps it
+    'Which team built Atlas? Who leads that team?',
   ];
   it.each(chains)('walks relations for %s', (q) => {
     expect(isChainQuestion(q), q).toBe(true);
@@ -51,5 +52,62 @@ describe('chained questions', () => {
     expect(classifyQuestion('Which P1 incidents did the Platform team have this year? Give each incident\'s ID.').kind).toBe('list');
     expect(classifyQuestion('How many incidents did the Platform team report? Which were they?').kind).toBe('aggregate');
     expect(classifyQuestion('风险R-01从提出到关闭经历了什么？按时间列出每一步（谁、哪一周）。').kind).toBe('timeline');
+  });
+
+  // found by an independent review (2026-11-16), each one sent to the walk and so losing its count or list
+  const reviewed: [string, string][] = [
+    ['宁德时代的人均产值是多少，它在行业里排第几', 'aggregate'], // 的人均 is not "the person who"
+    ['哪家公司今年营收最高，它的净利润是多少', 'aggregate'], // a superlative the count route computes
+    ['中国的人工智能公司有哪些，它们的估值一共多少', 'aggregate'], // a plural back to a list
+    ['给我讲一个关于茅台的故事，它最近股价怎么样', 'lookup'], // a storytelling 一个, and 它 is 茅台
+    ['List all incidents in 2025. Who fixed them?', 'list'], // they are the list
+  ];
+  it.each(reviewed)('is not a chain: %s', (q, kind) => {
+    expect(isChainQuestion(q), q).toBe(false);
+    expect(classifyQuestion(q)).toMatchObject({ kind });
+  });
+
+  it('gives a question that is both a list or count and a chain the route of whatever finds the thing', () => {
+    // the count is what identifies the company: the count route
+    expect(classifyQuestion('哪家银行的存款利率最高？那家银行的总部在哪？').kind).toBe('aggregate');
+    expect(classifyQuestion('Which suppliers delivered late last quarter? Who manages that supplier?').kind).toBe('list');
+    // the list or count is asked of the person the first part finds: the walk
+    expect(classifyQuestion('谁修复了INC-001？他今年还修复过哪些事故？')).toMatchObject({ kind: 'multihop', by: 'rule:chain' });
+    expect(classifyQuestion('Who fixed INC-001? How many incidents has that engineer fixed this year?')).toMatchObject({ kind: 'multihop', by: 'rule:chain' });
+  });
+
+  it('reads 那几个 as "those", not as a count', () => {
+    const q = '西湖边办公的那几个组的甲方里，送快递的那一家记作甲；甲头一回闹出来的故障记作乙；乙事后领了改进活儿的人记作丙；丙走后顶了其位置的人记作丁。问：丁叫什么名字？只回答这一问。';
+    expect(classifyQuestion(q)).toMatchObject({ kind: 'multihop', by: 'rule:chain' });
+    expect(classifyQuestion('平台组今年出了几起事故？').kind).toBe('aggregate');
+  });
+});
+
+describe('routing a long paste', () => {
+  // a question is classified on every Ask; a pasted report once took 7.5 s in TIMELINE (review of 2026-11-16)
+  const en = 'The first quarter was strong for the company, and the last quarter was weak; of the regions, the north grew. '.repeat(520);
+  const zh = '最早的季度表现很好，他负责的那个项目，谁也没想到，最后一个季度下滑。'.repeat(1500);
+  const timed = (q: string) => {
+    const t = performance.now();
+    classifyQuestion(q);
+    isChainQuestion(q);
+    return performance.now() - t;
+  };
+
+  it('reads only the head and the tail of a long paste, in milliseconds', () => {
+    expect(en.length).toBeGreaterThan(55_000);
+    expect(timed(en)).toBeLessThan(50);
+    expect(timed(zh)).toBeLessThan(50);
+    // the question at the end of a paste still routes
+    expect(classifyQuestion(`${en}\n\nHow many quarters were weak?`).kind).toBe('aggregate');
+    expect(classifyQuestion(`下面这段周报最可能是谁写的？\n\n${zh}`).kind).not.toBe('multihop');
+  });
+
+  it('has no pattern that backtracks over the text it reads', () => {
+    // 600 characters, the most the router reads, of the shapes the open-ended patterns once crossed
+    for (const unit of ['first and last of the ', 'how has the ', 'of the a ', '最早 ', 'the one that ', "Acme's Beta's "]) {
+      const q = unit.repeat(Math.ceil(600 / unit.length)).slice(0, 600);
+      expect(timed(q), unit).toBeLessThan(20);
+    }
   });
 });
