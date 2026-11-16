@@ -71,7 +71,39 @@ const NOT_CHAINS: string[] = [
   'Which supplier was cheaper, Foxconn or Pegatron, and why did that supplier win?',
   '平台组今年排第一名的工程师是谁，他修了几起事故？',
   '马斯克收购推特是谁的主意？它后来改名叫什么？',
-  'The CEO, who joined in 2020, cut three divisions. What did they cost?',
+  'The CEO, who joined in 2020, cut three divisions. What did they cost?',  // the re-check's battery (2026-11-16)
+  '贵州茅台2025年的营收是多少，它的毛利率呢',
+  '比亚迪三季度销量如何？它的海外市场表现怎么样？',
+  '宁德时代的研发投入怎么样，它的专利数量有变化吗',
+  '腾讯最近回购了吗，它的分红政策是什么',
+  '招商银行的不良率是多少？它的拨备覆盖率呢？',
+  '小米汽车交付了吗，它的毛利率是正的吗',
+  '雷军最近在发布会上说了什么，他对SU7的定价怎么解释',
+  '巴菲特减持了苹果吗？他持有多少现金',
+  '隆基绿能的人员优化进展如何，它的产能利用率是多少',
+  '中国平安的人寿业务新单增长了吗，它的投资收益率呢',
+  '美团外卖的人效怎么样，它和饿了么的竞争如何',
+  '片仔癀的人参产品卖得好吗？它的提价逻辑是什么',
+  '海康威视的人工智能业务收入如何，它的海外业务受制裁影响大吗',
+  'How did Apple do last quarter, and what did Tim Cook say about China?',
+  'What is Nvidia\'s data center revenue? How did it change from last year?',
+  'Did Tesla raise prices in China? What did Musk say about it?',
+  'What did Morgan Stanley say about BYD, and what is their target price?',
+  'Tell me about the Kweichow Moutai pricing story. Has its stock recovered?',
+  '这个季度谁的业绩超预期了？',
+  '东方财富的投资组合里有哪些股票',
+  '中金公司对宁德时代的评级是什么，他们的目标价是多少',
+  '九哥怎么看光伏，他现在的仓位如何',
+  '茅台是一家什么样的公司？它的护城河在哪',
+  '宁德时代是一家好公司吗，它的估值贵不贵',
+  '这事是谁的主意？他们后来怎么说',
+  '腾讯的创始人是马化腾，他最近说了什么',
+  '谁在买入宁德时代？他们的成本是多少',
+  // a named person asked about, then referred to: a lookup, not a hop
+  '马斯克是谁？他最近说了什么',
+  '九哥是谁，他的持仓表现怎么样',
+  '李想是谁？他对纯电怎么看',
+  'Who is Jensen Huang? What did he say about China?',
 ];
 
 /** Real phrasing that does chain: the later clause asks about what the first part has to find. */
@@ -89,7 +121,20 @@ const CHAINS: string[] = [
   '朋友给我介绍了一家律所，那家律所的合伙人是谁？',
   'An analyst at Morgan Stanley downgraded Nvidia. Which fund does that analyst cover?',
   'Who is Apple\'s chief executive? What did he say about AI last quarter?',
-  'Who signed the supply deal with Foxconn? Which division does that person run?',
+  'Who signed the supply deal with Foxconn? Which division does that person run?',  // the re-check's battery (2026-11-16)
+  '宁德时代的董事长是谁？他还担任哪些公司的董事',
+  '谁是比亚迪最大的电池供应商之一的创始人？',
+  '哪家券商首次覆盖了寒武纪？这家券商的首席分析师是谁',
+  '高瓴最新买入的那家公司是谁创立的？',
+  '九哥推荐的那只股票的大股东是谁？他最近有没有减持',
+  '收购了华为荣耀的那家公司，它的实际控制人是谁',
+  'Who is the CEO of the company that acquired Arm? What else does he run?',
+  'Which fund led TSMC\'s latest round? Who manages that fund?',
+  '茅台的前任董事长被调查后，接替他的人是谁？此人之前在哪工作',
+  '宁德时代的一个客户最近被收购了，收购方是谁？',
+  '谁是理想汽车的CFO？她之前在哪家公司任职？',
+  '比亚迪的一位高管离职了，他去了哪里？',
+  '有一名分析师上调了评级，他的理由是什么',
 ];
 
 describe('the chain rule on real phrasing', () => {
@@ -113,7 +158,17 @@ describe('the chain rule on real phrasing', () => {
   });
 
   it.each(CHAINS)('walks %s', (q) => {
-    expect(classifyQuestion(q)).toMatchObject({ kind: 'multihop', by: 'rule:chain' });
+    // a chain across clauses (rule:chain) or a hop inside one noun phrase (rule:multihop)
+    expect(classifyQuestion(q).kind).toBe('multihop');
+  });
+
+  it('finds the question at the end of a long paste', () => {
+    const paste = '以下是本季度各公司的经营数据汇总，营收合计多少、利润排名如何都列在表里。'.repeat(30);
+    expect(paste.length).toBeGreaterThan(600);
+    expect(classifyQuestion(`${paste}\n\n二部平台组的事故是谁修复的？他还修复过哪些事故？`).kind).toBe('multihop');
+    expect(classifyQuestion(`${paste}\n\nWho fixed the Platform 2 team's incident? Which other incidents has he fixed?`).kind).toBe('multihop');
+    // and a paste whose question is no chain stays off the walk
+    expect(classifyQuestion(`${paste}\n\n茅台的毛利率是多少？它的净利率呢？`).kind).not.toBe('multihop');
   });
 });
 

@@ -58,7 +58,16 @@ const AGGREGATE = [
  * ("X的母公司的CEO"). A miss costs what today's path costs; a false hit costs
  * a walk over a few relations.
  */
+/**
+ * A hop inside one clause whose description holds a superlative: "谁是比亚迪最大的
+ * 电池供应商之一的创始人？" asks about the founder of the supplier the
+ * superlative picks, so the superlative describes what to find, not a count.
+ */
+const SUPERLATIVE_HOP = /(?:谁|哪)[^，,。？?；;]{0,20}最[大小高低多少好强差][^，,。？?；;的]{0,4}的[^，,。？?；;的]{1,12}的[^，,。？?；;的]{1,10}|最[大小高低多少好强差][^，,。？?；;的]{0,4}的[^，,。？?；;的]{1,12}的[^，,。？?；;的]{1,10}(?:是谁|是哪)/;
+
 const MULTIHOP = [
+  // "高瓴最新买入的那家公司是谁创立的？": a described thing, and who made or runs it
+  /的那(?:一)?[个位家起项名件只][^，。？?]{0,10}?(?:是谁|由谁|被谁)/,
   /\b(?:the|a|an)\s+(?:[\w-]+\s+){0,3}?(?:that|which|who|whose)\s+(?!is\b|are\b|was\b|were\b)\w+/i,
   /\bof the\b[^?]{0,80}?\bof (?:the\b|[A-Z])/,
   /'s\s+[\w-]+(?:\s+[\w-]+)?'s\b/,
@@ -120,8 +129,10 @@ const CHAIN_INTRO = [
  */
 const CHAIN_OPENING = [
   new RegExp(`^\\s*(?:请问|那么|并且|而且|又|是|由)?\\s*(?:谁|哪(?:一)?[个位家名项件组](?!些)|有?(?<!第)[一另]\\s*(?:[位名家]|[起个项件]\\s*(?:[^，。？?；;、\\s]{0,12}?的)?${ENTITY_NOUN}))`),
-  // "这家公司的创始人是谁，他…": the clause asks who or which one, at its end
-  /是(?:谁|哪(?:一)?[个位家名])\s*[，,。？?；;：:—]?\s*$/,
+  // "这家公司的创始人是谁，他…": the clause asks who or which one of something it describes (not "马斯克是谁？他…")
+  /的[^，,。？?；;的]{0,10}是(?:谁|哪(?:一)?[个位家名])\s*[，,。？?；;：:—]?\s*$/,
+  // "收购了华为荣耀的那家公司，它…": the clause is a described thing and nothing else
+  /的那(?:一)?[个位家起项名件只][^，,。？?；;的什么谁哪吗呢怎如多几]{0,6}\s*[，,—]?\s*$/,
 ];
 
 /** The English openings: only where a sentence starts ("The CEO, who joined…" is a relative clause, not a question). */
@@ -131,7 +142,9 @@ const CHAIN_OPENING_EN = [
 
 /** A reference back that names what it refers to as one thing: needs an introducer in an earlier clause. */
 const CHAIN_BACK = [
-  /此人|该人|这个人|那个人|这位|那位|对方|同一(?![周天日月年时期次类种样]|[个位家起名项件]?(?:问题|事))|那(?:一)?[个位家起项名件条组](?!些)|该(?:项目|组|客户|事故|风险|员工|工程师|同事|公司)|新(?:的)?负责人|前者|后者|其(?:位置|名下)/,
+  // 这家券商 / 这名分析师 / 这个客户, and the role a later clause names for the other side of an event (收购方 after 被收购了)
+  new RegExp(`这(?:一)?[家名只](?!些)|这个${ENTITY_NOUN}|(?:收购方|买方|卖方|接盘方|接替者|继任者|接任者|新东家)`),
+  /此人|该人|这个人|那个人|这位|那位|对方|同一(?![周天日月年时期次类种样]|[个位家起名项件]?(?:问题|事))|那(?:一)?[个位家起项名件条组只](?!些)|该(?:项目|组|客户|事故|风险|员工|工程师|同事|公司)|新(?:的)?负责人|前者|后者|其(?:位置|名下)/,
   new RegExp(`\\b(?:that|this|the same)\\s+(?:one|${EN_NOUN})\\b|\\bthe new (?:owner|lead|manager|assignee)\\b|\\bthe (?:former|latter)\\b`, 'i'),
 ];
 
@@ -143,7 +156,11 @@ const CHAIN_PRONOUN = [/(?<![其吉])[他她](?!们)|(?<!其)它(?!们)/, /\b(?:
  * "fixed by whom?"): a later 他 / 她 / he / she stands for that person, not 它
  * ("…是谁的主意？它后来…" is about what the question named).
  */
-const CHAIN_ASKS_WHO = [/谁/, /\bwhom\b/i];
+const CHAIN_ASKS_WHO = [/谁/, /\bwhom\b/i, /(?<!第)[一另]\s*[位名]/];
+/** "马斯克是谁？" asks who someone named is: the 他 after it is that person, nothing to find. */
+const NAMED_WHO = /^\s*[^的，,。？?；;]{1,12}是谁\s*[，,。？?；;]?\s*$/;
+/** "Who is Jensen Huang?": the same in English (case-sensitive: a name is capitalised). */
+const NAMED_WHO_EN = /^\s*[Ww]ho\s+(?:is|was)\s+[A-Z][\w.'-]*(?:\s+[A-Z][\w.'-]*)*\s*[?.]?\s*$/;
 const CHAIN_PERSON_PRONOUN = [/(?<![其吉])[他她](?!们)/, /\b(?:he|she|him|her|his|hers|they|them|their|theirs)\b/i];
 
 /** A label the question gives what it describes, used again later: "…的那一家记作甲；甲头一回…". */
@@ -182,8 +199,8 @@ function chainAt(question: string): number {
     // a sentence starts at the beginning, or after 。？！；, a line, or ". ": not after a comma
     const sentence = i === 0 || /[。？?！!；;\n]\s*$|\.\s+$/.test(question.slice(Math.max(0, at - 3), at));
     if (CHAIN_INTRO.some((re) => re.test(clause))) introduced = true;
-    if (CHAIN_OPENING.some((re) => re.test(clause)) || (sentence && CHAIN_OPENING_EN.some((re) => re.test(clause)))) asked = true;
-    if (CHAIN_ASKS_WHO.some((re) => re.test(clause))) askedWho = true;
+    if (CHAIN_OPENING.some((re) => re.test(clause)) || (sentence && !NAMED_WHO_EN.test(clause) && CHAIN_OPENING_EN.some((re) => re.test(clause)))) asked = true;
+    if (CHAIN_ASKS_WHO.some((re) => re.test(clause)) && !NAMED_WHO.test(clause)) askedWho = true;
     for (const m of clause.matchAll(CHAIN_LABEL)) labels.add(m[1]);
   }
   return -1;
@@ -206,9 +223,19 @@ function countsOrLists(text: string): boolean {
  * the enumeration answers).
  */
 export function isChainQuestion(question: string): boolean {
-  const text = routedText(question);
-  const at = chainAt(text);
-  return at >= 0 && !countsOrLists(text.slice(0, at));
+  const chained = (text: string) => {
+    const at = chainAt(text);
+    return at >= 0 && !countsOrLists(text.slice(0, at));
+  };
+  if (question.length <= HEAD_CHARS + TAIL_CHARS) return chained(question);
+  // a long paste: the question is at its start or at its end (the last sentence or two)
+  return chained(question.slice(0, HEAD_CHARS)) || chained(lastSentences(question.slice(-TAIL_CHARS)));
+}
+
+/** The last two sentences of a text: where a question after a paste stands. */
+function lastSentences(text: string): string {
+  const ends = [...text.matchAll(/[。？?！!\n]|\.\s/g)].map((m) => (m.index ?? 0) + m[0].length).filter((i) => i < text.trimEnd().length);
+  return text.slice(ends.length >= 2 ? ends[ends.length - 2] : 0).trim();
 }
 
 const MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
@@ -276,7 +303,8 @@ export function classifyQuestion(full: string): QuestionRoute {
   const range = questionRange(question);
   if (TIMELINE.some((re) => re.test(question))) return { kind: 'timeline', range, by: 'rule:timeline' };
   // before the counts and lists: what those would enumerate is the thing the question has yet to find
-  if (isChainQuestion(question)) return { kind: 'multihop', range, by: 'rule:chain' };
+  if (isChainQuestion(full)) return { kind: 'multihop', range, by: 'rule:chain' };
+  if (SUPERLATIVE_HOP.test(question)) return { kind: 'multihop', range, by: 'rule:multihop' };
   if (AGGREGATE.some((re) => re.test(question))) return { kind: 'aggregate', range, by: 'rule:aggregate' };
   if (isListQuestion(question)) return { kind: 'list', range, by: 'rule:list' };
   if (MULTIHOP.some((re) => re.test(question))) return { kind: 'multihop', range, by: 'rule:multihop' };
