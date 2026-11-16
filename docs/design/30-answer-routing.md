@@ -77,18 +77,30 @@ Cost: the same single completion, one embedding, two SQL queries over the match 
   - **Meaning and type.** See §3.1.
 - **What leads on.** A relation is kept only when it holds a term, is anchored, or (first hop) leads to one of a named entity's few siblings the question describes (§3.1). The first hop is held to this too: a question the walk cannot help gets nothing from it. Before 2026-11-16 the first hop kept the heaviest relations whatever they were: "宁德时代的人均产值是多少，它在行业里排第几" got five `competes_with` relations as facts.
 - **How many it keeps.** Every branch takes its best step (branches ranked by their path's score), and the five best of the rest join it, so a hop holds at most ten.
-- **The passage that states a hop.** Read near the relation's own sources: the document it was read from and those its evidence names (at most 20), the earliest of which dates it.
-  - Of the chunks that mention both ends (at most 200, read from the end mentioned less), the walk takes the one in the earliest document dated within 45 days before that source. That is the report of the week it happened, which a monthly summary the relation was read from restates.
-  - A co-mention long before the relation's first source, on a knowledge base that has mentioned both for years, is never taken.
-  - Else a chunk of that source; else the chunk the relation was read from.
-  - A document's date is its own, or else the day its claims state most often.
-  - Every read is bounded per step: on a synthetic finance-sized store (a hub with 6,594 relations and 23,520 mentions) the walk takes 149 ms for one hub and 386 ms for six, against 731 ms and 985 ms on main 7a299bf.
+- **The passage that states a hop.** The chunk the relation was read from: relations record it since v20, and all 2,014 relations of the 10× index do.
+  - Else a passage of its source document (the one it was read from, or else the first its evidence names) that mentions both ends, or either.
+  - Only a relation with no recorded source falls back to a chunk that merely mentions both ends. That passage is flagged (`trace.coMention`) and begins "(mentions A and B; not the source of "A rel B")". On a finance knowledge base two big names are named together daily, and a market recap three weeks before an acquisition is no statement of it.
+  - From 2026-11-16 to its recheck the passage was the earliest co-mention within 45 days before the relation's source.
+  - One bounded read per step, with no document dates.
+- **Time.** The walk has a budget (1,500 ms by default, `budgetMs`). Past it no further hop or ordering starts, and the walk returns what it has with `spent` = { budgetMs, ms, before }. `ask` puts that in `route.walked.spent` and in a computed fact saying where the walk stopped and that what lies past it was not looked for. The first hop always runs.
+  - On the reviewer's synthetic finance-sized store (113k entities; a hub with 6,594 relations and 23,520 mentions), same session, the walk takes:
+
+    | | main 7a299bf | b8243cf | this |
+    |---|---|---|---|
+    | one hub | 908 ms | 192 ms | 57 ms |
+    | two hubs | 1,182 ms | 673 ms | 121 ms |
+    | six hubs | 1,304 ms | 568 ms | 128 ms |
+    | one hub, ordered | 1,010 ms | 257 ms | 132 ms |
+    | a small entity | 612 ms | 165 ms | 64 ms |
 - **Chain order.** The passages come chain by chain: the best-scored step (scores add up along a branch) with the steps that led to it, from the first hop down, then the next best.
 - **What the walk does not read.** The question's time window that routing reads (`questionRange`) does not constrain the walk. Only the ordering step (§3.1) reads a period, from the ordinal's own clause.
 
 `ask` (`multihopAnswer`) answers from a search plus those bridge passages.
 - **The search.** SAG when it has the question's embedding; otherwise (the embedder down, or keyword asked for) the caller's mode, whose hybrid search falls back to the keyword and graph channels.
-- **What else it runs.** What the lookup route would have run: the set computed from the claims, the depth-2 graph search, and the excerpts of a list question.
+- **What else it runs.** What the lookup route would have run: the depth-2 graph search, the excerpts of a list question, and the set computed from the claims. The set comes under the Ask session's switch (`opts.computed` or `retrieval.router.computedSets`, off by default) and with the same `now` and time budget (design 34).
+  - On a chain (`isChainQuestion`) the set is computed only after the walk, over the entities the walk reached beyond those the question names, and kept only when its scope is one of them. Otherwise there is no set.
+  - "平台组的INC-001是谁修复的？此人还修复过哪些事故？" got "Computed from the claims: 6 distinct event matching 修复", the group's six incidents, though the person fixed two.
+  - A question routed to the walk that is not a chain computes as the lookup route does.
 - **Context order.** The top eight contexts are the search's first four and the walk's first four. The rest of each follow, and then the graph search's chunks, up to twelve.
 - **Facts.** The walk's computed ordering lines come first (§3.1), then the walked relations as the sources' facts ("Nimbus Freight acquired Borealis Logistics: … — raw/docs/deal.md"), then the claims about every entity reached.
 
@@ -116,15 +128,18 @@ A non-lexical question names only the division and describes the rest: "第一�
   The first hop at which one entity leads to two or more of the noun the ordinal is about (the first predicate family after it: 故障 → 事故) is ordered, over all of that entity's relations, read again in full up to 2000. More than that and no pick is made: the note says the set was too large. Each branch keeps the one the question names and drops the others it ordered.
   - **Dates:** a candidate is dated by the event asked about: the claims and relations that state it (the spellings of the ordinal's noun), the latest of them for "the latest", the earliest for "the first". A product released in 2019 and again in 2026 was last released in 2026. When nothing states the event, it is dated by first sight (marked so): the earliest date its claims state, else its relations' starts, else the date of the earliest document that mentions it.
   - **Levels:** a candidate's level is the one its earliest claim states, dating an undated claim by its document. The reports contradict themselves: "本周新增P2事故INC-004-T1" in the week, "级别为P1" in the month's summary, so the week wins.
-  - **Periods:** a relative period is read against the present: the day the question says it is asked as of ("截至2025年5月21日", "as of 2025-05-21"), else the date of the knowledge base's latest source up to today (a source's date: its own, or the earliest its claims state). On a knowledge base kept current that is this year. On the 10× reports, whose sources stop in December 2025, it is 2025, and the note says so: "dated in 2025 (this year: the knowledge base's latest date, 2025-12-05)". Before 2026-11-16 it was the latest year the candidates themselves were dated in.
+  - **Periods:** a relative period is read against the present: the day the question says it is asked as of ("截至2025年5月21日", "as of 2025-05-21"), else the now its caller gives (`ask`'s `now`, the option design 34 added for computed sets), else the clock's.
+    - A knowledge base behind the clock is not read as current: when its "今年" holds nothing, the note says so and gives its latest source, for example "0 candidates are dated in 2027 (this year: the caller's now, 2027-03-01); the knowledge base has no source dated in 2027 (its latest: 2026-…)".
+    - An evaluation of a past corpus passes its own now; the 10× reports are measured with now = 2025-12-31. `src/eval` does not yet pass one to `ask`.
+    - From 2026-11-16 to its recheck the present was the knowledge base's latest source; before that, the latest year the candidates themselves were dated in.
   - **Missing dates:** a candidate with no date is left out of the order and counted in the note. When fewer remain than the position asks for, nothing is picked, and the walk goes on as if the question had not ordered.
   - **What the answer is told:** every branch's pick, or why there was none, with the order made ("in order: INC-001-T1 (2025-02-03), …"). It goes to the answer as a computed fact, apart from the sources' facts ("Ordered by the walk from the dates the sources state (no source states this order): 第二起 — 第一事业部平台组: INC-003-T1 — the 2nd of 4 P1 dated in 2025 …"), and in `route.walked.ordering`. The relation's own fact no longer carries the pick.
 - **The kind of thing the question ends at.** The last clause, split at sentence ends and commas but not at a dash, may name an entity type: 项目 → project; 组 / 团队 → organization; 事故 / 故障 / 事件 → event. The words come from the ontology's type labels plus these nouns. 组 counts only as a word (那个组, 另一个组), not inside 组合, 组件 or 投资组合. A far end of that type then holds the cue like a term: "此人名下的那个项目" reaches 司命系统 rather than the heavier incident the person "负责修复". A person is never cued, because nearly every chain asks 谁. Cues from every clause pull early hops toward later clauses (deep-hop 10 → 6 chains).
 
-**Measured 2026-11-16, after the review fixes.** Set-up:
-- **The index:** a fresh no-model rebuild of the 10× workspace from its stored extractions (`src/bench/replay-build.ts` on main 7a299bf).
-- **Its vectors:** the run's own bge-m3 vectors: chunks from the run's vector cache by content, and 718 of 822 entities and 16,865 of 16,874 claims from the run's index by name and statement.
-- **The run:** `ask()` with no model and the cached question vectors, ~18 questions per type.
+**Measured 2026-11-16, after the review and its recheck.** Set-up:
+- **The index:** a fresh no-model rebuild of the 10× workspace from its stored extractions (`src/bench/replay-build.ts`). All 2,014 relations record their source chunk and document.
+- **Its vectors:** the run's own bge-m3 vectors: chunks from the run's vector cache by content, and 718 of 823 entities and 16,865 of 16,874 claims from the run's index by name and statement.
+- **The run:** `ask()` with no model, the cached question vectors and now = 2025-12-31, ~18 questions per type.
 - **The measures:**
   - hit@8 is a gold document among the first eight contexts;
   - gold-in-contexts is gold recall over all contexts;
@@ -133,16 +148,16 @@ A non-lexical question names only the division and describes the rest: "第一�
 | type | hit@8 | gold in contexts | bridges named | chains complete |
 |---|---|---|---|---|
 | deep-hop, main 7a299bf | 0.89 | 0.31 | 0.86 | 11 / 18 |
-| deep-hop, this change | 0.83 | 0.30 | 0.87 | **12 / 18** |
+| deep-hop, after the review (b8243cf) | 0.83 | 0.31 | 0.87 | 12 / 18 |
+| deep-hop, after the recheck | 0.72 | 0.29 | 0.87 | 12 / 18 |
 | nonlexical-hop, main 7a299bf | 0.67 | 0.34 | 0.94 | 16 / 18 |
-| nonlexical-hop, this change | 0.61 | 0.29 | 0.93 | 15 / 18 |
+| nonlexical-hop, after the review (b8243cf) | 0.61 | 0.29 | 0.93 | 15 / 18 |
+| nonlexical-hop, after the recheck | 0.56 | 0.29 | 0.93 | 15 / 18 |
 
-All 196 questions of the other eleven types have byte-identical contexts, facts and route.
-- **Deep-hop hit@8.** The two questions lost (d8-h5, d10-h5) had their gold report among the top eight only as an old co-mention. d8's first hop, 八部增长组—远景银行, is stated in week 43; main showed week 4, which mentions both but states another relation.
-- **Nonlexical chains.** The chain lost (d9-nh-risk-INC-021-D9T3) has no "raised" relation for R-106 in the index. It completed only while 上报 matched another relation in the beam's spare slots.
-- **Cost on the 10× index.**
-  - The walk alone (same process, median of 3 runs): 30–35 ms and 9–12 statements per question on main, 55–78 ms and 15–22 here. The increase is the sources' evidence and co-mention reads, the term-matching read, and the full read an ordering makes.
-  - `ask` as a whole: 41–44 statements per question on main, 60–67 here. It now also runs the graph search, the claim set and the excerpts the lookup route would.
+Against its base (the computed-sets branch, 79793bf) the recheck's changes leave every other type's contexts, facts and route byte-identical.
+- **hit@8 after the recheck.** Its fall is the price of showing the relation's own passage, in three questions (h5r-C0, d3-h5r-C4, nh-proj-INC-001-T1). Each has a gold weekly report that names both ends of a hop but is not the source recorded for the relation the walk took. "INC-001-T1列于平台组事故记录" was read from the monthly pmo-02; the gold is the week-5 report, which lists the incident under the group's own heading. Every relation in this index has a recorded source, so this is not missing sources.
+- **After the review.** The two deep-hop questions lost (d8-h5, d10-h5) had their gold report among the top eight only as an old co-mention. The nonlexical chain lost (d9-nh-risk-INC-021-D9T3) has no "raised" relation for R-106 in the index; it completed only while 上报 matched another relation in the beam's spare slots.
+- **Cost on the 10× index.** `ask` takes 41–44 statements per question on main, 55–63 now. It also runs the lookup route's graph search, excerpts and (when switched on) claim set.
 
 Where the 9 incomplete chains stop:
 - **Extraction (6).**
