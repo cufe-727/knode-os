@@ -404,6 +404,18 @@ What the rules are now:
   answers to. Refine merges an entity named only by a code into the one
   entity that answers to it (the split part labelled with it, else the single
   carrier of the code as an alias), in either identity mode.
+- **A bare identifier stays apart from its tailed forms** unless something
+  states it for one of them. INC-006 lands on an incident that carries INC-006
+  as an alias; with none, it is its own entity, even when INC-006-T1 is the
+  only tailed form the workspace holds. The tail says which team's or
+  division's sixth incident it is, and "only one tailed form so far" is a fact
+  about the reports read, not about the text: next week's report may bring
+  INC-006-T2, and the join made before it would then be wrong, in an order
+  that decides the outcome (a workspace that read the T2 report first would
+  never make it). Undoing it would mean unmerging an entity whose claims have
+  since been superseded and linked under the other. Kept apart, the cost is
+  one more entity whose claims search still finds by "INC-006"; a person who
+  knows which incident it is merges it by hand (reversible).
 - **Back-references** (`src/graph/backrefs.ts`) are off unless
   `review.backReferences` lists periodic-report folders (`periodic`) or asks to
   `detect` series; only claims that state a fix take part, only an

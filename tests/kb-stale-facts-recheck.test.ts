@@ -174,3 +174,20 @@ describe('several fixers, or one with help', () => {
     expect(sources.map((r) => r.source_id).sort()).toEqual(['方杰', '李明']);
   });
 });
+
+describe('a bare identifier no incident carries', () => {
+  it('stays its own entity, even with one tailed form in the workspace, through refine', async () => {
+    const { splitEntities } = await import('../src/graph/entity-context.js');
+    const fm = (title: string, entities: string) => `---\ntitle: ${title}\nentities:\n${entities}---\n${title}\n`;
+    const ctx = await workspace('bare-id', {
+      'raw/docs/a.md': fm('a', '  - { name: INC-006-T1, type: event }\n'),
+      'raw/docs/b.md': fm('b', '  - { name: INC-006, type: event }\n'),
+    });
+    for (const identity of ['name', 'context'] as const) {
+      await splitEntities(ctx.store, { config: { ...ctx.config, review: { ...ctx.config.review, identity } } });
+      const live = await ctx.store.query<{ id: string }>(`SELECT id FROM entities WHERE tx_to IS NULL AND canonical_id IS NULL AND id LIKE 'inc-006%' ORDER BY id COLLATE "C"`);
+      // "only INC-006-T1 so far" is a fact about the reports read, not about the text: INC-006-T2 may come next week
+      expect(live.map((r) => r.id), identity).toEqual(['inc-006', 'inc-006-t1']);
+    }
+  });
+});
