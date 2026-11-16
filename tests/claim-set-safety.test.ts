@@ -173,6 +173,26 @@ describe('numbers from current, factual claims of one unit and one period granul
   });
 });
 
+describe('nothing computed when what is asked is not tied to the claims with confidence (review item 2)', () => {
+  it('computes no set from a match on part of what the question asks', async () => {
+    // "需要注意" matches, "风险" does not: the claims that say 需要注意 are not the risks asked for
+    expect(await set('宁德时代有哪些风险需要注意？', ['catl'])).toBeNull();
+    // a question whose words reach no claim
+    expect(await set('How many ways could this go wrong for 宁德时代?', ['catl'])).toBeNull();
+  });
+
+  it('still computes a set the question\'s kind of item and words tie to the claims', async () => {
+    const s = await set('宁德时代有哪些客户？', ['catl']);
+    expect(s?.lines.join('\n')).toMatch(/^- 特斯拉/m);
+  });
+
+  it('tells the model to check the match before taking its figures', async () => {
+    const { llm, prompts } = recordingLlm();
+    await ask(store, defaultConfig(), embedder, llm, '宁德时代有哪些客户？', { computed: true });
+    expect(prompts[0]).toContain('use its figures only where that match is what the question asks');
+  });
+});
+
 describe('the switches', () => {
   it('computes no set unless the workspace or the call turns computed sets on', async () => {
     const q = '宁德时代有哪些客户？';

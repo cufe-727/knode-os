@@ -577,6 +577,21 @@ export async function computeClaimSet(
   // the attributes that hold the named value: the item's latest of those is tested, not its latest of any
   const valueAttrs = namedValue ? valuesOfAttrs.get(namedValue)! : new Set<string>();
 
+  // confidence: an attribute it names, an entity it names that is not its scope, or words that cover everything it
+  // asks about (or the kind of item it asks for and words): a match on part of it ("需要注意" of "风险需要注意") is
+  // a set of something else
+  const covered = (f: string) => {
+    const lower = f.toLowerCase();
+    const on = new Array<boolean>(lower.length).fill(false);
+    for (const t of terms) for (let at = lower.indexOf(t); at >= 0; at = lower.indexOf(t, at + 1)) for (let i = at; i < at + t.length; i++) on[i] = true;
+    // a latin word matched by its singular counts as covered
+    if (!/[一-鿿]/.test(f)) return terms.some((t) => lower.startsWith(t));
+    return on.every(Boolean);
+  };
+  const namedWhatHit = cands.some((c) => namedWhat.has(c.subject_id) || (c.object_id !== null && namedWhat.has(c.object_id)));
+  const confident = matchedAttrs.size > 0 || namedWhatHit || (terms.length > 0 && (read.asks !== undefined || frags.every(covered)));
+  if (!confident) return null;
+
   const matches = (c: Cand) =>
     namedWhat.has(c.subject_id) || (c.object_id !== null && namedWhat.has(c.object_id)) ||
     (c.attribute !== null && matchedAttrs.has(c.attribute)) || terms.some((t) => c.statement.toLowerCase().includes(t));

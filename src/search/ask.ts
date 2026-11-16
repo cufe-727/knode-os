@@ -59,7 +59,7 @@ const ENUMERATED_RULE = `
 
 /** The rule a computed set adds: its counts and values were computed in code over every matching claim. */
 const COMPUTED_RULE = `
-- The "Computed from the claims" section was computed in code over every claim of the scope it names that matched the question (each row is listed among the known facts marked "set"): take its counts, groups, extremes, averages and values as the answer's figures, and say which items it lists; a row it lists from a source you were not shown in full is still evidence. If its scope or its match is not what the question asks, say so and answer from the rest.`;
+- The "Computed from the claims" section was computed in code over the claims of the scope it names that matched the question by the attributes and words it lists (each row is among the known facts marked "set", with its own kind and status): use its figures only where that match is what the question asks, and say which items it lists; a row from a source you were not shown in full is still evidence. What it says it left out (forecasts, replaced or other-unit figures) is not in its figures. If its scope or its match is not what the question asks, say so and answer from the rest.`;
 
 /** The computed set as the prompt shows it: what was matched, where, and the lines of the answer. */
 function renderComputed(c: ComputedSet): string {
