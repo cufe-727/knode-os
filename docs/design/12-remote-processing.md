@@ -224,7 +224,11 @@ processing is started, as embedding does now.
   with nothing (a write by another process does not show here). A walk that ends short of `k` is all such a side gets: what it found is returned, nearest
   first, and the channel is marked partial (`SearchChannel.partial`, in `channels.vector` of an explained search)
   with what stopped it and how many it has; so is the walk that looks for pages beside the sources, when it ends at
-  its limit before it has its forty rows. Nothing is read after a walk: for a day a side the walk found nothing of
+  its limit before it has its forty rows. The mark goes where the results go: `search()` returns them with a
+  `partial` property (not an element, not in their JSON), a walk's results carry its direct route's, `knode_search`
+  adds a block `{ "partial": … }` after the results, and `GET /api/search` sets the `x-knode-search-partial`
+  header; the array of results is the same in each. An agent can tell "semantic recall stopped early" from
+  "nothing there". Nothing is read after a walk: for a day a side the walk found nothing of
   was read as far as four times the walk's rows, and of a larger side that was its first so-many chunks in no
   order, returned as if they were its nearest. The 2,000 had bounded narrowed searches too, and a folder of 2,500
   chunks away from the question returned nothing.

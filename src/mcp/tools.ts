@@ -142,7 +142,7 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
         filter: resolveScopeFilter({ kinds, sources, trust, actor }),
         track,
       });
-      return json(results.map((r) => ({
+      const answer = json(results.map((r) => ({
         path: r.path,
         title: r.title,
         score: +r.score.toFixed(4),
@@ -152,6 +152,11 @@ export function registerKnodeTools(target: McpServer, ctx: AppContext, opts: Kno
         current: r.current,
         content: r.content,
       })));
+      // The semantic channel stopped short of what it was asked for (a folder too large to read, lying
+      // further than the index is walked): said in a block of its own after the results, which stay the
+      // array they were. Without it "few results" or "none" reads as "nothing there".
+      if (results.partial) answer.content.push({ type: 'text' as const, text: JSON.stringify({ partial: results.partial }, null, 2) });
+      return answer;
     },
   );
 

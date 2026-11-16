@@ -74,8 +74,26 @@ type Recall = RankedChunk[] & { partial?: string };
 
 export type SearchChannelName = 'vector' | 'keyword' | 'graph';
 
+/**
+ * The results of a search, with `partial` when its vector channel returned
+ * fewer candidates than it was asked for though more exist
+ * (`SearchChannel.partial`): the results are then what the other channels and
+ * the short list found, and "nothing" from such a search is not "nothing
+ * there". It is a property of the array, not an element and not in its JSON:
+ * whoever passes results on says it in their own way (`knode_search` in a
+ * block after the results, `GET /api/search` in a header).
+ */
+export type SearchResults = SearchResult[] & { partial?: string };
+
+/** `results`, saying `partial` when there is something to say. */
+export function markedPartial(results: SearchResult[], partial: string | undefined): SearchResults {
+  // not enumerable: the array compares, spreads and iterates as an array of results and nothing else
+  if (partial) Object.defineProperty(results, 'partial', { value: partial, enumerable: false, writable: true, configurable: true });
+  return results;
+}
+
 export interface ExplainedSearch {
-  results: SearchResult[];
+  results: SearchResults;
   /** The channels that ran: all three in hybrid mode, one in vector or keyword mode, none for SAG; `rerank` when that stage ran. */
   channels: Partial<Record<SearchChannelName | 'rerank', SearchChannel>>;
 }
@@ -1729,7 +1747,7 @@ export async function search(
   embedder: EmbeddingProvider,
   query: string,
   opts: SearchOptions = {},
-): Promise<SearchResult[]> {
+): Promise<SearchResults> {
   return (await searchExplained(store, embedder, query, opts)).results;
 }
 
@@ -1753,7 +1771,8 @@ export async function searchExplained(
     const channels: ExplainedSearch['channels'] = {};
     // a walk's results say which of them are pages (the direct route's hits and the expansion's rows both do)
     const results = await finish(store, query, walked, k, opts, channels, new Set(walked.filter((r) => r.generated).map((r) => r.chunkId)));
-    return { results, channels };
+    // a walk reports no channels; what cut its direct route's vector channel short comes with its results
+    return { results: markedPartial(results, walked.partial), channels };
   }
   const fetchK = Math.max(k * 3, 24);
   const channels: ExplainedSearch['channels'] = {};
@@ -1827,7 +1846,7 @@ export async function searchExplained(
   if (opts.track !== false) {
     await recordChunkHits(store, results.map((r) => ({ chunkId: r.chunkId, documentId: r.documentId })), heatCfg);
   }
-  return { results, channels };
+  return { results: markedPartial(results, channels.vector?.partial), channels };
 }
 
 /**
