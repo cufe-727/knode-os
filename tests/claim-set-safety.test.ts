@@ -431,6 +431,30 @@ describe('a figure belongs to its claim\'s subject (re-check item 3)', () => {
   });
 });
 
+describe('units: a scale and a base (re-check item 4)', () => {
+  beforeAll(async () => {
+    const q = (n: number) => ({ from: d(`2025-${String((n - 1) * 3 + 1).padStart(2, '0')}-01`), to: d(`2025-${String(n * 3).padStart(2, '0')}-${n === 1 || n === 4 ? 31 : 30}`) });
+    await addClaim('r1', 'catl', '宁德时代2025年一季度销售额847亿元', { attribute: '销售额', num: 847, unit: '亿元', at: d('2025-04-20'), ...q(1) });
+    await addClaim('r2', 'catl', '宁德时代2025年二季度销售额942亿元', { attribute: '销售额', num: 942, unit: '亿元', at: d('2025-07-30'), ...q(2) });
+    await addClaim('r3', 'catl', '宁德时代2025年三季度销售额1041亿元', { attribute: '销售额', num: 1041, unit: '亿元', at: d('2025-10-20'), ...q(3) });
+    await addClaim('r3', 'catl', '宁德时代2025年三季度海外销售额折合60亿美元', { attribute: '销售额', num: 60, unit: '亿美元', at: d('2025-10-21'), ...q(3) });
+    await addClaim('r5', 'catl', '宁德时代2024年四季度销售额1000亿', { attribute: '销售额', num: 1000, unit: '亿', at: d('2025-03-21'), from: d('2024-10-01'), to: d('2024-12-31') });
+    await addClaim('r2', 'catl', '宁德时代市值1.1万亿元', { attribute: '市值', num: 1.1, unit: '万亿元', at: d('2025-07-10') });
+  });
+
+  it('never lets a bare scale merge two currencies', async () => {
+    const min = await set('宁德时代的最低销售额是多少？', ['catl']);
+    expect(min).toMatchObject({ op: 'min', answer: '847' });
+    expect(min!.lines.join('\n')).toMatch(/another unit .*亿美元/);
+  });
+
+  it('compares one base across scales: 1.1万亿元 is above 9800亿元', async () => {
+    const max = await set('宁德时代的最高市值是多少？', ['catl']);
+    expect(max).toMatchObject({ op: 'max', answer: '1.1' });
+    expect(max!.lines[0]).toContain('(of 2 readings)');
+  });
+});
+
 describe('a Chinese question end to end (review item 11)', () => {
   it('puts the value as of a day, its sources and what it left out before the model, and no forecast as a fact', async () => {
     const { llm, prompts } = recordingLlm();

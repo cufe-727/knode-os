@@ -307,6 +307,21 @@ interface Cand {
 
 /** How a claim not stated as fact was stated: its kind, and its status when hedged ("rumor, suspected"). */
 const claimKind = (c: { kind: string | null; status: string | null }) => [c.kind && c.kind !== 'fact' ? c.kind : '', c.status && c.status !== 'fact' ? c.status : ''].filter(Boolean).join(', ') || 'fact';
+const CJK_SCALES: [string, number][] = [['万亿', 1e12], ['千亿', 1e11], ['百亿', 1e10], ['十亿', 1e9], ['亿', 1e8], ['千万', 1e7], ['百万', 1e6], ['十万', 1e5], ['万', 1e4]];
+const EN_SCALES: Record<string, number> = { trillion: 1e12, tn: 1e12, billion: 1e9, bn: 1e9, million: 1e6, mn: 1e6, thousand: 1e3, k: 1e3 };
+
+/**
+ * A unit's scale and base: "万亿元" is 1e12 of 元, "亿美元" 1e8 of 美元, "billion USD" 1e9 of usd, "亿" 1e8 of
+ * nothing named. Figures of one base compare across scales (1.1万亿元 above 9800亿元); two bases never merge.
+ */
+export function unitParts(unit: string | null): { scale: number; base: string } {
+  const u = (unit ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+  for (const [prefix, factor] of CJK_SCALES) if (u.startsWith(prefix)) return { scale: factor, base: u.slice(prefix.length).trim() };
+  const m = /^(trillion|tn|billion|bn|million|mn|thousand|k)\b\.?\s*(.*)$/.exec(u);
+  if (m) return { scale: EN_SCALES[m[1]], base: m[2].trim() };
+  return { scale: 1, base: u };
+}
+
 /** A claim stated as fact: no forecast, opinion or rumour, nothing suspected or disputed. */
 const isFact = (c: { kind: string | null; status: string | null }) => (c.kind ?? 'fact') === 'fact' && (c.status ?? 'fact') === 'fact';
 
@@ -952,17 +967,18 @@ export async function computeClaimSet(
         if (samePeriod) { left.replaced++; continue; }
       }
       const d = dateOf(c);
-      const key = read.op === 'value' ? c.id : `${c.subject_id}|${period ? `${period.gran}:${period.key}` : d ? isoWeek(d) : c.id}`;
+      // one reading per subject, period and base: a figure in another currency is another measure, never the same one restated
+      const key = read.op === 'value' ? c.id : `${c.subject_id}|${unitParts(c.unit).base}|${period ? `${period.gran}:${period.key}` : d ? isoWeek(d) : c.id}`;
       const prev = readings.get(key);
       if (!prev || byDate(dateOf(prev), d) < 0) readings.set(key, c);
     }
-    // one unit: the commonest; a tie names no figure. A unit that begins another is the same one written with its
-    // noun ("万" and "万用户", "个" and "个连接"); "亿元" and "亿美元" are two
-    const raw = (c: Cand) => (c.unit ?? '').trim().toLowerCase();
-    const allUnits = [...new Set([...readings.values()].map(raw))].sort((a, b) => a.length - b.length);
-    const unitRoot = new Map<string, string>();
-    for (const u of allUnits) unitRoot.set(u, allUnits.find((v) => v && u.startsWith(v)) ?? u);
-    const unitOf = (c: Cand) => unitRoot.get(raw(c)) ?? raw(c);
+    // one base: the commonest; a tie names no figure. A base that begins another is the same one written with its
+    // noun ("个" and "个连接"); a bare scale ("亿", "万") joins a base only when one base is named among the readings
+    // ("万" with "万用户"), never when two are ("亿" beside "亿元" and "亿美元"); "亿元" and "亿美元" are two
+    const baseOfC = (c: Cand) => unitParts(c.unit).base;
+    const namedBases = [...new Set([...readings.values()].map(baseOfC).filter(Boolean))].sort((a, b) => a.length - b.length);
+    const rootOf = (b: string) => (b ? namedBases.find((v) => b.startsWith(v)) ?? b : namedBases.length === 1 ? namedBases[0] : '');
+    const unitOf = (c: Cand) => rootOf(baseOfC(c));
     const byUnit = new Map<string, number>();
     for (const c of readings.values()) byUnit.set(unitOf(c), (byUnit.get(unitOf(c)) ?? 0) + 1);
     const unitsRanked = [...byUnit].sort((a, b) => b[1] - a[1]);
@@ -989,6 +1005,13 @@ export async function computeClaimSet(
       left.peers.size ? `${[...left.peers.values()].reduce((a, b) => a + b, 0)} about other organisations (${[...left.peers.keys()].join(', ')})` : '',
     ].filter(Boolean);
     if (readings.size === 0) return skip('no reading');
+    // figures compare in their base; they are shown in the commonest unit's scale
+    const unitCount = new Map<string, number>();
+    for (const c of readings.values()) unitCount.set(c.unit ?? '', (unitCount.get(c.unit ?? '') ?? 0) + 1);
+    const shownUnit = [...unitCount].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]?.[0] ?? '';
+    const shownScale = unitParts(shownUnit).scale;
+    const inBase = (c: Cand) => c.value_num! * unitParts(c.unit).scale;
+    const shown = (c: Cand) => inBase(c) / shownScale;
     let list = [...readings.values()].sort((a, b) => byDate(dateOf(a), dateOf(b)) || a.id.localeCompare(b.id));
     if (read.op === 'value') {
       // the value then: the latest stated on or before the date, a correction over what it corrects
@@ -1009,7 +1032,7 @@ export async function computeClaimSet(
       if (read.threshold) {
         const { cmp, value } = read.threshold;
         list = list.filter((c) => {
-          const v = c.value_num!;
+          const v = shown(c);
           return cmp === '<' ? v < value : cmp === '<=' ? v <= value : cmp === '>' ? v > value : v >= value;
         });
         if (list.length === 0) return skip('no reading past the threshold');
@@ -1022,7 +1045,7 @@ export async function computeClaimSet(
       }
       // groups of one reading each ("各周的周均值") group nothing: the operation is over them all
       if (groups.size > 1 && [...groups.values()].every((g) => g.length === 1)) groups = new Map([['all', list]]);
-      const unit = list.find((c) => c.unit)?.unit ?? '';
+      const unit = shownUnit;
       const attr = [...matchedAttrs].join('/') || terms.join('/');
       if (read.op === 'list' || read.op === 'count') {
         lines.push(`${list.length} readings of ${attr}${read.threshold ? ` ${read.threshold.cmp} ${read.threshold.value}` : ''}${from || to ? ` (${from ?? ''}..${to ?? ''})` : ''}:`);
@@ -1030,14 +1053,14 @@ export async function computeClaimSet(
         if (read.op === 'count') answer = list.length;
       } else {
         for (const [key, cs] of [...groups].sort((a, b) => a[0].localeCompare(b[0]))) {
-          const vs = cs.map((c) => c.value_num!);
+          const vs = cs.map(shown);
           if (read.op === 'mean' || read.op === 'sum') {
             const total = vs.reduce((s, v) => s + v, 0);
             const v = read.op === 'mean' ? total / vs.length : total;
             if (groups.size === 1) answer = fmt(v);
             lines.push(`${key === 'all' ? '' : `${key}: `}${read.op} of ${attr} over ${vs.length} readings${from || to ? ` (${from ?? ''}..${to ?? ''})` : ''} = ${fmt(v)}${unit} (3 decimals: ${v.toFixed(3)})`);
           } else {
-            const best = cs.reduce((b, c) => ((read.op === 'max' ? c.value_num! > b.value_num! : c.value_num! < b.value_num!) ? c : b));
+            const best = cs.reduce((b, c) => ((read.op === 'max' ? inBase(c) > inBase(b) : inBase(c) < inBase(b)) ? c : b));
             const r = toRow(best);
             if (groups.size === 1) answer = fmt(best.value_num!);
             lines.push(`${key === 'all' ? '' : `${key}: `}${read.op} ${attr} = ${r.value} — ${label(r)} (of ${vs.length} readings)`);
