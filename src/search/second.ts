@@ -1,7 +1,10 @@
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { SearchResult } from '../types.js';
 import { factsForQuestion, QuestionFact } from './facts.js';
-import { chunksForTerms, CJK_QUERY_STOP, keywordTerms, LATIN_QUERY_STOP, termCount } from './search.js';
+import { chunksForTerms, CJK_QUERY_STOP, keywordTerms, LATIN_QUERY_STOP, termCount, termStats } from './search.js';
+
+/** The keyword index's cap on a term's passages (search.ts): a word in this many is no word that narrows. */
+const KEYWORD_DF_CAP = 1000;
 
 /**
  * A second retrieval round when the first is thin (docs/design/34 §2).
@@ -172,10 +175,22 @@ export async function secondRound(
     .filter((g) => !g.some((r) => mentioned.has(r.id) || namesOf(r).some((n) => about.has(n) || (n.length >= 2 && passageText.includes(n)))))
     .map((g) => g.find((r) => r.id === r.root) ?? g[0]);
   const names = namedRows.flatMap(namesOf);
-  const missing = missingTerms(question, names, text);
+  // a word is missing only when the knowledge base holds it somewhere, in fewer passages than the keyword index's cap:
+  // a word in no passage ("列出", "综合", "接近" — the question's own framing) no second round can find, and one in
+  // most of them narrows nothing
+  const said = questionWords(question).filter((t) => !names.join(' ').toLowerCase().includes(t));
+  let asked0: string[] = [];
+  let missing: string[] = [];
+  if (said.length) {
+    const unheld = missingTerms(question, names, text);
+    statements++;
+    const { df } = await termStats(store, said).catch(() => ({ df: said.map(() => 0) }));
+    const retrievable = new Set(said.filter((_, i) => df[i] > 0 && df[i] < KEYWORD_DF_CAP));
+    asked0 = said.filter((t) => retrievable.has(t));
+    missing = unheld.filter((t) => retrievable.has(t));
+  }
   // thin: a named entity came back with nothing; half a lookup's words are nowhere; a chain misses a word, or its
   // step — the entity its first round reached — has no passage or fact of its own yet (only the claim that led to it)
-  const asked0 = questionWords(question).filter((t) => !names.join(' ').toLowerCase().includes(t));
   let thin = uncovered.length > 0 || (missing.length > 0 && (opts.chain || missing.length * 2 >= Math.max(1, asked0.length)));
   let stepCheck = false;
   if (!thin && opts.chain) stepCheck = true;

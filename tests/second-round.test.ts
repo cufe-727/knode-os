@@ -69,6 +69,8 @@ beforeAll(async () => {
   // a project mentioned in two documents only
   await addDoc('orion-1', 'Orion reached its first milestone; Atlas waits on it.', ['orion', 'atlas']);
   await addDoc('orion-2', 'Orion launched in week 32.', ['orion']);
+  // another project's budget: the word a lookup about Orion misses, held by a passage that is not Orion's
+  await addDoc('atlas-budget', 'The Atlas budget was cut by a fifth.', ['atlas']);
   // a person three documents mention: any passage of theirs is a step further
   await addEntity('r-07', 'R-07', 'other');
   await addEntity('liwei', 'Li Wei', 'person');
@@ -168,13 +170,21 @@ describe('the second round', () => {
   });
 
   it('reads a lookup further only from what it names, and only what holds the word it missed', async () => {
-    // Orion is covered; "budget" is in nothing: the round may only bring Orion's passages or facts holding it — there are none
+    // Orion is covered; "budget" is held only by an Atlas passage: the round reads Orion's alone, and Orion has none
     const r = await secondRound(store, 'What was the budget of Orion?', {
       named: ['orion'], contexts: [result('orion-2', 'Orion launched in week 32.')], facts: [], chain: false,
     });
     expect(r?.reason.from ?? []).toEqual(['Orion']);
+    expect(r?.reason.missingTerms).toEqual(['budget']);
     expect(r?.chunks ?? []).toEqual([]);
     expect(r?.facts ?? []).toEqual([]);
+  });
+
+  it('counts no word the knowledge base holds nowhere as missing: the question\'s own framing is no gap', async () => {
+    const r = await secondRound(store, 'List the overall gist of what Orion did, roughly.', {
+      named: ['orion'], contexts: [result('orion-2', 'Orion launched in week 32.')], facts: [], chain: false,
+    });
+    expect(r).toBeNull();
   });
 
   it('gives an ordinary lookup whose passages hold its words no round, however its words split into pairs', async () => {
