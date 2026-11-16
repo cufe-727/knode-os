@@ -395,66 +395,83 @@ function neutralKey(key: string): string {
   return fold(key).replace(/[的\s]/g, '').replace(/(环比|同比)(?:变化|变动|增幅|增速|涨幅|增长|增减)/gu, '$1').replace(/(?:数量|数|水平)$/u, '');
 }
 
+function bigrams(s: string): Set<string> {
+  const out = new Set<string>();
+  const t = s.replace(/\s+/g, '');
+  for (let i = 0; i + 2 <= t.length; i++) out.add(t.slice(i, i + 2));
+  if (t.length === 1) out.add(t);
+  return out;
+}
+
+function dice(a: string, b: string): number {
+  const x = bigrams(a);
+  const y = bigrams(b);
+  let shared = 0;
+  for (const g of x) if (y.has(g)) shared++;
+  return (2 * shared) / Math.max(1, x.size + y.size);
+}
+
 /**
- * A subject's keys that are one attribute, unified. Two keys of one unit and
- * the same qualifiers are one when
- *   - a synonym group holds both (事故级别 / 事故等级, 跟进人 / 负责人), however
- *     they were read when written;
- *   - they differ only by "的", spaces or a neutral last word (周活跃用户 /
- *     周活跃用户数);
+ * A subject's keys that are one attribute, unified. Keys of one unit and the
+ * same qualifiers (keyQualifiers: a change, a first value, a plan, an
+ * average, a total, a peak) are one when
+ *   - one contains the other or their bigrams mostly agree (Dice ≥ 0.67):
+ *     the rule claim state was built with (归母净利润 / 净利润, 销售毛利率 /
+ *     毛利率, 市盈率TTM / 市盈率), kept as it was;
+ *   - a synonym group holds both (事故级别 / 事故等级, 跟进人 / 负责人);
+ *   - they differ by 的, spaces or a neutral last word (周活跃用户 / 周活跃用户数);
  *   - both name the subject itself (namesSubject).
- * Nothing else: a key that contains another names another measure (股价 /
- * 基准情景终点股价, 首席执行官 / 临时首席执行官), and two keys of one head word
- * are two measures (批发价格 / 零售价格). The relation is closed transitively,
- * so the order keys come in decides nothing, and a group's canonical key is
- * chosen by rule, not by count: its synonym head (负责人, 状态, 级别), else the
- * subject's own name, else the shortest key (ties: code-point order). A key
- * alone is mapped to its synonym head too, so stored keys of an older reading
+ * What the qualifiers keep apart is what that rule used to join across them:
+ * a week-on-week change and the week's value, a setting's first value and its
+ * current one, 环比涨幅 and 同比涨幅. Keys are taken most used first (ties:
+ * code-point order) and each joins the first group it is one with, as before.
+ * A group's canonical key is chosen by rule, not by count: its synonym head
+ * (负责人, 状态, 级别), else the subject's own name, else the shortest key that
+ * no other member only extends by a neutral word (用户数, not 用户). A key alone
+ * is mapped to its synonym head too, so stored keys of an older reading
  * (跟进人) move with the mapping, without re-reading their claims.
  * Returns key → canonical key, with the reason, for keys that change.
  */
 export function unifyAttributeKeys(uses: AttributeUse[], spellings: readonly string[] = []): Map<string, { canonical: string; reason: string }> {
-  const list = [...uses].sort((a, b) => (a.attribute < b.attribute ? -1 : a.attribute > b.attribute ? 1 : 0));
+  const sorted = [...uses].sort((a, b) => b.count - a.count || (a.attribute < b.attribute ? -1 : a.attribute > b.attribute ? 1 : 0));
   const unitOf = (u: AttributeUse) => [...new Set(u.units.map((x) => x || '∅'))].sort().join('|');
-  const info = list.map((u) => ({
-    use: u,
-    unit: unitOf(u),
-    qualifiers: keyQualifiers(u.attribute),
-    synonym: SYNONYM.get(fold(u.attribute)) ?? null,
-    neutral: neutralKey(u.attribute),
-    self: namesSubject(u.attribute, spellings),
-  }));
-  const parent = info.map((_, i) => i);
-  const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i])));
-  const why = new Map<number, string>();
-  for (let i = 0; i < info.length; i++) {
-    for (let j = i + 1; j < info.length; j++) {
-      const a = info[i];
-      const b = info[j];
-      if (a.unit !== b.unit || a.qualifiers !== b.qualifiers) continue;
-      const reason = a.synonym && a.synonym === b.synonym ? '同义' : a.neutral === b.neutral ? '仅措辞不同' : a.self && b.self ? '都指主体自身的取值' : null;
-      if (!reason) continue;
-      const [x, y] = [find(i), find(j)];
-      if (x !== y) parent[y] = x;
-      why.set(j, reason);
-      if (!why.has(i)) why.set(i, reason);
+  type Key = { use: AttributeUse; unit: string; qualifiers: string; synonym: string | null; neutral: string; self: boolean; why: string };
+  const groups: Key[][] = [];
+  const related = (m: Key, k: Key): string | null => {
+    if (m.synonym && m.synonym === k.synonym) return '同义';
+    if (m.neutral === k.neutral) return '仅措辞不同';
+    if (m.self && k.self) return '都指主体自身的取值';
+    const [s, l] = m.use.attribute.length <= k.use.attribute.length ? [m.use.attribute, k.use.attribute] : [k.use.attribute, m.use.attribute];
+    if ((s.length >= 2 && l.includes(s)) || dice(m.use.attribute, k.use.attribute) >= 0.67) return '同单位且名称相近';
+    return null;
+  };
+  for (const use of sorted) {
+    const k: Key = { use, unit: unitOf(use), qualifiers: keyQualifiers(use.attribute), synonym: SYNONYM.get(fold(use.attribute)) ?? null, neutral: neutralKey(use.attribute), self: namesSubject(use.attribute, spellings), why: '同义' };
+    let joined = false;
+    for (const g of groups) {
+      if (g[0].unit !== k.unit || g[0].qualifiers !== k.qualifiers) continue;
+      const why = g.map((m) => related(m, k)).find(Boolean);
+      if (!why) continue;
+      k.why = why;
+      g.push(k);
+      joined = true;
+      break;
     }
+    if (!joined) groups.push([k]);
   }
-  const groups = new Map<number, number[]>();
-  for (let i = 0; i < info.length; i++) (groups.get(find(i)) ?? groups.set(find(i), []).get(find(i))!).push(i);
   const own = spellings.map((s) => fold(s));
+  const extends_ = (a: string, b: string) => b.length > a.length && b.startsWith(a) && /^(?:数量|数|水平)$/u.test(b.slice(a.length));
   const out = new Map<string, { canonical: string; reason: string }>();
-  for (const members of groups.values()) {
-    const keys = members.map((i) => info[i]);
+  for (const keys of groups) {
     const head = keys.find((k) => k.synonym)?.synonym;
     const named = keys.find((k) => own.includes(fold(k.use.attribute)))?.use.attribute;
-    const shortest = [...keys].sort((a, b) => a.use.attribute.length - b.use.attribute.length || (a.use.attribute < b.use.attribute ? -1 : 1))[0].use.attribute;
+    const names = keys.map((k) => k.use.attribute);
+    const whole = names.filter((n) => !names.some((o) => extends_(n, o)));
+    const shortest = [...whole].sort((a, b) => a.length - b.length || (a < b ? -1 : 1))[0];
     const canonical = head ?? named ?? shortest;
-    for (const i of members) {
-      const k = info[i];
+    for (const k of keys) {
       if (k.use.attribute === canonical) continue;
-      const reason = members.length === 1 ? '同义' : why.get(i) ?? '同义';
-      out.set(k.use.attribute, { canonical, reason: `与"${canonical}"${reason}（${k.use.count} 条断言）` });
+      out.set(k.use.attribute, { canonical, reason: `与"${canonical}"${k.why}（${k.use.count} 条断言）` });
     }
   }
   return out;

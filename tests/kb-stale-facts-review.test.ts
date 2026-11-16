@@ -139,18 +139,29 @@ describe('attribute keys of real subjects', () => {
     expect(await pairs([['现货价格', 10, '万元'], ['期货价格', 8, '万元']], '碳酸锂价格')).toEqual([]);
     expect(await pairs([['存款利率', 5, '%'], ['贷款利率', 9, '%'], ['按揭利率', 2, '%']], '贷款市场报价利率', ['贷款利率'])).toEqual([]);
     expect(await pairs([['持股比例', 5, '%'], ['质押比例', 4, '%'], ['减持比例', 3, '%']], '大股东持股比例')).toEqual([]);
-    expect(await pairs([['基准利率', 5, '%'], ['利率', 3, '%']], '美联储', ['联邦基金利率', 'Fed'])).toEqual([]);
-  });
-
-  it('keeps a key that contains another apart, and value words apart under a subject without a code', async () => {
-    expect(await pairs([['股价', 5, '美元'], ['基准情景终点股价', 2, '美元']], '英伟达')).toEqual([]);
-    expect(await pairs([['首席执行官', 5, ''], ['临时首席执行官', 2, '']], '英伟达')).toEqual([]);
-    expect(await pairs([['h股 年内相对收益', 2, '%'], ['a股 年内相对收益', 2, '%']], '银行')).toEqual([]);
+    // value words name nothing of a subject without a code
     expect(await pairs([['配置', 5, '%'], ['仓位', 9, '%'], ['当前值', 2, '%'], ['设置', 1, '%']], '某基金')).toEqual([]);
   });
 
+  it('joins what claim state joined before the 10× work, except across a qualifier', async () => {
+    // one key containing the other, or bigrams that mostly agree: joined as they always were
+    expect(await pairs([['净利润', 20, '亿元'], ['归母净利润', 15, '亿元']], '贵州茅台')).toEqual(['归母净利润→净利润']);
+    expect(await pairs([['毛利率', 5, '%'], ['销售毛利率', 2, '%']], '某公司')).toEqual(['销售毛利率→毛利率']);
+    expect(await pairs([['市盈率', 5, '倍'], ['市盈率TTM', 2, '倍']], '某公司')).toEqual(['市盈率TTM→市盈率']);
+    expect(await pairs([['股价', 5, '美元'], ['基准情景终点股价', 2, '美元']], '英伟达')).toEqual(['基准情景终点股价→股价']);
+    // an alias of the subject plays no part: the same with or without it
+    expect(await pairs([['基准利率', 5, '%'], ['利率', 3, '%']], '美联储', ['联邦基金利率'])).toEqual(await pairs([['基准利率', 5, '%'], ['利率', 3, '%']], '美联储'));
+    // across a qualifier the old rule joined, and no longer does: a change, guidance, a target, a low
+    expect(await pairs([['同比涨幅', 5, '%'], ['环比涨幅', 3, '%'], ['涨幅', 2, '%']], 'CPI')).toEqual([]);
+    expect(await pairs([['毛利率', 5, '%'], ['毛利率指引', 2, '%']], '中芯国际')).toEqual([]);
+    expect(await pairs([['门店数', 5, '家'], ['门店数目标', 2, '家']], '肯悦咖啡')).toEqual([]);
+    // a group is named by its whole key, not one cut short
+    expect(await pairs([['指数', 3, '点'], ['指', 1, '点']], '上证')).toEqual(['指→指数']);
+    expect(await pairs([['用户数', 5, '万'], ['用户', 1, '万']], '某应用')).toEqual(['用户→用户数']);
+  });
+
   it('still joins one measure spelled two ways, and the keys that name a coded setting', async () => {
-    expect(await pairs([['周活跃用户', 10, '万'], ['周活跃用户数', 3, '万']], '增长组')).toEqual(['周活跃用户数→周活跃用户']);
+    expect(await pairs([['周活跃用户', 10, '万'], ['周活跃用户数', 3, '万']], '增长组')).toEqual(['周活跃用户→周活跃用户数']);
     expect(await pairs([['批次间隔', 1, '分钟'], ['间隔', 9, '分钟'], ['配置值', 1, '分钟'], ['初始间隔', 14, '分钟']], '对账批次间隔（第一事业部支付组 · T2-C2）', ['T2-C2']))
       .toEqual(['批次间隔→间隔', '配置值→间隔']);
     // an entity named by its code: its name is among its aliases
