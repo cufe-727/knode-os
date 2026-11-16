@@ -533,6 +533,15 @@ describe('periods a figure covers (re-check item 5)', () => {
   });
 });
 
+describe('round three (C1-C7)', () => {
+  it('C1: reads 合计 as a sum, and lists no peer organisation\'s own figures as the scope\'s items', async () => {
+    expect(readSetQuestion('宁德时代2025年营收合计多少？', classifyQuestion('宁德时代2025年营收合计多少？'), '2026-11-16')).toMatchObject({ op: 'sum' });
+    // 比亚迪's 毛利率 and 市值, stated in 宁德时代's reports, are 比亚迪's: no item of 宁德时代's
+    const s = await set('宁德时代的毛利率有哪些？', ['catl']);
+    expect(s?.lines.join('\n') ?? '').not.toMatch(/^- 比亚迪/m);
+  });
+});
+
 describe('a Chinese question end to end (review item 11)', () => {
   it('puts the value as of a day, its sources and what it left out before the model, and no forecast as a fact', async () => {
     const { llm, prompts } = recordingLlm();

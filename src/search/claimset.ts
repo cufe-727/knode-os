@@ -215,13 +215,16 @@ export function readSetQuestion(question: string, routed: Pick<QuestionRoute, 'k
   // a value asked as of a day: a quantity or a setting, not what happened that day ("那天发布了什么公告")
   const valueAsked = /多少|几|数值|水平|上限|下限|阈值|比例|\bhow (?:much|many)\b|\bwhat (?:is|was) the (?!\w+ (?:that|which)\b)[\w -]{0,40}\b(?:of|for|at)\b/i.test(q)
     && !/发布|宣布|公告|发生|举行|召开|签署|\bannounc|\bhappen|\breleas|\bpublish|\bsign(?:ed)?\b|\bsaid\b/i.test(q);
-  const counting = /几[起个位名家项次人]|多少[起个位名家项次人]|一共|总共|总数|\bhow many\b|\bnumber of\b|\bcount\b/i.test(q);
+  // a count asks how many of something (几起, 多少个, 总数, how many); a total of a figure without one is a sum
+  // ("营收合计多少", "一共多少营收")
+  const counting = /几[起个位名家项次人]|多少[起个位名家项次人]|总数|\bhow many\b|\bnumber of\b|\bcount\b/i.test(q);
+  const totalling = /一共|总共|合计|共计|总计|总额|总和|累计|加起来|\bsum\b|\btotal\b/i.test(q);
   let op: SetOp;
   if (/平均|均值|\baverage\b|\bmean\b/i.test(q)) op = 'mean';
   else if (/最高|最大|峰值|\bhighest\b|\bmaximum\b|\bpeak\b/i.test(q)) op = 'max';
   else if (/最低|最小|\blowest\b|\bminimum\b/i.test(q)) op = 'min';
-  else if (/总额|总和|累计|\bsum\b|\btotal (?:amount|value)\b/i.test(q)) op = 'sum';
   else if (counting) op = 'count';
+  else if (totalling) op = 'sum';
   else if (asOf && !listy && valueAsked) op = 'value';
   else if (listy || routed.kind === 'list' || routed.kind === 'aggregate') op = 'list';
   else return null;
@@ -1203,8 +1206,11 @@ async function computeWithin(
       : [];
     if (late()) return skip('over its time budget');
     // the scope's own organisations are where the items are, never items
+    // another organisation's claim about itself ("比亚迪毛利率17.6%", stated in the scope's report) makes it no item
+    // of the scope: an organisation is one when its claim relates it to the scope (names a member, or is the scope's)
+    const relatesToScope = (c: Cand) => (c.object_id !== null && members.has(c.object_id)) || names.some((n) => n.length >= 2 && c.statement.includes(n));
     const itemsOf = (c: Cand): { key: string; name: string; id: string }[] => {
-      const subjectFits = !members.has(c.subject_id) && (!read.asks || c.subject_type === read.asks);
+      const subjectFits = !members.has(c.subject_id) && (!read.asks || c.subject_type === read.asks) && !(scoped && c.subject_type === 'organization' && !relatesToScope(c));
       if (subjectFits) return [{ key: itemKey(c.subject), name: c.subject, id: c.subject_id }];
       if (c.object && c.object_id && !members.has(c.object_id) && (!read.asks || c.object_type === read.asks)) return [{ key: itemKey(c.object), name: c.object, id: c.object_id }];
       if (read.asks === 'person') {
