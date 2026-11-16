@@ -35,10 +35,10 @@ async function addEntity(id: string, name: string, type: string): Promise<void> 
   }
 }
 
-async function addDoc(id: string, content: string, mentions: string[]): Promise<void> {
+async function addDoc(id: string, content: string, mentions: string[], vector = [1, 0, 0, 0]): Promise<void> {
   await store.query(`INSERT INTO documents (id, path, root, title, sha256, bytes, status) VALUES ($1, $2, 'docs', $1, $3, 10, 'indexed')`, [id, `raw/docs/${id}.md`, `sha-${id}`]);
   await store.query(`INSERT INTO chunks (id, document_id, seq, content, token_count, tsv) VALUES ($1, $2, 0, $3, 3, to_tsvector('simple', $3))`, [`c-${id}`, id, content]);
-  await store.query(`INSERT INTO embeddings (chunk_id, model, embedding) VALUES ($1, $2, $3::${VECTOR_TYPE})`, [`c-${id}`, embedder.model, toVectorLiteral([1, 0, 0, 0])]);
+  await store.query(`INSERT INTO embeddings (chunk_id, model, embedding) VALUES ($1, $2, $3::${VECTOR_TYPE})`, [`c-${id}`, embedder.model, toVectorLiteral(vector)]);
   await store.query(`INSERT INTO scopes (id, kind, key, sha, status, applied_at) VALUES ($1, 'doc', $2, $3, 'active', now())`, [`s-${id}`, `raw/docs/${id}.md`, `sha-${id}`]);
   for (const e of mentions) {
     await store.query(`INSERT INTO entity_mentions (entity_id, chunk_id, document_id, scope_id) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`, [e, `c-${id}`, id, `s-${id}`]);
@@ -59,6 +59,13 @@ beforeAll(async () => {
   for (let i = 1; i <= 20; i++) await addDoc(`week-${i}`, `Weekly report ${i}. Fang Jie reviewed tickets and joined the stand-up.`, ['fang']);
   await addDoc('raised', 'Fang Jie raised risk R-03 about the load-test environment.', ['fang', 'r-03']);
   await addDoc('moved', 'Fang Jie transferred to the Growth team this week.', ['fang']);
+  // a spelling merged into Atlas, mentioned nowhere
+  await store.query(`INSERT INTO entities (id, name, type, mention_count, aliases, description, canonical_id) VALUES ('atlas-v', 'ATLAS-X', 'project', 1, '[]'::jsonb, '', 'atlas')`);
+  // a hub: three hundred documents mention Helios; one says what it decided on the recall, one is nearest the question
+  await addEntity('helios', 'Helios', 'organization');
+  for (let i = 0; i < 300; i++) await addDoc(`helios-${String(i).padStart(3, '0')}`, `Helios weekly note ${i}: shipments as planned.`, ['helios']);
+  await addDoc('helios-zz-recall', 'Helios decided to recall the battery packs of the first batch.', ['helios']);
+  await addDoc('helios-zz-near', 'Helios board minutes.', ['helios'], [0, 1, 0, 0]);
   // a project mentioned in two documents only
   await addDoc('orion-1', 'Orion reached its first milestone; Atlas waits on it.', ['orion', 'atlas']);
   await addDoc('orion-2', 'Orion launched in week 32.', ['orion']);
@@ -107,11 +114,37 @@ describe('the second round', () => {
     expect(r?.statements).toBeGreaterThan(0);
   });
 
-  it('looks for a named entity nothing came back about, within its budget', async () => {
+  it('looks for a named entity nothing came back about', async () => {
     const r = await secondRound(store, 'What happened to Orion?', { named: ['orion'], contexts: [], facts: [], chain: false });
     expect(r?.reason.uncoveredNamed).toEqual(['Orion']);
     expect(r?.chunks.map((c) => c.path).sort()).toEqual(['raw/docs/orion-1.md', 'raw/docs/orion-2.md']);
     expect(r!.chunks.length).toBeLessThanOrEqual(SECOND_CHUNKS);
+  });
+
+  it('takes a named entity as covered when any of its spellings is: a merged spelling absent from the passages is no gap', async () => {
+    const r = await secondRound(store, 'Atlas waits on what?', {
+      named: ['atlas', 'atlas-v'], contexts: [result('orion-1', 'Orion reached its first milestone; Atlas waits on it.')], facts: [], chain: false,
+    });
+    expect(r).toBeNull();
+  });
+
+  it('gives a chain no second round when its passages and facts hold every word it asks', async () => {
+    const r = await secondRound(store, 'Who raised risk R-07?', {
+      named: ['r-07'], contexts: [result('raised7', 'Li Wei raised risk R-07 on the payment gateway.')],
+      facts: [{ subject: 'R-07', object: 'Li Wei', statement: 'R-07 was raised by Li Wei' }], chain: true,
+    });
+    expect(r).toBeNull();
+  });
+
+  it('reads a hub entity\'s passages nearest the question first, or those holding its missing words, within its budget', async () => {
+    const nearest = await secondRound(store, 'What did Helios decide about the battery recall?', {
+      named: ['helios'], contexts: [], facts: [], chain: false, queryVector: [0, 1, 0, 0], model: embedder.model,
+    });
+    expect(nearest!.chunks).toHaveLength(SECOND_CHUNKS);
+    expect(nearest!.chunks[0].path).toBe('raw/docs/helios-zz-near.md');
+    const worded = await secondRound(store, 'What did Helios decide about the battery recall?', { named: ['helios'], contexts: [], facts: [], chain: false });
+    expect(worded!.chunks[0].path).toBe('raw/docs/helios-zz-recall.md');
+    expect(worded!.chunks.length).toBeLessThanOrEqual(SECOND_CHUNKS);
   });
 
   it('does not run when the first round holds what the question asks about', async () => {
@@ -128,7 +161,7 @@ describe('ask with a second round', () => {
     const q = 'Who raised risk R-07, and where is that person now?';
     const res = await ask(store, defaultConfig(), embedder, llm, q, { queryVector: [1, 0, 0, 0], k: 1 });
     expect(res.route.kind).toBe('multihop');
-    expect(res.route.second).toMatchObject({ from: ['Li Wei'] });
+    expect(res.route.second).toMatchObject({ from: expect.arrayContaining(['Li Wei']) });
     expect(res.route.second!.chunks).toBeGreaterThan(0);
     expect(res.contexts.map((c) => c.path)).toContain('raw/docs/liwei-move.md');
     const off = await ask(store, defaultConfig(), embedder, llm, q, { queryVector: [1, 0, 0, 0], k: 1, second: false });

@@ -43,8 +43,10 @@ export const BRIDGE_DOCS = 15;
 export const BRIDGE_DOCS_WORDED = 80;
 /** Entities reached, looked further from at most. */
 const BRIDGES = 4;
-/** Passages read as candidates at most. */
+/** Passages read as candidates at most, the best first (nearest the question, else holding most missing words). */
 const CANDIDATES = 240;
+/** Mentions of the entities looked from read at most, before the candidates are ranked: a hub has thousands. */
+const POOL = 2000;
 /** Characters that make a CJK pair a piece of grammar, not a word ("的人", "复过", "那起"). */
 const FUNCTION_CHARS = /[的了过是在有和与及那这它他她其一被由把将又也都还就人个位些此该吗呢么哪谁几什]/;
 
@@ -87,23 +89,33 @@ export async function secondRound(
   const { named, contexts, facts } = opts;
   const text = [...contexts.map((c) => c.content), ...facts.map((f) => `${f.subject} ${f.statement} ${f.object ?? ''}`)].join('\n');
 
-  // named entities nothing was about: no fact's subject or object, no passage mentions them
+  // named entities nothing was about: an entity, not a spelling — one is covered when any spelling merged into or
+  // with it is mentioned by a passage, is a fact's subject or object, or is written in a passage
   const namedRows = named.length
-    ? await q<{ id: string; name: string; aliases: unknown; mentioned: boolean }>(
-      `SELECT e.id, e.name, e.aliases,
-              EXISTS (SELECT 1 FROM entity_mentions m WHERE m.entity_id = e.id AND m.chunk_id = ANY($2::text[])) AS mentioned
-       FROM entities e WHERE e.id = ANY($1::text[])`,
-      [named, contexts.map((c) => c.chunkId)],
+    ? await q<{ id: string; root: string; name: string; aliases: unknown }>(
+      `SELECT e.id, COALESCE(e.canonical_id, e.id) AS root, e.name, e.aliases FROM entities e
+       WHERE e.id = ANY($1::text[]) OR e.canonical_id = ANY($1::text[])
+          OR e.id IN (SELECT canonical_id FROM entities WHERE id = ANY($1::text[]) AND canonical_id IS NOT NULL)`,
+      [named],
     )
     : [];
+  const spellingIds = namedRows.map((r) => r.id);
+  const mentioned = new Set(spellingIds.length && contexts.length
+    ? (await q<{ entity_id: string }>(`SELECT DISTINCT entity_id FROM entity_mentions WHERE entity_id = ANY($1::text[]) AND chunk_id = ANY($2::text[])`, [spellingIds, contexts.map((c) => c.chunkId)])).map((r) => r.entity_id)
+    : []);
   const namesOf = (r: { name: string; aliases: unknown }) => [r.name, ...(Array.isArray(r.aliases) ? r.aliases.filter((a): a is string => typeof a === 'string') : [])];
   const about = new Set(facts.flatMap((f) => [f.subject, f.object ?? '']).filter(Boolean));
-  const uncovered = namedRows.filter((r) => !r.mentioned && !namesOf(r).some((n) => about.has(n)));
+  const passageText = contexts.map((c) => c.content).join('\n');
+  const groups = new Map<string, typeof namedRows>();
+  for (const r of namedRows) (groups.get(r.root) ?? groups.set(r.root, []).get(r.root)!).push(r);
+  const uncovered = [...groups.values()]
+    .filter((g) => !g.some((r) => mentioned.has(r.id) || namesOf(r).some((n) => about.has(n) || (n.length >= 2 && passageText.includes(n)))))
+    .map((g) => g.find((r) => r.id === r.root) ?? g[0]);
   const names = namedRows.flatMap(namesOf);
   const missing = missingTerms(question, names, text);
-  // a chain asks for steps one round took at once: it gets the next step always; a lookup, when a named entity
-  // came back with nothing or half the words it asks about are nowhere
-  const thin = opts.chain || uncovered.length > 0 || (missing.length > 0 && missing.length * 2 >= Math.max(1, keywordTerms(question).length));
+  // thin: a named entity came back with nothing; or words the question asks are nowhere — any of a chain's (one
+  // round took at once the steps it asks one after another), half of a lookup's
+  const thin = uncovered.length > 0 || (missing.length > 0 && (opts.chain || missing.length * 2 >= Math.max(1, keywordTerms(question).length)));
   if (!thin) return null;
 
   // what to look further from: the uncovered named entities, and the entities the first round reached — its facts
@@ -116,7 +128,7 @@ export async function secondRound(
             (SELECT count(DISTINCT m.document_id)::int FROM entity_mentions m WHERE m.entity_id = e.id) AS docs
      FROM entities e LEFT JOIN ctx ON ctx.entity_id = e.id
      WHERE (e.name = ANY($1::text[]) OR ctx.entity_id IS NOT NULL) AND e.tx_to IS NULL AND e.canonical_id IS NULL AND NOT e.id = ANY($3::text[])`,
-    [[...reachedNames.keys()], contexts.map((c) => c.chunkId), named],
+    [[...reachedNames.keys()], contexts.map((c) => c.chunkId), spellingIds],
   );
   // the ones the facts about what the question asks hold most, a rarer one before a commoner
   const asked = keywordTerms(question).filter((t) => !names.join(' ').toLowerCase().includes(t));
@@ -131,27 +143,41 @@ export async function secondRound(
     .sort((a, b) => (weight.get(b.name) ?? 0) - (weight.get(a.name) ?? 0) || a.docs - b.docs || a.id.localeCompare(b.id))
     .slice(0, BRIDGES);
   const common = new Set(bridges.filter((b) => b.docs > BRIDGE_DOCS).map((b) => b.id));
-  const from = [...uncovered.map((r) => r.id), ...bridges.map((b) => b.id)];
+  // an uncovered named entity is looked from through every spelling; a hub among them, with no vector to rank its
+  // passages by, only through passages holding a missing word
+  const withVector = Boolean(opts.queryVector && opts.model);
+  const uncoveredIds = uncovered.flatMap((u) => groups.get(u.root)!.map((r) => r.id));
+  if (!withVector && uncoveredIds.length) {
+    const hubs = await q<{ id: string }>(
+      `SELECT entity_id AS id FROM entity_mentions WHERE entity_id = ANY($1::text[]) GROUP BY 1 HAVING count(DISTINCT document_id) > $2`, [uncoveredIds, BRIDGE_DOCS],
+    );
+    for (const h of hubs) common.add(h.id);
+  }
+  const from = [...uncoveredIds, ...bridges.map((b) => b.id)];
   if (from.length === 0) return null;
 
   // the passages that mention them, most of them first, then the missing words, then nearness
   const shown = contexts.map((c) => c.chunkId);
-  const withVector = Boolean(opts.queryVector && opts.model);
-  const cands = await q<{ chunk_id: string; document_id: string; path: string; title: string | null; content: string; doc_date: string | Date | null; hits: number; ents: string[]; sim: number | null }>(
-    `WITH hit AS (
-       SELECT m.chunk_id, count(DISTINCT m.entity_id)::int AS hits, array_agg(DISTINCT m.entity_id) AS ents FROM entity_mentions m
-       WHERE m.entity_id = ANY($1::text[]) AND NOT m.chunk_id = ANY($2::text[]) GROUP BY 1
+  const words = missing.slice(0, 6).map((t) => `%${t.replace(/[%_\\]/g, '\\$&')}%`);
+  const wordsSql = words.length ? words.map((_, i) => `(c.content ILIKE $${withVector ? 6 + i : 4 + i})::int`).join(' + ') : '0';
+  const cands = await q<{ chunk_id: string; document_id: string; path: string; title: string | null; content: string; doc_date: string | Date | null; hits: number; ents: string[]; sim: number | null; words: number }>(
+    `WITH m AS MATERIALIZED (
+       SELECT chunk_id, entity_id FROM entity_mentions WHERE entity_id = ANY($1::text[]) AND NOT chunk_id = ANY($2::text[]) LIMIT ${POOL}
+     ), hit AS (
+       SELECT chunk_id, count(DISTINCT entity_id)::int AS hits, array_agg(DISTINCT entity_id) AS ents FROM m GROUP BY 1
+     ), scored AS (
+       SELECT c.id AS chunk_id, c.document_id, d.path, d.title, c.content, d.doc_date, hit.hits, hit.ents,
+              ${withVector ? `(SELECT 1 - (e.embedding <=> $4::${VECTOR_TYPE}) FROM embeddings e WHERE e.chunk_id = c.id AND e.model = $5)` : 'NULL::float'} AS sim,
+              ${wordsSql} AS words
+       FROM hit JOIN chunks c ON c.id = hit.chunk_id JOIN documents d ON d.id = c.document_id
+       WHERE d.status = 'indexed'
      )
-     SELECT c.id AS chunk_id, c.document_id, d.path, d.title, c.content, d.doc_date, hit.hits, hit.ents,
-            ${withVector ? `(SELECT 1 - (e.embedding <=> $4::${VECTOR_TYPE}) FROM embeddings e WHERE e.chunk_id = c.id AND e.model = $5)` : 'NULL::float'} AS sim
-     FROM hit JOIN chunks c ON c.id = hit.chunk_id JOIN documents d ON d.id = c.document_id
-     WHERE d.status = 'indexed'
-     ORDER BY hit.hits DESC, c.id LIMIT $3`,
-    withVector ? [from, shown, CANDIDATES, toVectorLiteral(opts.queryVector!), opts.model] : [from, shown, CANDIDATES],
+     SELECT * FROM scored ORDER BY hits DESC, ${withVector ? 'sim DESC NULLS LAST, ' : ''}words DESC, chunk_id LIMIT $3`,
+    withVector ? [from, shown, CANDIDATES, toVectorLiteral(opts.queryVector!), opts.model, ...words] : [from, shown, CANDIDATES, ...words],
   );
   const scored = cands.map((c) => {
     const words = missing.filter((t) => termCount(c.content.toLowerCase(), t) > 0).length;
-    return { c, words, key: [c.hits, words, c.sim ?? 0] as const };
+    return { c, words, key: withVector ? [c.hits, c.sim ?? 0, words] as const : [c.hits, words, 0] as const };
   })
     // a passage reached only through a common entity must hold a missing word
     .filter((x) => x.words > 0 || (x.c.ents ?? []).some((e) => !common.has(e)))
