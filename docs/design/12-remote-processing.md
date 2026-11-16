@@ -218,7 +218,10 @@ processing is started, as embedding does now.
   statement, that many rows of the index at the most, each row looked up as it is pulled: the planner cannot answer
   by reading the side instead (left to choose, it ranked 34,000 chunks of four folders without the index, 420,000
   blocks), and a side near the question ends its walk in a few dozen rows. A side counted past the measure, or
-  empty, is not counted again for a minute by a search with the same conditions. A walk that ends short of `k` is all such a side gets: what it found is returned, nearest
+  empty, is not counted again for a minute by a search with the same conditions — unless this process has written
+  documents, chunks, pages or scopes since (`Store.contentVersion`), which puts every remembered count out of date
+  at once; and where all a search could return was remembered as empty, the sides are counted before it answers
+  with nothing (a write by another process does not show here). A walk that ends short of `k` is all such a side gets: what it found is returned, nearest
   first, and the channel is marked partial (`SearchChannel.partial`, in `channels.vector` of an explained search)
   with what stopped it and how many it has; so is the walk that looks for pages beside the sources, when it ends at
   its limit before it has its forty rows. Nothing is read after a walk: for a day a side the walk found nothing of

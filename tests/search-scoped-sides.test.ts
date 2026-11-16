@@ -554,4 +554,81 @@ describe.each(BACKENDS)('scoped searches on %s', (backend) => {
       expect(await store.query(`SHOW hnsw.ef_search`)).toEqual([{ 'hnsw.ef_search': '40' }]);
     });
   });
+
+  // last in the file: it adds documents to the index, and takes them away again
+  describe('what a search remembers of its sides', () => {
+    /** Statements sent past the store, as another process writing the same database sends them. */
+    const elsewhere = (sql: string, params?: unknown[]) =>
+      (store as unknown as { db: { query(sql: string, params?: unknown[]): Promise<unknown> } }).db.query(sql, params);
+    const countsOf = () => {
+      const counts: string[] = [];
+      const on = Object.create(store) as Store;
+      on.query = ((sql: string, params?: unknown[]) => {
+        if (/SELECT count\(\*\)::int FROM \(\s*SELECT 1 FROM documents d/.test(sql)) counts.push(sql);
+        return store.query(sql, params);
+      }) as typeof store.query;
+      return { on, counts };
+    };
+
+    it('does not answer nothing from a count it remembers', async () => {
+      // a folder with nothing in it: no result, and its sides remembered as empty
+      expect(await found({ sources: ['raw/docs/fresh'] })).toEqual([]);
+      expect(await found({ sources: ['raw/docs/fresh'] })).toEqual([]);
+      try {
+        // fifty documents arrive, written by another process: nothing this store sent says so
+        await elsewhere(
+          `INSERT INTO documents (id, path, root, kind, title, sha256, bytes, status)
+           SELECT 'd-x' || i, 'raw/docs/fresh/x' || i || '.md', 'docs', 'source', 'x' || i, 'sha-x' || i, 10, 'indexed' FROM generate_series(1, 50) i`,
+        );
+        await elsewhere(
+          `INSERT INTO chunks (id, document_id, seq, content, token_count, tsv)
+           SELECT 'x' || i, 'd-x' || i, 0, 'chunk x' || i, 2, to_tsvector('simple', 'chunk') FROM generate_series(1, 50) i`,
+        );
+        await elsewhere(
+          `INSERT INTO embeddings (chunk_id, model, embedding)
+           SELECT 'x' || i, 'fixture-v1', ('[1,' || i / 100.0 || ',0,0]')::${VECTOR_TYPE} FROM generate_series(1, 50) i`,
+        );
+        // the next search of the folder, at once: its eight nearest, not the nothing that was remembered
+        const { results, channels } = await searchExplained(store, embedder, 'chunk', {
+          k: 8, mode: 'vector', track: false, current: false, queryVector: AMONG_PAGES, filter: resolveScopeFilter({ sources: ['raw/docs/fresh'] }),
+        });
+        expect(results.map((r) => r.chunkId)).toEqual(['x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8']);
+        expect(channels.vector).toEqual({ hits: 24, ms: expect.any(Number) });
+      } finally {
+        await elsewhere(`DELETE FROM embeddings WHERE chunk_id IN (SELECT id FROM chunks WHERE document_id LIKE 'd-x%')`);
+        await elsewhere(`DELETE FROM chunks WHERE document_id LIKE 'd-x%'`);
+        await elsewhere(`DELETE FROM documents WHERE id LIKE 'd-x%'`);
+      }
+    });
+
+    it('counts a side again once the store has written documents or chunks', async () => {
+      const { on, counts } = countsOf();
+      const narrowed = { k: 8, mode: 'vector' as const, track: false, current: false, queryVector: AMONG_REPORTS, filter: resolveScopeFilter({ sources: ['raw/docs/main'] }) };
+      await search(on, embedder, 'chunk', narrowed);
+      counts.length = 0;
+      // remembered: the folder is past what is read, and has no pages
+      for (let i = 0; i < 2; i++) await search(on, embedder, 'chunk', narrowed);
+      expect(counts).toHaveLength(0);
+      // a document is written through the store (here, to no effect): what was remembered was counted before it
+      await store.query(`UPDATE documents SET title = title WHERE id = 'd-m1'`);
+      await search(on, embedder, 'chunk', narrowed);
+      expect(counts).toHaveLength(1);
+      await search(on, embedder, 'chunk', narrowed);
+      expect(counts).toHaveLength(1);
+      // the sides of the whole index are kept the same way
+      const everything = { k: 8, mode: 'vector' as const, track: false, current: false, queryVector: AMONG_REPORTS };
+      await search(on, embedder, 'chunk', everything);
+      counts.length = 0;
+      await search(on, embedder, 'chunk', everything);
+      expect(counts).toHaveLength(0);
+      await store.tx(async (q) => q.query(`UPDATE chunks SET token_count = token_count WHERE id = 'm1'`));
+      await search(on, embedder, 'chunk', everything);
+      expect(counts).toHaveLength(1);
+      // a write to anything else leaves them
+      await store.setMeta('scoped-sides-test', { at: 1 });
+      await search(on, embedder, 'chunk', everything);
+      await search(on, embedder, 'chunk', narrowed);
+      expect(counts).toHaveLength(2);
+    });
+  });
 });

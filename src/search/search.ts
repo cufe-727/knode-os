@@ -626,12 +626,17 @@ interface SideSizes {
   /** Searchable chunks of sources, counted as far as the cap. */
   sources: number;
   generated: number;
+  /** A size here was not counted by this search: it is one remembered from an earlier count. */
+  remembered?: boolean;
 }
 
-const wholeSides = new WeakMap<object, SideSizes & { at: number }>();
+/** How long a count is remembered, where nothing this process wrote has put it out of date sooner. */
+const SIDES_REMEMBERED_MS = 60_000;
 
-/** Per store, per search conditions and cap: when each side was last counted empty or past the cap, and which. */
-type SettledSides = { sources?: { at: number; n: number }; generated?: { at: number; n: number } };
+const wholeSides = new WeakMap<object, SideSizes & { at: number; version: number }>();
+
+/** Per store, per search conditions and cap: each side last counted empty or past the cap — when, and at which content version of the store. */
+type SettledSides = { sources?: { at: number; n: number; version: number }; generated?: { at: number; n: number; version: number } };
 const settledSides = new WeakMap<object, Map<string, SettledSides>>();
 /** Conditions remembered per store: the oldest is forgotten past this many. */
 const LARGE_SIDES_KEPT = 64;
@@ -652,16 +657,29 @@ const LARGE_SIDES_KEPT = 64;
  * whole index's sides are kept as long. A side within the cap is counted by
  * each search, since what it holds decides what is read.
  *
+ * What is remembered is put out of date by a write: it is kept with the
+ * store's content version (`Store.contentVersion`, which moves when this
+ * process writes documents, chunks, pages or scopes) and not used once that
+ * has moved — a folder that has just been filled, or emptied, is counted
+ * again by the next search. A write by another process moves nothing here,
+ * so the minute still ends a memory, and `fresh` counts whatever is
+ * remembered: the caller asks for that before it answers "nothing" from a
+ * remembered count.
+ *
  * Documents are counted first, and a side's chunks only when its documents
  * are within the cap: a side of more documents than that has more chunks
  * than that, and counting 2,001 chunks through their documents took 213 ms
  * on the finance copy with nothing in memory — once a minute, on whichever
  * search came first.
  */
-async function sideSizes(store: Store, sides: SideSql, cap: number, asOf?: TimeInput, filter: ResolvedScopeFilter = NO_FILTER): Promise<SideSizes> {
+async function sideSizes(store: Store, sides: SideSql, cap: number, asOf?: TimeInput, filter: ResolvedScopeFilter = NO_FILTER, fresh = false): Promise<SideSizes> {
+  // taken before anything is counted: a write that lands while the count runs puts the count out of date
+  const version = store.contentVersion;
+  const current = (kept: { at: number; version: number } | undefined): kept is { at: number; version: number } =>
+    !fresh && kept !== undefined && kept.version === version && Date.now() - kept.at < SIDES_REMEMBERED_MS;
   const whole = cap === SIDE_ROWS_MAX && !toIso(asOf) && isEmptyFilter(filter);
   const hit = whole ? wholeSides.get(store) : undefined;
-  if (hit && Date.now() - hit.at < 60_000) return hit;
+  if (current(hit)) return { sources: hit.sources, generated: hit.generated, remembered: true };
   const key = JSON.stringify([cap, toIso(asOf), filter.kinds, filter.sources, filter.trust, filter.actor]);
   const remembered = settledSides.get(store) ?? new Map<string, SettledSides>();
   settledSides.set(store, remembered);
@@ -671,8 +689,12 @@ async function sideSizes(store: Store, sides: SideSql, cap: number, asOf?: TimeI
   const uncounted: boolean[] = [];
   for (const generated of [false, true]) {
     const known = settled[name(generated)];
-    if (known && Date.now() - known.at < 60_000) sizes[name(generated)] = known.n;
-    else uncounted.push(generated);
+    if (current(known)) {
+      sizes[name(generated)] = known.n;
+      sizes.remembered = true;
+    } else {
+      uncounted.push(generated);
+    }
   }
   const counted = async (chunks: boolean, which: boolean[]): Promise<number[]> => {
     const p = new Params();
@@ -697,7 +719,7 @@ async function sideSizes(store: Store, sides: SideSql, cap: number, asOf?: TimeI
     for (const generated of uncounted) {
       const n = sizes[name(generated)];
       if (n === 0 || n > cap) {
-        settled[name(generated)] = { at: Date.now(), n };
+        settled[name(generated)] = { at: Date.now(), n, version };
         settles = true;
       } else {
         delete settled[name(generated)];
@@ -709,7 +731,7 @@ async function sideSizes(store: Store, sides: SideSql, cap: number, asOf?: TimeI
       if (remembered.size > LARGE_SIDES_KEPT) remembered.delete(remembered.keys().next().value!);
     }
   }
-  if (whole) wholeSides.set(store, { ...sizes, at: Date.now() });
+  if (whole) wholeSides.set(store, { sources: sizes.sources, generated: sizes.generated, at: Date.now(), version });
   return sizes;
 }
 
@@ -801,7 +823,12 @@ async function vectorSearch(
   const total = narrowed ? await chunkTotal(store) : 0;
   const budget = narrowed ? scopedRows(k, total) : SIDE_ROWS_MAX;
   const readMax = exactSide ?? (narrowed ? scopedReadRows(k, total) : SIDE_ROWS_MAX);
-  const held = await sideSizes(store, sides, readMax, asOf, filter);
+  const sizesOf = (h: SideSizes) => ({ sources: wantsSources ? h.sources : 0, generated: wantsPages ? h.generated : 0 });
+  let held = await sideSizes(store, sides, readMax, asOf, filter);
+  // "Nothing here" is not said from memory: where every side the search could return was remembered as
+  // empty, the sides are counted now. A folder remembered empty returned nothing, and nothing to say it
+  // was a memory, for up to a minute after fifty documents had come in from another process.
+  if (held.remembered && sizesOf(held).sources === 0 && sizesOf(held).generated === 0) held = await sideSizes(store, sides, readMax, asOf, filter, true);
   /**
    * How a side is ranked: its vectors read; the index walked on for it (the sources, and the pages
    * where the search has no sources to return: it asked for pages, or its filter leaves none — a
@@ -817,7 +844,7 @@ async function vectorSearch(
    * is ranked; a narrowed search reads at the most two sides of `readMax`, or one and a walk.
    * (`readMax` is half as much again as the walk's rows: `scopedReadRows`.)
    */
-  const size = (generated: boolean) => ((generated ? wantsPages : wantsSources) ? (generated ? held.generated : held.sources) : 0);
+  const size = (generated: boolean) => sizesOf(held)[generated ? 'generated' : 'sources'];
   const sources: 'none' | 'read' | 'walk' = size(false) === 0 ? 'none' : size(false) <= readMax ? 'read' : 'walk';
   const pages: 'none' | 'read' | 'near' | 'walk' = size(true) === 0 ? 'none' : size(true) <= readMax ? 'read' : sources === 'none' ? 'walk' : 'near';
   const walks = Number(sources === 'walk') + Number(pages === 'walk' || pages === 'near');
