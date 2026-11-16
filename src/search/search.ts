@@ -532,10 +532,28 @@ function scansIteratively(store: Store): Promise<boolean> {
 export const SIDE_ROWS_MAX = 2000;
 
 /**
- * The nearest chunks of all that a search reads first, for both sides: one
- * walk of the vector index at pgvector's own width (`hnsw.ef_search`).
+ * The nearest chunks of all that a search reads first, for both sides, at the
+ * least: one walk of the vector index at pgvector's own width
+ * (`hnsw.ef_search`).
  */
 export const NEAREST_OF_ALL = 40;
+
+/** The widest one walk of the index can be asked to be (`hnsw.ef_search` takes 1 to 1000). */
+const WALK_WIDTH_MAX = 1000;
+
+/**
+ * The nearest chunks a search reads first when each channel is asked for `k`
+ * candidates: five thirds of `k`, the forty that serve the 24 of a search for
+ * 8, and never fewer than forty.
+ *
+ * The walk on for the sources starts when those nearest hold fewer than `k`
+ * of them. Held at forty, they could not hold the 60 a search for 20 asks
+ * for, or the 72 of the evaluation's 24, and every such search walked on:
+ * "never starts" was true of searches for 13 at most.
+ */
+export function nearestFor(k: number): number {
+  return Math.min(WALK_WIDTH_MAX, Math.max(NEAREST_OF_ALL, Math.ceil((k * 5) / 3)));
+}
 
 /** The most rows a side of a narrowed search may cost, whatever the index's size: pgvector's own limit for a scan that walks on. */
 export const SCOPED_ROWS_MAX = 20000;
@@ -651,11 +669,12 @@ async function sideSizes(store: Store, sides: SideSql, cap: number, asOf?: TimeI
  *
  * So, for a search of both sides of a large index:
  *
- * - One walk, the nearest `NEAREST_OF_ALL` chunks of all, serves both sides:
- *   the pages among them are the pages' side — a page that is not among the
- *   nearest forty chunks is not near the question, and the keyword and graph
- *   channels still list pages by their own measure — and the sources among
- *   them are the sources', when there are `k`.
+ * - One walk, the nearest chunks of all, serves both sides (`nearestFor`:
+ *   forty for the 24 candidates of a search for 8, five thirds of `k` beyond
+ *   that): the pages among them are the pages' side — a page that is not
+ *   among them is not near the question, and the keyword and graph channels
+ *   still list pages by their own measure — and the sources among them are
+ *   the sources', when there are `k`.
  * - Only when there are not is the index walked on for the sources, for
  *   `SIDE_ROWS_MAX` rows at most: a branch of the statement whose condition
  *   (fewer than `k` sources among the nearest) holds no column, so the
@@ -717,6 +736,19 @@ async function vectorSearch(
   const pages: 'none' | 'read' | 'near' | 'walk' = size(true) === 0 ? 'none' : size(true) <= readMax ? 'read' : sources === 'none' ? 'walk' : 'near';
   if (sources === 'none' && pages === 'none') return [];
   const iterative = (sources === 'walk' || pages === 'walk' || pages === 'near') && (await scansIteratively(store));
+  // The settings a walk of the index is made under, for this statement alone: the scan that walks on, as
+  // far as `walkMax` rows; and a first walk as wide as the candidates asked for, since one walk ends at
+  // `hnsw.ef_search` rows (40 unless the server says more, which is kept) — on a library that walks no
+  // further that is all of a search for 20's sixty that there is. The scan that walks on could fetch
+  // the rows past forty too, and is not left to: resumed, it goes on from the candidates the first
+  // walk set aside, and on an index of a few tight clusters those lay in another cluster — the rows
+  // after the fortieth were not the next nearest (one build in three of the test index).
+  const nearest = nearestFor(k);
+  const settings: string[] = [];
+  if (iterative) settings.push(`set_config('hnsw.iterative_scan', 'relaxed_order', true)`, `set_config('hnsw.max_scan_tuples', '${walkMax}', true)`);
+  if (nearest > NEAREST_OF_ALL) {
+    settings.push(`set_config('hnsw.ef_search', greatest(coalesce(nullif(current_setting('hnsw.ef_search', true), '')::int, ${NEAREST_OF_ALL}), ${nearest})::text, true)`);
+  }
 
   /** One statement of the branches `compose` picks, with its own parameters: only what a branch uses is bound. */
   const ask = (compose: (parts: {
@@ -739,9 +771,9 @@ async function vectorSearch(
     // a branch that walks the index reads the statement's settings first: a condition without a column,
     // which the executor tests once, before it starts the scan
     const setting = () => {
-      if (!iterative) return '';
+      if (settings.length === 0) return '';
       set = true;
-      return ' AND (SELECT mode FROM scan) IS NOT NULL';
+      return ' AND (SELECT made FROM scan) IS NOT NULL';
     };
     const from = `FROM embeddings e
        JOIN chunks c ON c.id = e.chunk_id
@@ -778,33 +810,48 @@ async function vectorSearch(
     //   the cost is one walk on any index.
     // - A narrowed search reads the nearest the filter leaves: the conditions are in the walk, which
     //   goes on to them as far as `walkMax` rows. Forty rows of everything hold little of a folder.
+    // The walk is as wide as the sources need (`nearestFor`); the pages' side is the pages among the
+    // first `NEAREST_OF_ALL` of it whatever its width. A wider walk is there for the sources' count,
+    // and handing every further page to a search that asks for more candidates is the crowding the
+    // sides were separated to end: the walk's direct route, which asks for 36, lost two to four gold
+    // documents of the 10× replay's top five that way.
     const near = (pagesOnly: boolean) => {
+      const width = pagesOnly ? NEAREST_OF_ALL : nearest;
+      const wide = width > NEAREST_OF_ALL;
+      const picked = `chunk_id, document_id, path, title, doc_date, content, raw, generated, walked`;
       ctes.push(narrowed
         ? `near AS MATERIALIZED (
-       SELECT ${columns}, 1 - (e.embedding <=> $1::${VECTOR_TYPE}) AS raw, ${sides.generated('d')} AS generated, false AS walked
-       ${from}
-       WHERE e.model = ${model} AND ${cond}${setting()}
-       ORDER BY e.embedding <=> $1::${VECTOR_TYPE}
-       LIMIT ${NEAREST_OF_ALL})`
-        : `near AS MATERIALIZED (
-       SELECT ${columns}, 1 - nearest.far AS raw, ${sides.generated('d')} AS generated, false AS walked
+       SELECT found.*${wide ? ', row_number() OVER (ORDER BY found.raw DESC) AS place' : ''}
        FROM (
-         SELECT e.chunk_id, e.embedding <=> $1::${VECTOR_TYPE} AS far
-         FROM embeddings e
-         WHERE e.model = ${model}
+         SELECT ${columns}, 1 - (e.embedding <=> $1::${VECTOR_TYPE}) AS raw, ${sides.generated('d')} AS generated, false AS walked
+         ${from}
+         WHERE e.model = ${model} AND ${cond}${setting()}
          ORDER BY e.embedding <=> $1::${VECTOR_TYPE}
-         LIMIT ${NEAREST_OF_ALL}
+         LIMIT ${width}
+       ) found)`
+        : `near AS MATERIALIZED (
+       SELECT ${columns}, 1 - nearest.far AS raw, ${sides.generated('d')} AS generated, false AS walked${wide ? ', nearest.place' : ''}
+       FROM (
+         SELECT first.chunk_id, first.far${wide ? ', row_number() OVER (ORDER BY first.far) AS place' : ''}
+         FROM (
+           SELECT e.chunk_id, e.embedding <=> $1::${VECTOR_TYPE} AS far
+           FROM embeddings e
+           WHERE e.model = ${model}${wide ? setting() : ''}
+           ORDER BY e.embedding <=> $1::${VECTOR_TYPE}
+           LIMIT ${width}
+         ) first
        ) nearest
        JOIN chunks c ON c.id = nearest.chunk_id
        JOIN documents d ON d.id = c.document_id
        WHERE ${cond})`);
-      return `(SELECT * FROM near${pagesOnly ? ' WHERE generated' : ''})`;
+      const kept = [pagesOnly ? 'generated' : '', wide ? `(NOT generated OR place <= ${NEAREST_OF_ALL})` : ''].filter(Boolean);
+      return `(SELECT ${picked} FROM near${kept.length ? ` WHERE ${kept.join(' AND ')}` : ''})`;
     };
     const branches = compose({ near, walk, read, lim });
     // first in the statement: the walks that read it follow
     if (set) {
       ctes.unshift(`scan AS MATERIALIZED (
-       SELECT set_config('hnsw.iterative_scan', 'relaxed_order', true) AS mode, set_config('hnsw.max_scan_tuples', '${walkMax}', true) AS most)`);
+       SELECT concat_ws(' ', ${settings.join(', ')}) AS made)`);
     }
     return store.query<RankedChunk & { walked: boolean }>(
       `${ctes.length ? `WITH ${ctes.join(',\n     ')}\n     ` : ''}${branches.join('\n     UNION ALL\n     ')}`,

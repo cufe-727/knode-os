@@ -6,7 +6,7 @@ import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { DatabaseConfig } from '../src/config.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
-import { scopedRows, search, searchExplained, SIDE_ROWS_MAX } from '../src/search/search.js';
+import { NEAREST_OF_ALL, nearestFor, scopedRows, search, searchExplained, SIDE_ROWS_MAX } from '../src/search/search.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
 import { resolveScopeFilter } from '../src/store/resolver.js';
 
@@ -269,6 +269,73 @@ describe.each(BACKENDS)('scoped searches on %s', (backend) => {
       const sent = await sentBy(() => found({ queryVector: AMONG_PAGES }));
       expect(sent).toHaveLength(1);
       expect(sent[0]).toContain(`set_config('hnsw.max_scan_tuples', '${SIDE_ROWS_MAX}', true)`);
+    });
+  });
+
+  describe('a search of everything for more than a few results', () => {
+    /** The vector statement a search sends, run under EXPLAIN: its walks of the index, one line each. */
+    const walksOf = async (k: number, queryVector: number[], on: Store = store): Promise<{ ids: string[]; sql: string; params?: unknown[]; walks: string[] }> => {
+      const sent: { sql: string; params?: unknown[] }[] = [];
+      const query = store.query.bind(store);
+      store.query = ((sql: string, params?: unknown[]) => {
+        if (sql.includes('<=>')) sent.push({ sql, params });
+        return query(sql, params);
+      }) as typeof store.query;
+      let ids: string[];
+      try {
+        ids = (await search(on, embedder, 'chunk', { k, mode: 'vector', track: false, current: false, queryVector })).map((r) => r.chunkId);
+      } finally {
+        store.query = query;
+      }
+      expect(sent).toHaveLength(1);
+      const plan = (await store.query<{ 'QUERY PLAN': string }>(`EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) ${sent[0].sql}`, sent[0].params)).map((r) => r['QUERY PLAN']);
+      return { ids, sql: sent[0].sql, params: sent[0].params, walks: plan.filter((line) => line.includes('Index Scan using embeddings_hnsw_idx')) };
+    };
+    const rowsOf = (line: string) => Number(/actual rows=(\d+)/.exec(line)![1]);
+
+    it('reads as many of the nearest chunks as the search needs candidates, and five thirds of that', () => {
+      // a search for 8 asks each channel for 24, for 20 it asks for 60, the evaluation's 24 for 72
+      expect([24, 60, 72].map(nearestFor)).toEqual([NEAREST_OF_ALL, 100, 120]);
+      expect(nearestFor(1)).toBe(NEAREST_OF_ALL);
+      // no wider than the index can be asked to search
+      expect(nearestFor(5000)).toBe(1000);
+    });
+
+    it('walks on for the sources only when the nearest hold too few, for 20 results as for 8', async () => {
+      // among the reports the nearest chunks are all sources: one walk, and the walk on never starts
+      for (const k of [8, 20, 24]) {
+        const { ids, walks } = await walksOf(k, AMONG_REPORTS);
+        expect(ids).toHaveLength(k);
+        expect(ids.every((id) => id.startsWith('m'))).toBe(true);
+        expect(walks).toHaveLength(2);
+        expect(rowsOf(walks[0])).toBe(nearestFor(Math.max(k * 3, 24)));
+        expect(walks[1]).toContain('never executed');
+      }
+      // among the pages they hold no source, and the walk goes on: the mechanism is still there
+      const { walks } = await walksOf(20, AMONG_PAGES);
+      expect(walks[1]).not.toContain('never executed');
+    });
+
+    it('gives the pages those among the nearest forty, however wide the walk', async () => {
+      // among the pages every one of the nearest hundred is a page. Forty are the pages' side, as in a search
+      // for 8, not the sixty of them a search for 20 asks a channel for: the wider walk is for the sources'
+      // count, not a way for more pages to stand before them
+      const { sql, params, walks } = await walksOf(20, AMONG_PAGES);
+      expect(rowsOf(walks[0])).toBe(100);
+      const rows = await store.query<{ chunk_id: string; generated: boolean }>(sql, params);
+      const pages = rows.filter((r) => r.generated);
+      expect(pages).toHaveLength(NEAREST_OF_ALL);
+      expect(pages.every((r) => r.chunk_id.startsWith('p'))).toBe(true);
+    });
+
+    it('widens the one walk a library without the iterative scan makes, too', async () => {
+      const { ids, sql, walks } = await walksOf(20, AMONG_REPORTS, withoutIterativeScan());
+      expect(sql).not.toContain('hnsw.iterative_scan');
+      expect(sql).toContain(`'hnsw.ef_search'`);
+      // one walk ends at `hnsw.ef_search` rows: forty would leave a search for 20 with 40 candidates of the 60
+      expect(rowsOf(walks[0])).toBe(100);
+      expect(ids).toHaveLength(20);
+      expect(await store.query(`SHOW hnsw.ef_search`)).toEqual([{ 'hnsw.ef_search': '40' }]);
     });
   });
 });

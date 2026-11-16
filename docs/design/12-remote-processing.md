@@ -197,7 +197,10 @@ processing is started, as embedding does now.
   for itself (`hnsw.iterative_scan = relaxed_order`, with `hnsw.max_scan_tuples` set to 2,000): the walk goes on
   until `k` rows pass the filter. Since the same day it does so only where it must: one walk of the nearest 40
   chunks serves both sides, and the walk is carried on for the sources only when those 40 hold fewer than `k` of
-  them. Carried on for each side, it made a search three to five times slower on a copy of the finance index
+  them. (Forty for the 24 candidates a search for 8 asks of each channel; since 2026‑11‑16 five thirds of the
+  candidates beyond that — 100 for a search for 20 — with `hnsw.ef_search` raised to as many for the statement,
+  never lowered: held at forty, every search for 14 or more walked on. The pages' side stays the pages among the
+  first forty, however wide the walk.) Carried on for each side, it made a search three to five times slower on a copy of the finance index
   (562,563 chunks, an eighth of them generated pages, seldom among the nearest): 192 to 272 ms at the median with
   nothing in memory, against 76 to 81 before any of this and 48 to 56 now. No server setting is involved, and
   none needs changing.
