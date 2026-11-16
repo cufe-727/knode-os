@@ -26,7 +26,7 @@ import { judgeAgent, judgeFamily, queueRunId, PackScope, packMayLeave, PieceStuc
 import type { EvalFamily } from '../work/eval.js';
 import type { Placed } from './meter.js';
 import { closeAdapters } from './systems/external.js';
-import { closeKnodeStates } from './systems/knode.js';
+import { askOptionsFromEnv, closeKnodeStates } from './systems/knode.js';
 import { describeDatabase, EVAL_POOL_MAX, evalDatabase, orphanedEvalSchemas, sameDatabase } from './database.js';
 import { makeSystems } from './systems/index.js';
 import { removeHeldTempDirs, sweepStaleTempDirs } from './tmp.js';
@@ -543,6 +543,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       local: placement.local, pool: remote.pool, waitMinutes: remote.waitMinutes, legacy: placement.legacy,
     };
     delete meta.stuck;
+    recordAskOptions(meta, opts.systems);
     store.writeMeta(meta);
     const tasksByKey = new Map<string, Task>();
     const corpusDocs = new Map<string, Set<string>>();
@@ -1192,3 +1193,9 @@ function interleaveStrata(list: Task[]): Task[] {
 }
 
 export { emptyUsage };
+
+/** Record in the run's metadata what knode-ask is asked beyond its defaults, as this start of the run reads it. */
+export function recordAskOptions(meta: RunMeta, systems: string[], env: NodeJS.ProcessEnv = process.env): void {
+  if (systems.includes('knode-ask')) meta.askOptions = askOptionsFromEnv(env);
+  else delete meta.askOptions;
+}

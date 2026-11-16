@@ -3,7 +3,8 @@ import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { toDateString } from '../store/temporal.js';
 import { ClaimItem, SearchResult } from '../types.js';
 import { keywordTerms, termCount } from './search.js';
-import { documentDates, OrdinalAsk, ordinalInQuestion, pickByOrder, placeEntities } from './walk-order.js';
+import { asOfDate } from './claimset.js';
+import { documentDates, OrdinalAsk, ordinalInQuestion, pickByOrder, placeEntities, presentOf } from './walk-order.js';
 
 /**
  * The multi-hop route of `ask` (docs/design/30 §3): resolve → relations →
@@ -54,6 +55,8 @@ export interface WalkStep {
   type: string;
   description: string;
   path: string | null;
+  /** The passage the relation was read from, where the store records it. */
+  chunkId?: string | null;
   validFrom: string | null;
   validTo: string | null;
   /** The scores of the relations on the way here, this one's included: a step deep on a well-matched branch scores most. */
@@ -78,6 +81,34 @@ export interface Walk {
 const FRONTIER = 5;
 /** Relations read per frontier entity and hop before scoring. */
 const READ_PER_ENTITY = 150;
+/** Relations of one entity ordered at most: more, and the walk makes no pick and says the set was too large. */
+const ORDER_MAX = 2000;
+
+/**
+ * The live relations of the given entities: the heaviest `$2` of each, and of each the `$2` whose descriptions
+ * hold the most of the question's terms (`$3`, as LIKE patterns; the heaviest among equals), so an entity with more
+ * heavy relations than are read cannot hide the light one the question asks about. With their ends, their source and its path.
+ */
+const RELATIONS_OF = `SELECT f.id AS near_id, r.id, r.source_id, r.target_id, se.name AS source, te.name AS target, se.type AS source_type, te.type AS target_type,
+         r.type, r.description, r.weight, r.valid_from, r.valid_to, r.document_id, r.chunk_id,
+         COALESCE((SELECT d.path FROM documents d WHERE d.id = r.document_id),
+                  (SELECT s.key FROM evidence ev JOIN scopes s ON s.id = ev.scope_id
+                   WHERE ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL ORDER BY ev.tx_from, s.key LIMIT 1)) AS path
+  FROM unnest($1::text[]) AS f(id)
+  CROSS JOIN LATERAL (
+    (SELECT * FROM relations r WHERE (r.source_id = f.id OR r.target_id = f.id) AND r.tx_to IS NULL AND r.type <> 'co_occurs'
+     ORDER BY r.weight DESC, r.id LIMIT $2)
+    UNION
+    (SELECT r.* FROM relations r
+       CROSS JOIN LATERAL (SELECT count(*) AS held FROM unnest($3::text[]) p WHERE lower(r.description) LIKE p) h
+     WHERE (r.source_id = f.id OR r.target_id = f.id) AND r.tx_to IS NULL AND r.type <> 'co_occurs' AND h.held > 0
+     ORDER BY h.held DESC, r.weight DESC, r.id LIMIT $2)) r
+  JOIN entities se ON se.id = r.source_id JOIN entities te ON te.id = r.target_id
+  ORDER BY r.id, f.id`;
+
+/** The question's terms as LIKE patterns for `RELATIONS_OF` (spellings of two characters or more). */
+const likePatterns = (terms: WalkTerm[]) => [...new Set(terms.map((t) => t.text).filter((t) => t.length >= 2))].map((t) => `%${t.replace(/[\\%_]/g, (c) => `\\${c}`)}%`);
+
 /** Question terms scored at most: a chain question is long, and its last clause names the last hop. */
 const WALK_TERMS_MAX = 64;
 /** Neighbours read per entity when finding what a named entity anchors (two relations out). */
@@ -86,18 +117,22 @@ const ANCHOR_FANOUT = 60;
 /**
  * Predicates the question and the relation descriptions word differently:
  * when the question holds any spelling of a family, the relation may hold any
- * other. Verbs and the nouns relations are named by, not domain words.
+ * other. Only spellings that mean the same in general: escalating is not
+ * complaining, releasing is not going live or delivering, a hint is not
+ * raising, joining is not a transfer. A knowledge base's own synonyms belong
+ * to its vocabulary, not here.
  */
 const PREDICATE_FAMILIES: string[][] = [
-  ['修复', '修好', '处理好', '处理', '解决', '搞定', '排除', 'fixed', 'fix', 'resolved', 'resolve', 'repaired'],
+  ['修复', '修好', '处理好', '处理', '解决', '搞定', 'fixed', 'fix', 'resolved', 'resolve', 'repaired'],
   ['负责', '名下', '盯着', '跟进', '主导', '牵头', '在管', '主管', 'owner', 'owns', 'owned', 'responsible', 'in charge', 'leads'],
-  ['接手', '接管', '交接', 'took over', 'take over', 'taken over', 'inherited'],
-  ['提出', '预警', '提了', '提示', '上报', 'raised', 'flagged', 'warned'],
+  ['接手', '接管', 'took over', 'take over', 'taken over', 'inherited'],
+  ['提出', '预警', '提了', 'raised', 'flagged', 'warned'],
   ['风险', '隐患', 'risk', 'hazard'],
   ['事故', '故障', '宕机', 'incident', 'outage'],
-  ['上线', '投产', '发布', '交付', '落地', 'launched', 'launch', 'released', 'shipped', 'went live', 'go-live'],
-  ['调到', '调入', '调往', '调去', '转到', '转岗', '加入', 'transferred', 'moved to', 'joined'],
-  ['升级', '投诉', 'escalated', 'escalation', 'complained'],
+  ['上线', '投产', 'went live', 'go-live', 'go live'],
+  ['发布', 'released', 'release'],
+  ['调到', '调入', '调往', '调去', '转到', '转岗', 'transferred', 'moved to'],
+  ['升级', 'escalated', 'escalation'],
   ['客户', 'customer', 'client'],
   ['成员', '组员', 'member'],
 ];
@@ -151,13 +186,17 @@ export function walkTerms(question: string, namedNames: string[] = []): { terms:
     let rest = last;
     let used = 0;
     for (const w of [...words].sort((x, y) => y.length - x.length)) {
-      used += occurrences(rest, w);
-      rest = rest.split(w).join(' ');
+      const word = TEAM_WORD.has(w) ? new RegExp(`(?<=[个那这该本此各哪每一两几同另])${w}(?![合织件成建装])`, 'g') : null;
+      used += word ? (rest.match(word) ?? []).length : occurrences(rest, w);
+      rest = word ? rest.replace(word, ' ') : rest.split(w).join(' ');
     }
     if (used > 0) budget.set(`type:${type}`, used);
   }
   return { terms: [...terms.values()], budget };
 }
+
+/** 组 names a team only as a word ("那个组", "另一个组"), not inside 组合, 组织, 组件 or 投资组合. */
+const TEAM_WORD = new Set(['组']);
 
 /** Question nouns that name an entity type beside the ontology's own labels: 组 asks for a team, 故障 for an event. */
 const TYPE_NOUNS: Record<string, string[]> = {
@@ -189,7 +228,7 @@ function typeCues(): Map<string, string[]> {
 
 interface RelRow {
   id: string; source_id: string; target_id: string; source: string; target: string; type: string; description: string;
-  source_type: string; target_type: string;
+  source_type: string; target_type: string; document_id: string | null; chunk_id: string | null;
   weight: number; path: string | null; valid_from: string | Date | null; valid_to: string | Date | null;
 }
 
@@ -204,22 +243,45 @@ interface Candidate {
   /** What the relation says, as scored: its type, its description, its far end. */
   text: string;
   score: number;
+  /** The question describes its far end better than its siblings (the meaning signal gave it a bonus). */
+  meant?: boolean;
+  /** One of a few siblings the question describes one of. */
+  described?: boolean;
   /** How the ordering step picked the far end. */
   order?: string;
 }
 
 /** How strongly the meaning signal prefers a far end, per standard deviation above its siblings' mean. */
 const MEANING_WEIGHT = 1;
+/**
+ * The most the meaning signal adds: two points, under what a term held by few of a hop's relations weighs (a rare
+ * term weighs up to ~5), however many siblings the meaning is measured against; uncapped, the nearest of 150 gained
+ * about 12.
+ */
+const MEANING_CAP = 2;
+/** The cosine to the question below which a far end is not what the question describes, however its siblings fare. */
+const MEANING_FLOOR = 0.3;
 
-/** A bonus per standard deviation above the group's mean, for each member with a value. */
-function zBonus(group: Candidate[], value: (c: Candidate) => number | undefined, weight: number): void {
+/**
+ * A bonus of one point per standard deviation above the group's mean, at most `cap`, for each member with a value at
+ * least `floor`. Of two siblings both far from the question neither gains, and among 150 the nearest gains no more
+ * than `cap`.
+ */
+function zBonus(group: Candidate[], value: (c: Candidate) => number | undefined, weight: number, cap: number, floor: number): void {
   const withValue = group.filter((c) => value(c) !== undefined);
-  if (withValue.length < 2 || weight === 0) return;
+  if (withValue.length < 2 || weight === 0 || cap <= 0) return;
   const v = withValue.map((c) => value(c)!);
   const mean = v.reduce((a, b) => a + b, 0) / v.length;
   const sd = Math.sqrt(v.reduce((a, b) => a + (b - mean) ** 2, 0) / v.length);
   if (sd < 1e-6) return;
-  for (const c of withValue) c.score += weight * Math.max(0, (value(c)! - mean) / sd);
+  for (const c of withValue) {
+    if (value(c)! < floor) continue;
+    const bonus = Math.min(cap, weight * Math.max(0, (value(c)! - mean) / sd));
+    if (bonus > 0) {
+      c.score += bonus;
+      c.meant = true;
+    }
+  }
 }
 
 /**
@@ -285,11 +347,13 @@ export async function walkRelations(
   const names = await store.query<{ name: string; aliases: unknown }>(`SELECT name, aliases FROM entities WHERE id = ANY($1::text[])`, [named]);
   const { terms, budget } = walkTerms(question, names.flatMap((e) => [e.name, ...(Array.isArray(e.aliases) ? e.aliases.filter((a): a is string => typeof a === 'string') : [])]));
   const anchors = await anchorSets(store, named);
+  const patterns = likePatterns(terms);
   const ordinal = ordinalInQuestion(question);
   // the noun the ordering is about: the first predicate family the question uses after the ordinal ("第二起…故障" → 事故)
   const orderKey = ordinal ? orderedNoun(question, ordinal, terms) : null;
   let orderedHop: number | null = null;
   const picks: string[] = [];
+  let present: Awaited<ReturnType<typeof presentOf>> | null = null;
   // per entity reached: the named entities its branch descends from (a branch is not anchored by its own start),
   // and the term keys the relations on its way have used
   const origins = new Map<string, Set<string>>(named.map((id) => [id, new Set([id])]));
@@ -301,27 +365,8 @@ export async function walkRelations(
   let frontier = [...named];
 
   for (let hop = 1; hop <= maxHops && frontier.length > 0; hop++) {
-    const rows = await store.query<RelRow & { near_id: string }>(
-      `SELECT f.id AS near_id, r.id, r.source_id, r.target_id, se.name AS source, te.name AS target, se.type AS source_type, te.type AS target_type,
-              r.type, r.description, r.weight,
-              r.valid_from, r.valid_to,
-              COALESCE((SELECT d.path FROM documents d WHERE d.id = r.document_id),
-                       (SELECT s.key FROM evidence ev JOIN scopes s ON s.id = ev.scope_id
-                        WHERE ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL ORDER BY ev.tx_from, s.key LIMIT 1)) AS path
-       FROM unnest($1::text[]) AS f(id)
-       CROSS JOIN LATERAL (
-         SELECT * FROM relations r WHERE (r.source_id = f.id OR r.target_id = f.id) AND r.tx_to IS NULL AND r.type <> 'co_occurs'
-         ORDER BY r.weight DESC, r.id LIMIT $2) r
-       JOIN entities se ON se.id = r.source_id JOIN entities te ON te.id = r.target_id
-       ORDER BY r.id, f.id`,
-      [frontier, READ_PER_ENTITY],
-    );
-    const candidates: Candidate[] = [];
-    const seen = new Set<string>();
-    for (const r of rows) {
-      // a relation between two frontier entities is read once, from the first
-      if (used.has(r.id) || seen.has(r.id)) continue;
-      seen.add(r.id);
+    const rows = await store.query<RelRow & { near_id: string }>(RELATIONS_OF, [frontier, READ_PER_ENTITY, patterns]);
+    const toCandidate = (r: RelRow & { near_id: string }): Candidate => {
       const nearId = r.near_id;
       const forward = r.source_id === nearId;
       const farId = forward ? r.target_id : r.source_id;
@@ -335,7 +380,15 @@ export async function walkRelations(
         .filter((k) => (spentHere?.get(k) ?? 0) < (budget.get(k) ?? 1));
       const from = origins.get(nearId) ?? new Set<string>();
       const anchoredBy = named.filter((n) => !from.has(n) && (n === farId || anchors.get(n)?.has(farId)));
-      candidates.push({ r, farId, nearId, held, anchors: anchoredBy, text, score: 0 });
+      return { r, farId, nearId, held, anchors: anchoredBy, text, score: 0 };
+    };
+    const candidates: Candidate[] = [];
+    const seen = new Set<string>();
+    for (const r of rows) {
+      // a relation between two frontier entities is read once, from the first
+      if (used.has(r.id) || seen.has(r.id)) continue;
+      seen.add(r.id);
+      candidates.push(toCandidate(r));
     }
     // a term or a named entity weighs by how few of this hop's candidates hold it
     const n = candidates.length;
@@ -352,28 +405,59 @@ export async function walkRelations(
       const k = `${c.nearId}|${c.r.type}`;
       siblings.set(k, [...(siblings.get(k) ?? []), c]);
     }
-    for (const group of siblings.values()) zBonus(group, (c) => meaning.get(c.farId), MEANING_WEIGHT);
-    // the ordering step, at the first hop where an entity leads to several of what the question orders:
-    // each such branch keeps the one the question names, by date, and drops the others it ordered
+    for (const group of siblings.values()) zBonus(group, (c) => meaning.get(c.farId), MEANING_WEIGHT, MEANING_CAP, MEANING_FLOOR);
+    // a named entity's few siblings one of which the question describes ("第一事业部管基础设施的那个组" of a division's
+    // three groups) are all walked, the described one first: the description picks among them by meaning, and the
+    // later hops (an ordering, a fix) may yet tell them apart
+    if (hop === 1) {
+      for (const group of siblings.values()) {
+        if (group.length <= FRONTIER && group.some((c) => c.meant)) for (const c of group) c.described = true;
+      }
+    }
+    // the ordering step, at the first hop where an entity leads to several of what the question orders: each such
+    // branch keeps the one the question names, by date, and drops the others it ordered (the note lists them all)
     const dropped = new Set<Candidate>();
     if (ordinal && orderKey && orderedHop === null) {
       const spellings = terms.filter((t) => t.key === orderKey).map((t) => t.text);
+      const ofKind = (c: Candidate) => spellings.some((w) => termCount(c.text, w) > 0);
+      const nears = [...new Set(candidates.filter(ofKind).map((c) => c.nearId))];
+      // every relation of those entities, not the heaviest READ_PER_ENTITY: the year's first incident may be a light one
+      const full = nears.length === 0 ? [] : await store.query<RelRow & { near_id: string }>(RELATIONS_OF, [nears, ORDER_MAX + 1, patterns]);
       const pools = new Map<string, Candidate[]>();
-      for (const c of candidates) {
-        if (!spellings.some((w) => termCount(c.text, w) > 0)) continue;
-        pools.set(c.nearId, [...(pools.get(c.nearId) ?? []), c]);
+      const byId = new Map(candidates.map((c) => [c.r.id, c]));
+      for (const r of full) {
+        if (used.has(r.id)) continue;
+        let c = byId.get(r.id);
+        if (!c) {
+          c = toCandidate(r);
+          byId.set(r.id, c);
+          candidates.push(c);
+        }
+        if (c.nearId === r.near_id && ofKind(c)) pools.set(r.near_id, [...(pools.get(r.near_id) ?? []), c]);
       }
+      const counts = new Map<string, number>();
+      for (const r of full) counts.set(r.near_id, (counts.get(r.near_id) ?? 0) + 1);
       const ordered = [...pools.entries()].filter(([, pool]) => new Set(pool.map((c) => c.farId)).size >= 2);
       if (ordered.length > 0) {
         orderedHop = hop;
-        const placed = await placeEntities(store, [...new Set(ordered.flatMap(([, pool]) => pool.map((c) => c.farId)))]);
+        if (ordinal.period && ordinal.period.year === null && !present) present = await presentOf(store, asOfDate(question) ?? null);
+        // an entity with more relations than can be ordered makes no pick: its candidates are not placed
+        const orderable = ordered.filter(([nearId]) => (counts.get(nearId) ?? 0) <= ORDER_MAX);
+        const placed = await placeEntities(store, [...new Set(orderable.flatMap(([, pool]) => pool.map((c) => c.farId)))], { spellings, latest: ordinal.kind !== 'nth' });
         const top = Math.max(0, ...candidates.map((c) => c.score));
         for (const [nearId, pool] of ordered) {
-          const byFar = new Map(pool.map((c) => [c.farId, c]));
-          const pick = pickByOrder(ordinal, [...byFar.keys()].map((id) => placed.get(id)!));
           const nearName = pool[0].r.source_id === nearId ? pool[0].r.source : pool[0].r.target;
-          picks.push(`${nearName}: ${pick.note}`);
-          if (!pick.picked) continue;
+          if ((counts.get(nearId) ?? 0) > ORDER_MAX) {
+            picks.push(`${nearName}: not ordered: ${ordinal.text} would order more than ${ORDER_MAX} relations of ${nearName}`);
+            continue;
+          }
+          const byFar = new Map(pool.map((c) => [c.farId, c]));
+          const pick = pickByOrder(ordinal, [...byFar.keys()].map((id) => placed.get(id)!), present);
+          if (!pick.picked) {
+            picks.push(`${nearName}: ${pick.note}`);
+            continue;
+          }
+          picks.push(`${nearName}: ${placed.get(pick.picked)?.name ?? pick.picked} — ${pick.note}`);
           for (const c of pool) {
             if (c.farId === pick.picked) {
               c.score += top + 1;
@@ -384,14 +468,17 @@ export async function walkRelations(
         }
       }
     }
-    const leads = (c: Candidate) => c.held.length > 0 || c.anchors.length > 0;
+    // a relation leads on when it holds a term of the question or is anchored by another entity it names, and on the
+    // first hop also when its far end is one of the few siblings the question describes; one that does none of these
+    // is not about the question, whatever its weight
+    const leads = (c: Candidate) => c.held.length > 0 || c.anchors.length > 0 || (hop === 1 && c.described === true);
     const scored = candidates
       .filter((c) => !dropped.has(c))
-      .filter((c) => !visited.has(c.farId) || leads(c))
       .sort((a, b) => b.score - a.score || b.r.weight - a.r.weight || (a.r.id < b.r.id ? -1 : 1));
-    // past the first hop, only relations that match the question or lead toward another entity it names go on;
+    // only relations that match the question or lead toward another entity it names go on, the first hop's too: a
+    // question the walk cannot help gets nothing from it rather than the heaviest relations of what it names;
     // every branch takes its own best step, then the best of the rest fill the hop, so a hub cannot take it whole
-    const eligible = hop === 1 ? scored : scored.filter(leads);
+    const eligible = scored.filter(leads);
     const chosen = new Set<Candidate>();
     if (hop > 1) {
       // the branches first whose way here scored best: an ordered pick or a well-matched chain keeps its lead
@@ -414,7 +501,7 @@ export async function walkRelations(
       const total = (pathScore.get(nearId) ?? 0) + score;
       out.steps.push({
         hop, relationId: r.id, source: r.source, sourceId: r.source_id, target: r.target, targetId: r.target_id,
-        type: r.type, description: r.description, path: r.path, validFrom: toDateString(r.valid_from), validTo: toDateString(r.valid_to), score: total,
+        type: r.type, description: r.description, path: r.path, chunkId: r.chunk_id, validFrom: toDateString(r.valid_from), validTo: toDateString(r.valid_to), score: total,
         parent: reachedBy.get(nearId) ?? null,
         ...(order ? { order } : {}),
       });
@@ -469,52 +556,90 @@ export function chainOrder(steps: WalkStep[]): number[] {
   return out;
 }
 
+/** A relation's evidence documents read at most when choosing the passage that states it. */
+const EVIDENCE_READ = 20;
+/** Chunks mentioning both ends read at most per step, from the end mentioned less. */
+const COMENTION_READ = 200;
+/** How long before its first source a report of the same two entities may be the one that states the hop. */
+const LEAD_DAYS = 45;
+
 /**
- * For each step, the passage that states it: of the chunks that mention both ends, the one in the earliest
- * dated document (the report of the week it happened, not a later summary restating it; a document's date is
- * its own or the earliest its claims state), the relation's own document first among equals; else a chunk of the
- * relation's own document that mentions either end. The best chain's first.
+ * For each step, the passage that states it, near the relation's own sources: the document it was read from and
+ * those its evidence names (at most `EVIDENCE_READ`); the earliest of them dates it. Of the chunks that mention both ends
+ * (at most `COMENTION_READ`, read from the end mentioned less), the one in the earliest document dated within
+ * `LEAD_DAYS` before that source is taken: the report of the week it happened, which a monthly summary the
+ * relation was read from restates. A co-mention long before the relation's first source, on a knowledge base
+ * that has mentioned both for years, is not. Else a chunk of that earliest source mentioning both ends, or either;
+ * else the chunk the relation was read from. A document's date is its own, or the day its claims state most often.
+ * Every read is bounded per step. The best chain's first.
  */
 async function bridgePassages(store: Store, steps: WalkStep[]): Promise<SearchResult[]> {
   if (steps.length === 0) return [];
-  // every chunk where a step's two ends are mentioned together, and the relation's own document's chunks that mention either
-  const found = await store.query<{ i: number; chunk_id: string; document_id: string; path: string; both: boolean }>(
-    `SELECT pair.i, m1.chunk_id, m1.document_id, d.path, true AS both
-     FROM unnest($1::text[], $2::text[]) WITH ORDINALITY AS pair(a, b, i)
-     JOIN entity_mentions m1 ON m1.entity_id = pair.a
-     JOIN entity_mentions m2 ON m2.chunk_id = m1.chunk_id AND m2.entity_id = pair.b
-     JOIN documents d ON d.id = m1.document_id
-     UNION ALL
-     SELECT pair.i, x.chunk_id, x.document_id, x.path, false FROM unnest($1::text[], $2::text[], $3::text[]) WITH ORDINALITY AS pair(a, b, p, i)
-     CROSS JOIN LATERAL (
-       SELECT m.chunk_id, m.document_id, d.path FROM documents d JOIN entity_mentions m ON m.document_id = d.id AND m.entity_id IN (pair.a, pair.b)
-       WHERE d.path = pair.p ORDER BY m.chunk_id LIMIT 1) x`,
-    [steps.map((s) => s.sourceId), steps.map((s) => s.targetId), steps.map((s) => s.path ?? '')],
-  );
-  // a document's date: its own, or the earliest its claims state
-  const dates = await documentDates(store, [...new Set(found.map((f) => f.document_id))]);
-  const choice = new Map<number, string>();
-  for (const [i, step] of steps.entries()) {
-    const mine = found.filter((f) => Number(f.i) === i + 1);
-    const both = mine.filter((f) => f.both);
-    const pool = both.length ? both : mine;
-    pool.sort((x, y) => {
-      const dx = dates.get(x.document_id) ?? null;
-      const dy = dates.get(y.document_id) ?? null;
-      if (dx !== dy) return dx === null ? 1 : dy === null ? -1 : dx < dy ? -1 : 1;
-      const ox = x.path === step.path ? 0 : 1;
-      const oy = y.path === step.path ? 0 : 1;
-      return ox - oy || (x.chunk_id < y.chunk_id ? -1 : 1);
-    });
-    if (pool[0]) choice.set(i, pool[0].chunk_id);
+  const [sources, together] = await Promise.all([
+    store.query<{ i: number; document_id: string }>(
+      `SELECT pair.i, x.document_id FROM unnest($1::text[]) WITH ORDINALITY AS pair(rid, i)
+       CROSS JOIN LATERAL (
+         (SELECT r.document_id FROM relations r WHERE r.id = pair.rid AND r.document_id IS NOT NULL)
+         UNION
+         (SELECT d.id FROM evidence ev JOIN scopes s ON s.id = ev.scope_id JOIN documents d ON d.path = s.key
+          WHERE ev.kind = 'relation' AND ev.target_id = pair.rid AND ev.tx_to IS NULL LIMIT $2)) x`,
+      [steps.map((s) => s.relationId), EVIDENCE_READ],
+    ),
+    store.query<{ i: number; chunk_id: string; document_id: string }>(
+      `SELECT pair.i, x.chunk_id, x.document_id FROM unnest($1::text[], $2::text[]) WITH ORDINALITY AS pair(a, b, i)
+       CROSS JOIN LATERAL (
+         SELECT CASE WHEN (SELECT count(*) FROM (SELECT 1 FROM entity_mentions WHERE entity_id = pair.a LIMIT 5000) ca)
+                       <= (SELECT count(*) FROM (SELECT 1 FROM entity_mentions WHERE entity_id = pair.b LIMIT 5000) cb)
+                     THEN pair.a ELSE pair.b END AS rare,
+                CASE WHEN (SELECT count(*) FROM (SELECT 1 FROM entity_mentions WHERE entity_id = pair.a LIMIT 5000) ca)
+                       <= (SELECT count(*) FROM (SELECT 1 FROM entity_mentions WHERE entity_id = pair.b LIMIT 5000) cb)
+                     THEN pair.b ELSE pair.a END AS other) e
+       CROSS JOIN LATERAL (
+         SELECT m1.chunk_id, m1.document_id FROM entity_mentions m1
+         JOIN entity_mentions m2 ON m2.chunk_id = m1.chunk_id AND m2.entity_id = e.other
+         WHERE m1.entity_id = e.rare LIMIT $3) x`,
+      [steps.map((s) => s.sourceId), steps.map((s) => s.targetId), COMENTION_READ],
+    ),
+  ]);
+  const dates = await documentDates(store, [...new Set([...sources.map((r) => r.document_id), ...together.map((r) => r.document_id)])]);
+  const dayOf = (d: string) => Date.parse(`${d}T00:00:00Z`) / 86_400_000;
+  const choice = new Map<number, { doc: string | null; chunk: string | null }>();
+  for (let i = 0; i < steps.length; i++) {
+    const mine = sources.filter((r) => Number(r.i) === i + 1).map((r) => r.document_id);
+    const first = mine.sort((x, y) => {
+      const dx = dates.get(x) ?? null;
+      const dy = dates.get(y) ?? null;
+      return dx === dy ? (x < y ? -1 : 1) : dx === null ? 1 : dy === null ? -1 : dx < dy ? -1 : 1;
+    })[0] ?? null;
+    const since = first && dates.get(first) ? dayOf(dates.get(first)!) - LEAD_DAYS : null;
+    const near = together
+      .filter((r) => Number(r.i) === i + 1)
+      .map((r) => ({ ...r, at: dates.get(r.document_id) ?? null }))
+      .filter((r) => r.at && since !== null && dayOf(r.at) >= since && r.at <= dates.get(first!)!)
+      .sort((x, y) => (x.at! < y.at! ? -1 : x.at! > y.at! ? 1 : x.chunk_id < y.chunk_id ? -1 : 1))[0];
+    choice.set(i, near ? { doc: null, chunk: near.chunk_id } : { doc: first, chunk: null });
   }
-  const chunkIds = [...new Set(choice.values())];
-  const chunks = chunkIds.length === 0 ? [] : await store.query<{ chunk_id: string; document_id: string; path: string; title: string | null; content: string; doc_date: string | Date | null }>(
-    `SELECT c.id AS chunk_id, c.document_id, d.path, d.title, c.content, d.doc_date FROM chunks c JOIN documents d ON d.id = c.document_id WHERE c.id = ANY($1::text[])`,
-    [chunkIds],
+  const rows = await store.query<{ i: number; chunk_id: string; document_id: string; path: string; title: string | null; content: string; doc_date: string | Date | null }>(
+    `SELECT pair.i, c.id AS chunk_id, c.document_id, d.path, d.title, c.content, d.doc_date
+     FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[]) WITH ORDINALITY AS pair(a, b, doc, pick, own, i)
+     CROSS JOIN LATERAL (
+       SELECT y.chunk_id FROM (
+         (SELECT ch.id AS chunk_id, 0 AS rank FROM chunks ch WHERE ch.id = NULLIF(pair.pick, ''))
+         UNION ALL
+         (SELECT m1.chunk_id, 1 FROM entity_mentions m1
+          JOIN entity_mentions m2 ON m2.chunk_id = m1.chunk_id AND m2.entity_id = pair.b
+          WHERE m1.document_id = NULLIF(pair.doc, '') AND m1.entity_id = pair.a ORDER BY m1.chunk_id LIMIT 1)
+         UNION ALL
+         (SELECT m.chunk_id, 2 FROM entity_mentions m
+          WHERE m.document_id = NULLIF(pair.doc, '') AND m.entity_id IN (pair.a, pair.b) ORDER BY m.chunk_id LIMIT 1)
+         UNION ALL
+         (SELECT ch.id, 3 FROM chunks ch WHERE ch.id = NULLIF(pair.own, ''))
+       ) y ORDER BY y.rank LIMIT 1
+     ) x
+     JOIN chunks c ON c.id = x.chunk_id
+     JOIN documents d ON d.id = c.document_id`,
+    [steps.map((s) => s.sourceId), steps.map((s) => s.targetId), steps.map((_, i) => choice.get(i)?.doc ?? ''), steps.map((_, i) => choice.get(i)?.chunk ?? ''), steps.map((s) => s.chunkId ?? '')],
   );
-  const byChunk = new Map(chunks.map((c) => [c.chunk_id, c]));
-  const rows = [...choice.entries()].flatMap(([i, id]) => (byChunk.has(id) ? [{ i: i + 1, ...byChunk.get(id)! }] : []));
   const byStep = new Map(rows.map((r) => [Number(r.i) - 1, r]));
   const seen = new Set<string>();
   const out: SearchResult[] = [];
@@ -539,7 +664,7 @@ export function stepsAsFacts(steps: WalkStep[]): (ClaimItem & { chunkId: string 
     subject: s.source,
     object: s.target,
     type: s.type,
-    statement: `${s.source} ${s.type.replace(/_/g, ' ')} ${s.target}${s.description ? `: ${s.description}` : ''}${s.order ? ` [picked as ${s.order}]` : ''}`,
+    statement: `${s.source} ${s.type.replace(/_/g, ' ')} ${s.target}${s.description ? `: ${s.description}` : ''}`,
     status: 'fact',
     kind: 'fact',
     startDate: s.validFrom,

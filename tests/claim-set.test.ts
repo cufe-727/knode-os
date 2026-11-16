@@ -70,7 +70,7 @@ beforeAll(async () => {
   store = await Store.open(tmp, 4);
   await store.indexing;
   await addEntity('northwind', 'Northwind', 'organization');
-  await addEntity('platform', 'Northwind Platform', 'organization'); // a part of Northwind by its name
+  await addEntity('platform', 'Northwind Platform', 'organization'); // a part of Northwind by a relation, not by its name
   await addEntity('payments', 'Payments Team', 'organization'); // a part of Northwind by a relation
   await addEntity('southwind', 'Southwind', 'organization');
   await addEntity('alice', 'Alice Chen', 'person');
@@ -78,6 +78,7 @@ beforeAll(async () => {
   for (const inc of ['INC-1', 'INC-2', 'INC-3', 'INC-7', 'INC-8', 'INC-9']) await addEntity(inc.toLowerCase(), inc, 'event');
   await addEntity('pool-1', 'POOL-1', 'component');
   await store.query(`INSERT INTO relations (id, source_id, target_id, type, description, weight) VALUES ('r-pay', 'payments', 'northwind', 'part_of', 'Payments Team is part of Northwind', 1)`);
+  await store.query(`INSERT INTO relations (id, source_id, target_id, type, description, weight) VALUES ('r-plat', 'platform', 'northwind', 'part_of', 'Northwind Platform is part of Northwind', 1)`);
 
   for (const [week, value] of AVAILABILITY) {
     const doc = `plat-w${week}`;
@@ -116,18 +117,19 @@ afterAll(async () => {
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
-const set = (q: string, named: string[]) => computeClaimSet(store, q, classifyQuestion(q), named);
+/** Asked at the end of the fixture's year: its yearless periods are 2025's. */
+const set = (q: string, named: string[]) => computeClaimSet(store, q, classifyQuestion(q), named, { now: '2025-12-31' });
 
 describe('reading what a question asks of the claims', () => {
   it('reads the operation, the grouping, the filters and the period by rules', () => {
-    const r = (q: string) => readSetQuestion(q, classifyQuestion(q));
+    const r = (q: string) => readSetQuestion(q, classifyQuestion(q), '2025-12-31');
     expect(r('（第一事业部）按组和季度统计：第一事业部的三个组在每个季度各报告了几起事故（截至第44周）？')).toMatchObject({ op: 'count', groupBy: ['member', 'quarter'], asks: 'event', throughWeek: 44 });
     expect(r('平台组的服务可用性在哪些周低于99.917%（截至第44周）？')).toMatchObject({ op: 'list', threshold: { cmp: '<', value: 99.917 } });
     expect(r('平台组的服务可用性每个季度的最高周值分别是多少？')).toMatchObject({ op: 'max', groupBy: ['quarter'] });
-    expect(r('平台组上半年服务可用性的周均值是多少？保留3位小数。')).toMatchObject({ op: 'mean', yearless: { from: 1, to: 6 } });
+    expect(r('平台组上半年服务可用性的周均值是多少？保留3位小数。')).toMatchObject({ op: 'mean', period: { from: '2025-01-01', to: '2025-06-30' } });
     expect(r('修复过两起及以上事故的有哪些人？')).toMatchObject({ atLeast: 2, asks: 'person' });
     expect(r('截至2025年11月7日，平台组的订单库连接池上限是多少？')).toMatchObject({ op: 'value', asOf: '2025-11-07' });
-    expect(r('每个事业部第二季度各报告了几起事故？')).toMatchObject({ op: 'count', groupBy: ['parent'], company: true, yearless: { from: 4, to: 6 } });
+    expect(r('每个事业部第二季度各报告了几起事故？')).toMatchObject({ op: 'count', groupBy: ['parent'], company: true, period: { from: '2025-04-01', to: '2025-06-30' } });
     expect(r('截至第44周，还有哪些风险没有关闭？')).toMatchObject({ op: 'list', notIn: '关闭' });
     expect(r('Which people fixed at least two incidents?')).toMatchObject({ op: 'list', atLeast: 2, asks: 'person' });
     expect(r('What is Northwind?')).toBeNull();
@@ -155,7 +157,7 @@ describe('computing the set from the claims', () => {
     expect(s!.lines.join('\n')).toMatch(/INC-1[\s\S]*INC-2[\s\S]*INC-3/);
   });
 
-  it('lists a division\'s items of a value it names, its teams by name and by relation, no other division', async () => {
+  it('lists a division\'s items of a value it names, its teams by relation, no other division', async () => {
     const s = await set('Which P1 incidents did Northwind have?', ['northwind']);
     const listed = s!.lines.filter((l) => l.startsWith('- ')).map((l) => /INC-\d+/.exec(l)![0]);
     expect(listed.sort()).toEqual(['INC-1', 'INC-3', 'INC-7']);
@@ -167,7 +169,7 @@ describe('computing the set from the claims', () => {
   it('groups by member organisation and by quarter', async () => {
     const s = await set('How many incidents did each team of Northwind report per quarter?', ['northwind']);
     expect(s!.question.groupBy).toEqual(['member', 'quarter']);
-    expect(s!.lines).toEqual(expect.arrayContaining(['Northwind Platform · Q1: 2', 'Northwind Platform · Q2: 1', 'Payments Team · Q1: 2']));
+    expect(s!.lines).toEqual(expect.arrayContaining(['Northwind Platform · 2025-Q1: 2', 'Northwind Platform · 2025-Q2: 1', 'Payments Team · 2025-Q1: 2']));
   });
 
   it('filters readings by a threshold, one reading a week', async () => {
@@ -179,8 +181,8 @@ describe('computing the set from the claims', () => {
   it('takes the highest reading per quarter and the mean over a yearless half', async () => {
     const max = await set('What was the highest weekly availability of Northwind Platform per quarter?', ['platform']);
     expect(max!.lines).toEqual([
-      `Q1: max availability = 99.97% — ${monday(4)} 《Platform weekly · week 4》 (of 6 readings)`,
-      `Q2: max availability = 99.99% — ${monday(14)} 《Platform weekly · week 14》 (of 2 readings)`,
+      `2025-Q1: max availability = 99.97% — ${monday(4)} 《Platform weekly · week 4》 (of 6 readings)`,
+      `2025-Q2: max availability = 99.99% — ${monday(14)} 《Platform weekly · week 14》 (of 2 readings)`,
     ]);
     const mean = await set('What was the average availability of Northwind Platform in the first half?', ['platform']);
     const expected = AVAILABILITY.reduce((s, [, v]) => s + v, 0) / AVAILABILITY.length;
@@ -211,10 +213,12 @@ describe('computing the set from the claims', () => {
     expect(people[0]).toMatch(/^- Alice Chen \(2: INC-1, INC-7\)/);
   });
 
-  it('counts over the whole knowledge base when the question says so', async () => {
-    const s = await set('How many P1 incidents were there company-wide?', []);
+  it('counts over the whole knowledge base when the question says so, by an attribute it names', async () => {
+    const s = await set('How many incidents of severity P1 were there company-wide?', []);
     expect(s).toMatchObject({ scope: 'the whole knowledge base', answer: 4 });
-    expect(await set('How many P1 incidents were there?', [])).toBeNull();
+    expect(await set('How many incidents of severity P1 were there?', [])).toBeNull();
+    // naming no attribute, a company-wide question is not read off every statement
+    expect(await set('How many P1 incidents were there company-wide?', [])).toBeNull();
   });
 });
 
@@ -239,7 +243,7 @@ describe('ask with a computed set', () => {
 
   it('hands the model the computed lines and every row as a fact with its source, in one completion', async () => {
     const { llm, prompts } = recordingLlm();
-    const res = await ask(store, config, embedder, llm, 'How many incidents did Northwind Platform report?');
+    const res = await ask(store, config, embedder, llm, 'How many incidents did Northwind Platform report?', { computed: true });
     expect(prompts).toHaveLength(1);
     expect(res.route.computed).toMatchObject({ op: 'count', scope: 'Northwind Platform', items: 3 });
     expect(prompts[0]).toContain('# Computed from the claims\nScope: Northwind Platform.');
@@ -249,9 +253,19 @@ describe('ask with a computed set', () => {
     expect(res.computed?.answer).toBe(3);
   });
 
+  it('computes the set for a question routed to the relation walk too', async () => {
+    const { llm, prompts } = recordingLlm();
+    const res = await ask(store, config, embedder, llm, 'How many incidents did Northwind Platform report?', { route: 'multihop', computed: true });
+    // and, with computed sets off (the default), none
+    expect((await ask(store, config, embedder, recordingLlm().llm, 'How many incidents did Northwind Platform report?', { route: 'multihop' })).computed).toBeUndefined();
+    expect(res.route.kind).toBe('multihop');
+    expect(res.route.computed).toMatchObject({ op: 'count', scope: 'Northwind Platform', items: 3 });
+    expect(prompts[0]).toContain('# Computed from the claims\nScope: Northwind Platform.');
+  });
+
   it('computes nothing for a question that asks for no set', async () => {
     const { llm, prompts } = recordingLlm();
-    const res = await ask(store, config, embedder, llm, 'What is Northwind Platform?');
+    const res = await ask(store, config, embedder, llm, 'What is Northwind Platform?', { computed: true });
     expect(res.computed).toBeUndefined();
     expect(res.route.computed).toBeUndefined();
     expect(prompts[0]).not.toContain('# Computed from the claims');

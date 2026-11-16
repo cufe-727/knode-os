@@ -1,7 +1,11 @@
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { SearchResult } from '../types.js';
 import { factsForQuestion, QuestionFact } from './facts.js';
-import { keywordTerms, termCount } from './search.js';
+import { matchIndexReady, termGrams } from '../store/grams.js';
+import { chunksForTerms, CJK_QUERY_STOP, keywordTerms, LATIN_QUERY_STOP, termCount, termStats } from './search.js';
+
+/** The keyword index's cap on a term's passages (search.ts): a word in this many is no word that narrows. */
+const KEYWORD_DF_CAP = 1000;
 
 /**
  * A second retrieval round when the first is thin (docs/design/34 §2).
@@ -13,13 +17,18 @@ import { keywordTerms, termCount } from './search.js';
  * claims or passages came back gets nothing about it at all. Here, without a
  * model call:
  *
- *   the test    a chain question (route.ts `isChainQuestion`, or routed
- *               multihop): one round answered steps it asks one after another;
- *               a named entity no fact is about and no passage mentions; or
- *               half the words of the question in none of the passages and
- *               facts. In each case there must be something to look further
- *               from: the uncovered named entities, or entities the first
- *               round reached that the question does not name
+ *   the test    a named entity none of whose spellings a fact is about or
+ *               a passage mentions or writes; half a lookup's words in none
+ *               of the passages and facts; a chain question (route.ts
+ *               `isChainQuestion`, or routed multihop) missing a word, or
+ *               whose step — the entity its first round reached — has no
+ *               passage or fact of its own yet. Words are the segmenter's
+ *               (`questionWords`), less stop words, interrogatives and the
+ *               kind of answer they ask for ("哪家公司"): never pairs of
+ *               characters across a word boundary. There must be something
+ *               to look further from: the uncovered named entities, or
+ *               entities the first round reached that the question does not
+ *               name
  *   the round   one, at most: the passages that mention those entities — the
  *               ones that mention most of them and hold most of the missing
  *               words first, nearness to the question breaking ties — and the
@@ -43,10 +52,67 @@ export const BRIDGE_DOCS = 15;
 export const BRIDGE_DOCS_WORDED = 80;
 /** Entities reached, looked further from at most. */
 const BRIDGES = 4;
-/** Passages read as candidates at most. */
+/** Passages read as candidates at most, the best first (nearest the question, else holding most missing words). */
 const CANDIDATES = 240;
-/** Characters that make a CJK pair a piece of grammar, not a word ("的人", "复过", "那起"). */
-const FUNCTION_CHARS = /[的了过是在有和与及那这它他她其一被由把将又也都还就人个位些此该吗呢么哪谁几什]/;
+/** Mentions of the entities looked from read at most, besides the ranked ones below: a hub has thousands. */
+const POOL = 2000;
+/** Passages nearest the question read off the vector index, and passages holding a missing word read off the keyword index, before they are kept to the entities' own: a hub's best passages are ranked before any cut. */
+const RANKED_POOL = 400;
+/** The word segmenter the search's bridge terms use (search/bridge.ts). */
+const SEGMENTER = new Intl.Segmenter('zh', { granularity: 'word' });
+/** Longest run of characters the segmenter cut one by one kept as one word (a name it does not know). */
+const UNKNOWN_RUN_MAX = 6;
+/** Words that ask, or point back or at now, rather than name what is asked about. */
+const ASKING = new Set([
+  '哪里', '哪儿', '哪个', '哪家', '哪位', '哪些', '哪一', '什么', '怎么', '怎样', '如何', '为什么', '为何', '多少', '几个', '是否', '现在', '目前', '当前', '如今', '后来', '此人', '这个', '那个', '情况',
+  '一共', '共有', '一共有', '总共', '合计', '总计', '分别', '各自', '最近', '近期',
+  'who', 'whom', 'whose', 'what', 'where', 'when', 'which', 'why', 'how', 'now', 'currently', 'today', 'person', 'people', 'one', 'that', 'this', 'they', 'them', 'their',
+]);
+/** An interrogative whose next word is the kind of answer asked for ("哪家公司", "which team"), not a word the passages must hold. */
+const ASKS_FOR = /^(?:哪|哪家|哪个|哪位|哪些|哪一|什么|啥|which|what)$/i;
+/** Characters of grammar: they break a run of characters the segmenter cut one by one, and a word made only of them is no word ("到了", "的人"). */
+const GRAMMAR = /^[的了过是在有和与及那这它他她其被由把将又也都还就人个位些此该吗呢么到着得地对从向给于为等之所以而且但或并年月日号周季度一二三四五六七八九十百千万亿两第]+$/;
+/** Measure characters between an interrogative and what it asks for ("哪|家|公司", "几|个|人"). */
+const MEASURE = /^[家个位名种条项些起件只台座次]$/;
+
+/** The question's words: latin words and the segmenter's CJK words, less stop words, interrogatives and what they ask for. */
+export function questionWords(question: string): string[] {
+  const out: string[] = [];
+  let skipNext = false;
+  const push = (w: string) => {
+    const lower = w.toLowerCase();
+    if (ASKS_FOR.test(lower)) { skipNext = true; return; }
+    if (skipNext) { skipNext = false; return; }
+    if (ASKING.has(lower) || CJK_QUERY_STOP.has(lower) || LATIN_QUERY_STOP.has(lower) || GRAMMAR.test(lower)) return;
+    if (/^[a-z0-9-]+$/i.test(w) ? w.length < 3 : w.length < 2) return;
+    // a number or a year is a period or a figure, not a word the passages must hold
+    if (/^\d+$/.test(w)) return;
+    out.push(lower);
+  };
+  for (const m of question.matchAll(/[一-鿿㐀-䶿]+|[A-Za-z][A-Za-z0-9-]*|\d+/g)) {
+    const run = m[0];
+    if (!/[一-鿿㐀-䶿]/.test(run)) { push(run); continue; }
+    // the characters the segmenter cut one by one, kept together as one word (a name it does not know) until grammar
+    let singles = '';
+    const flush = () => {
+      if (singles.length >= 2 && singles.length <= UNKNOWN_RUN_MAX) push(singles);
+      singles = '';
+    };
+    for (const { segment } of SEGMENTER.segment(run)) {
+      if (segment.length === 1) {
+        if (ASKS_FOR.test(segment)) { flush(); push(segment); continue; }
+        if (skipNext && MEASURE.test(segment)) continue;
+        if (GRAMMAR.test(segment)) { flush(); continue; }
+        singles += segment;
+        continue;
+      }
+      flush();
+      push(segment);
+    }
+    flush();
+  }
+  return [...new Set(out)];
+}
 
 export interface SecondRound {
   /** Why it ran: the named entities nothing was about, the words nothing held, the entities it looked from. */
@@ -63,10 +129,10 @@ interface FactLike { subject: string; object?: string | null; statement: string;
 export function missingTerms(question: string, names: string[], text: string): string[] {
   const hay = text.toLowerCase();
   const nameText = names.join(' ').toLowerCase();
-  return keywordTerms(question)
+  return questionWords(question)
     .filter((t) => !nameText.includes(t))
-    .filter((t) => !(/^[一-鿿]{2}$/.test(t) && FUNCTION_CHARS.test(t)))
-    .filter((t) => termCount(hay, t) === 0);
+    // a word held, or its singular ("incidents" / "incident")
+    .filter((t) => !hay.includes(t) && !(/^[a-z]{4,}s$/.test(t) && hay.includes(t.slice(0, -1))));
 }
 
 /**
@@ -87,36 +153,70 @@ export async function secondRound(
   const { named, contexts, facts } = opts;
   const text = [...contexts.map((c) => c.content), ...facts.map((f) => `${f.subject} ${f.statement} ${f.object ?? ''}`)].join('\n');
 
-  // named entities nothing was about: no fact's subject or object, no passage mentions them
+  // named entities nothing was about: an entity, not a spelling — one is covered when any spelling merged into or
+  // with it is mentioned by a passage, is a fact's subject or object, or is written in a passage
   const namedRows = named.length
-    ? await q<{ id: string; name: string; aliases: unknown; mentioned: boolean }>(
-      `SELECT e.id, e.name, e.aliases,
-              EXISTS (SELECT 1 FROM entity_mentions m WHERE m.entity_id = e.id AND m.chunk_id = ANY($2::text[])) AS mentioned
-       FROM entities e WHERE e.id = ANY($1::text[])`,
-      [named, contexts.map((c) => c.chunkId)],
+    ? await q<{ id: string; root: string; name: string; aliases: unknown }>(
+      `SELECT e.id, COALESCE(e.canonical_id, e.id) AS root, e.name, e.aliases FROM entities e
+       WHERE e.id = ANY($1::text[]) OR e.canonical_id = ANY($1::text[])
+          OR e.id IN (SELECT canonical_id FROM entities WHERE id = ANY($1::text[]) AND canonical_id IS NOT NULL)`,
+      [named],
     )
     : [];
+  const spellingIds = namedRows.map((r) => r.id);
+  const mentioned = new Set(spellingIds.length && contexts.length
+    ? (await q<{ entity_id: string }>(`SELECT DISTINCT entity_id FROM entity_mentions WHERE entity_id = ANY($1::text[]) AND chunk_id = ANY($2::text[])`, [spellingIds, contexts.map((c) => c.chunkId)])).map((r) => r.entity_id)
+    : []);
   const namesOf = (r: { name: string; aliases: unknown }) => [r.name, ...(Array.isArray(r.aliases) ? r.aliases.filter((a): a is string => typeof a === 'string') : [])];
   const about = new Set(facts.flatMap((f) => [f.subject, f.object ?? '']).filter(Boolean));
-  const uncovered = namedRows.filter((r) => !r.mentioned && !namesOf(r).some((n) => about.has(n)));
+  const passageText = contexts.map((c) => c.content).join('\n');
+  const groups = new Map<string, typeof namedRows>();
+  for (const r of namedRows) (groups.get(r.root) ?? groups.set(r.root, []).get(r.root)!).push(r);
+  const uncovered = [...groups.values()]
+    .filter((g) => !g.some((r) => mentioned.has(r.id) || namesOf(r).some((n) => about.has(n) || (n.length >= 2 && passageText.includes(n)))))
+    .map((g) => g.find((r) => r.id === r.root) ?? g[0]);
   const names = namedRows.flatMap(namesOf);
-  const missing = missingTerms(question, names, text);
-  // a chain asks for steps one round took at once: it gets the next step always; a lookup, when a named entity
-  // came back with nothing or half the words it asks about are nowhere
-  const thin = opts.chain || uncovered.length > 0 || (missing.length > 0 && missing.length * 2 >= Math.max(1, keywordTerms(question).length));
-  if (!thin) return null;
+  // a word is missing only when the knowledge base holds it somewhere, in fewer passages than the keyword index's cap:
+  // a word in no passage ("列出", "综合", "接近" — the question's own framing) no second round can find, and one in
+  // most of them narrows nothing
+  const said = questionWords(question).filter((t) => !names.join(' ').toLowerCase().includes(t));
+  let asked0: string[] = [];
+  let missing: string[] = [];
+  // only off the keyword index: while it is still building (or for a word it holds no grams of) the statistics would
+  // be a scan of every passage — seconds a question at half a million chunks — so no word counts as missing then
+  const indexed = matchIndexReady(store, 'chunks') ? said.filter((t) => termGrams(t).length > 0) : [];
+  if (indexed.length) {
+    const unheld = missingTerms(question, names, text);
+    statements++;
+    const { df } = await termStats(store, indexed).catch(() => ({ df: indexed.map(() => 0) }));
+    const retrievable = new Set(indexed.filter((_, i) => df[i] > 0 && df[i] < KEYWORD_DF_CAP));
+    asked0 = said.filter((t) => retrievable.has(t));
+    missing = unheld.filter((t) => retrievable.has(t));
+  }
+  // thin: a named entity came back with nothing; half a lookup's words are nowhere; a chain misses a word, or its
+  // step — the entity its first round reached — has no passage or fact of its own yet (only the claim that led to it)
+  let thin = uncovered.length > 0 || (missing.length > 0 && (opts.chain || missing.length * 2 >= Math.max(1, asked0.length)));
+  let stepCheck = false;
+  if (!thin && opts.chain) stepCheck = true;
+  else if (!thin) return null;
 
   // what to look further from: the uncovered named entities, and the entities the first round reached — its facts
   // are about, its passages mention — that the question does not name
   const reachedNames = new Map<string, number>();
   for (const f of facts.slice(0, 40)) for (const n of [f.subject, f.object]) if (n && !names.includes(n)) reachedNames.set(n, (reachedNames.get(n) ?? 0) + 1);
-  const reached = await q<{ id: string; name: string; docs: number; passages: number }>(
-    `WITH ctx AS (SELECT m.entity_id, count(DISTINCT m.chunk_id)::int AS passages FROM entity_mentions m WHERE m.chunk_id = ANY($2::text[]) GROUP BY 1)
-     SELECT e.id, e.name, COALESCE(ctx.passages, 0) AS passages,
+  // `own`: passages mentioning it that mention no entity the question names — not the passage that led to it
+  const reached = await q<{ id: string; name: string; docs: number; passages: number; own: number }>(
+    `WITH named AS MATERIALIZED (SELECT DISTINCT chunk_id FROM entity_mentions WHERE entity_id = ANY($3::text[]) AND chunk_id = ANY($2::text[])),
+     ctx AS (
+       SELECT m.entity_id, count(DISTINCT m.chunk_id)::int AS passages,
+              count(DISTINCT m.chunk_id) FILTER (WHERE m.chunk_id NOT IN (SELECT chunk_id FROM named))::int AS own
+       FROM entity_mentions m WHERE m.chunk_id = ANY($2::text[]) GROUP BY 1
+     )
+     SELECT e.id, e.name, COALESCE(ctx.passages, 0) AS passages, COALESCE(ctx.own, 0) AS own,
             (SELECT count(DISTINCT m.document_id)::int FROM entity_mentions m WHERE m.entity_id = e.id) AS docs
      FROM entities e LEFT JOIN ctx ON ctx.entity_id = e.id
      WHERE (e.name = ANY($1::text[]) OR ctx.entity_id IS NOT NULL) AND e.tx_to IS NULL AND e.canonical_id IS NULL AND NOT e.id = ANY($3::text[])`,
-    [[...reachedNames.keys()], contexts.map((c) => c.chunkId), named],
+    [[...reachedNames.keys()], contexts.map((c) => c.chunkId), spellingIds],
   );
   // the ones the facts about what the question asks hold most, a rarer one before a commoner
   const asked = keywordTerms(question).filter((t) => !names.join(' ').toLowerCase().includes(t));
@@ -130,28 +230,76 @@ export async function secondRound(
     .filter((r) => r.docs > 0 && r.docs <= (missing.length ? BRIDGE_DOCS_WORDED : BRIDGE_DOCS) && !names.includes(r.name))
     .sort((a, b) => (weight.get(b.name) ?? 0) - (weight.get(a.name) ?? 0) || a.docs - b.docs || a.id.localeCompare(b.id))
     .slice(0, BRIDGES);
+  if (stepCheck) {
+    // the chain's step: the reached entity weighed most; it is covered by a passage or a fact of its own — one that
+    // names nothing the question names: the passage or claim that led to it ("方杰提出R-03") is the link, not the step
+    const step = [...reached].filter((r) => !names.includes(r.name))
+      .sort((a, b) => (weight.get(b.name) ?? 0) - (weight.get(a.name) ?? 0) || a.id.localeCompare(b.id))[0];
+    const linkText = (f: FactLike) => names.some((n) => n.length >= 2 && (`${f.statement} ${f.object ?? ''}`.includes(n) || f.subject === n));
+    if (!step || step.own > 0 || facts.some((f) => f.subject === step.name && !linkText(f))) return null;
+    thin = true;
+  }
   const common = new Set(bridges.filter((b) => b.docs > BRIDGE_DOCS).map((b) => b.id));
-  const from = [...uncovered.map((r) => r.id), ...bridges.map((b) => b.id)];
-  if (from.length === 0) return null;
-
-  // the passages that mention them, most of them first, then the missing words, then nearness
-  const shown = contexts.map((c) => c.chunkId);
+  // an uncovered named entity is looked from through every spelling; a hub among them, with no vector to rank its
+  // passages by, only through passages holding a missing word
   const withVector = Boolean(opts.queryVector && opts.model);
-  const cands = await q<{ chunk_id: string; document_id: string; path: string; title: string | null; content: string; doc_date: string | Date | null; hits: number; ents: string[]; sim: number | null }>(
-    `WITH hit AS (
-       SELECT m.chunk_id, count(DISTINCT m.entity_id)::int AS hits, array_agg(DISTINCT m.entity_id) AS ents FROM entity_mentions m
-       WHERE m.entity_id = ANY($1::text[]) AND NOT m.chunk_id = ANY($2::text[]) GROUP BY 1
+  const uncoveredIds = uncovered.flatMap((u) => groups.get(u.root)!.map((r) => r.id));
+  if (!withVector && uncoveredIds.length) {
+    const hubs = await q<{ id: string }>(
+      `SELECT entity_id AS id FROM entity_mentions WHERE entity_id = ANY($1::text[]) GROUP BY 1 HAVING count(DISTINCT document_id) > $2`, [uncoveredIds, BRIDGE_DOCS],
+    );
+    for (const h of hubs) common.add(h.id);
+  }
+  // a lookup looks further only from what it names: the passages of a named entity holding the words it missed
+  // ("宁德时代的董事长" reads 宁德时代's passages that hold 董事); a chain from the entities its first round reached as
+  // well — never a lookup from whatever its passages happen to mention
+  const namedIds = [...new Set(namedRows.map((r) => r.id))];
+  const from = opts.chain
+    ? [...uncoveredIds, ...bridges.map((b) => b.id)]
+    : uncoveredIds.length ? uncoveredIds : missing.length ? namedIds : [];
+  if (from.length === 0) return null;
+  // a lookup reading a named entity it already covers takes only what holds a word it missed
+  const wordsOnly = !opts.chain && uncoveredIds.length === 0;
+  if (wordsOnly) for (const id of namedIds) common.add(id);
+
+  // the passages that mention them, most of them first, then nearness, then the missing words. A hub's mentions are
+  // more than any pool: its passages nearest the question (the vector index) and those holding a missing word (the
+  // keyword index) are read first, ranked, and only then kept to the entities' own; a bounded pool of the rest after
+  const shown = contexts.map((c) => c.chunkId);
+  const ranked = new Set<string>();
+  if (withVector) {
+    for (const r of await q<{ chunk_id: string }>(
+      `SELECT chunk_id FROM embeddings WHERE model = $2 ORDER BY embedding <=> $1::${VECTOR_TYPE} LIMIT ${RANKED_POOL}`,
+      [toVectorLiteral(opts.queryVector!), opts.model],
+    )) ranked.add(r.chunk_id);
+  }
+  if (missing.length) {
+    statements++;
+    const byTerms = await chunksForTerms(store, missing.slice(0, 6), missing.slice(0, 6).map(() => 1), Math.min(6, missing.length), { exclude: shown, perTerm: Math.ceil(RANKED_POOL / 3) }).catch(() => []);
+    for (const r of byTerms) ranked.add(r.chunk_id);
+  }
+  const words = missing.slice(0, 6).map((t) => `%${t.replace(/[%_\\]/g, '\\$&')}%`);
+  const wordsSql = words.length ? words.map((_, i) => `(c.content ILIKE $${withVector ? 6 + i : 4 + i})::int`).join(' + ') : '0';
+  const cands = await q<{ chunk_id: string; document_id: string; path: string; title: string | null; content: string; doc_date: string | Date | null; hits: number; ents: string[]; sim: number | null; words: number }>(
+    `WITH m AS MATERIALIZED (
+       (SELECT chunk_id, entity_id FROM entity_mentions WHERE entity_id = ANY($1::text[]) AND chunk_id = ANY($${withVector ? 6 + words.length : 4 + words.length}::text[]) AND NOT chunk_id = ANY($2::text[]))
+       UNION
+       (SELECT chunk_id, entity_id FROM entity_mentions WHERE entity_id = ANY($1::text[]) AND NOT chunk_id = ANY($2::text[]) LIMIT ${POOL})
+     ), hit AS (
+       SELECT chunk_id, count(DISTINCT entity_id)::int AS hits, array_agg(DISTINCT entity_id) AS ents FROM m GROUP BY 1
+     ), scored AS (
+       SELECT c.id AS chunk_id, c.document_id, d.path, d.title, c.content, d.doc_date, hit.hits, hit.ents,
+              ${withVector ? `(SELECT 1 - (e.embedding <=> $4::${VECTOR_TYPE}) FROM embeddings e WHERE e.chunk_id = c.id AND e.model = $5)` : 'NULL::float'} AS sim,
+              ${wordsSql} AS words
+       FROM hit JOIN chunks c ON c.id = hit.chunk_id JOIN documents d ON d.id = c.document_id
+       WHERE d.status = 'indexed'
      )
-     SELECT c.id AS chunk_id, c.document_id, d.path, d.title, c.content, d.doc_date, hit.hits, hit.ents,
-            ${withVector ? `(SELECT 1 - (e.embedding <=> $4::${VECTOR_TYPE}) FROM embeddings e WHERE e.chunk_id = c.id AND e.model = $5)` : 'NULL::float'} AS sim
-     FROM hit JOIN chunks c ON c.id = hit.chunk_id JOIN documents d ON d.id = c.document_id
-     WHERE d.status = 'indexed'
-     ORDER BY hit.hits DESC, c.id LIMIT $3`,
-    withVector ? [from, shown, CANDIDATES, toVectorLiteral(opts.queryVector!), opts.model] : [from, shown, CANDIDATES],
+     SELECT * FROM scored ORDER BY hits DESC, ${withVector ? 'sim DESC NULLS LAST, ' : ''}words DESC, chunk_id LIMIT $3`,
+    withVector ? [from, shown, CANDIDATES, toVectorLiteral(opts.queryVector!), opts.model, ...words, [...ranked]] : [from, shown, CANDIDATES, ...words, [...ranked]],
   );
   const scored = cands.map((c) => {
     const words = missing.filter((t) => termCount(c.content.toLowerCase(), t) > 0).length;
-    return { c, words, key: [c.hits, words, c.sim ?? 0] as const };
+    return { c, words, key: withVector ? [c.hits, c.sim ?? 0, words] as const : [c.hits, words, 0] as const };
   })
     // a passage reached only through a common entity must hold a missing word
     .filter((x) => x.words > 0 || (x.c.ents ?? []).some((e) => !common.has(e)))
@@ -177,10 +325,11 @@ export async function secondRound(
   const known = new Set(facts.map((f) => `${f.subject}|${f.statement}`));
   const more = (await factsForQuestion(store, question, chunks, { named: from, limit: SECOND_FACTS + facts.length, queryVector: opts.queryVector, model: opts.model }))
     .filter((f) => !known.has(`${f.subject}|${f.statement}`))
+    .filter((f) => !wordsOnly || missing.some((t) => `${f.subject} ${f.statement} ${f.object ?? ''}`.toLowerCase().includes(t)))
     .slice(0, SECOND_FACTS);
   statements += 1; // factsForQuestion: one statement (its list routes are not asked for)
   return {
-    reason: { uncoveredNamed: uncovered.map((r) => r.name), missingTerms: missing, from: [...uncovered.map((r) => r.name), ...bridges.map((b) => b.name)] },
+    reason: { uncoveredNamed: uncovered.map((r) => r.name), missingTerms: missing, from: opts.chain || uncovered.length ? [...uncovered.map((r) => r.name), ...(opts.chain ? bridges.map((b) => b.name) : [])] : [...groups.values()].map((g) => (g.find((r) => r.id === r.root) ?? g[0]).name) },
     chunks, facts: more, statements, ms: Date.now() - started,
   };
 }

@@ -555,7 +555,30 @@ function knodeSystem(id: string, label: string, kind: SystemUnderTest['kind'], a
   };
 }
 
-export function knodeAsk(): SystemUnderTest {
+/**
+ * What a run asks `ask` to do beyond its defaults (docs/design/34): compute sets from the claims
+ * (`KNODE_EVAL_ASK_COMPUTED=1`, off unless set) and read relative periods from a reference day
+ * (`KNODE_EVAL_ASK_NOW=YYYY-MM-DD`: a pack's own "today", 2025-11-07 for the 10x reports pack).
+ */
+export function askOptionsFromEnv(env: NodeJS.ProcessEnv = process.env): { computed?: boolean; now?: string } {
+  // empty is unset, as for any setting
+  const computed = env.KNODE_EVAL_ASK_COMPUTED?.trim() || undefined;
+  const now = env.KNODE_EVAL_ASK_NOW?.trim() || undefined;
+  let on: boolean | undefined;
+  if (computed !== undefined) {
+    if (/^(1|true|yes|on|enabled?)$/i.test(computed)) on = true;
+    else if (/^(0|false|no|off|disabled?)$/i.test(computed)) on = false;
+    else throw new Error(`KNODE_EVAL_ASK_COMPUTED must be on or off (1 / true / yes / on / enabled, or 0 / false / no / off / disabled), not "${computed}"`);
+  }
+  if (now !== undefined) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(now);
+    const day = m ? new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))) : null;
+    if (!m || !day || day.toISOString().slice(0, 10) !== now) throw new Error(`KNODE_EVAL_ASK_NOW must be a day (YYYY-MM-DD); "${now}" is not a day`);
+  }
+  return { ...(on !== undefined ? { computed: on } : {}), ...(now ? { now } : {}) };
+}
+
+export function knodeAsk(options: { computed?: boolean; now?: string } = askOptionsFromEnv()): SystemUnderTest {
   // as wide as the run's answer concurrency: every answer shares the one open context (docs/design/31 D2)
   return knodeSystem('knode-ask', 'knode-os ask (hybrid retrieval, cited answer)', 'kb', true, {
     async answer(task, prompt, env) {
@@ -565,7 +588,7 @@ export function knodeAsk(): SystemUnderTest {
       const rules = prompt.startsWith(task.question) ? prompt.slice(task.question.length) : '';
       const llm = withAppendedRules(shimClient(env, { system: 'knode-ask', stage: 'answer', task: task.id }), rules);
       // against the index as built: an answer records no hits, so no question moves another's ranking (docs/design/31 D3)
-      const res = await ask(ctx.store, ctx.config, ctx.embedder, llm, task.question, { mode: 'hybrid', track: false });
+      const res = await ask(ctx.store, ctx.config, ctx.embedder, llm, task.question, { mode: 'hybrid', track: false, ...options });
       // ask's own [n] citations, each the documents of the passage or fact it numbers, and any [doc: path] the
       // answer wrote under the shared output rules
       const docs = new Set(env.staged.docs.map((d) => d.path));
@@ -581,7 +604,7 @@ export function knodeAsk(): SystemUnderTest {
     async retrieve(query, k, env) {
       const s = stateFor(env);
       const ctx = await open(s);
-      const res = await ask(ctx.store, ctx.config, ctx.embedder, withoutModel(ctx.llm), query, { mode: 'hybrid', track: false });
+      const res = await ask(ctx.store, ctx.config, ctx.embedder, withoutModel(ctx.llm), query, { mode: 'hybrid', track: false, ...options });
       return sentDocuments(s, res, new Set(env.staged.docs.map((d) => d.path))).slice(0, k);
     },
     async exportKnowledge(env) {
