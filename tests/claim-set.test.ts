@@ -169,7 +169,7 @@ describe('computing the set from the claims', () => {
   it('groups by member organisation and by quarter', async () => {
     const s = await set('How many incidents did each team of Northwind report per quarter?', ['northwind']);
     expect(s!.question.groupBy).toEqual(['member', 'quarter']);
-    expect(s!.lines).toEqual(expect.arrayContaining(['Northwind Platform · Q1: 2', 'Northwind Platform · Q2: 1', 'Payments Team · Q1: 2']));
+    expect(s!.lines).toEqual(expect.arrayContaining(['Northwind Platform · 2025-Q1: 2', 'Northwind Platform · 2025-Q2: 1', 'Payments Team · 2025-Q1: 2']));
   });
 
   it('filters readings by a threshold, one reading a week', async () => {
@@ -181,8 +181,8 @@ describe('computing the set from the claims', () => {
   it('takes the highest reading per quarter and the mean over a yearless half', async () => {
     const max = await set('What was the highest weekly availability of Northwind Platform per quarter?', ['platform']);
     expect(max!.lines).toEqual([
-      `Q1: max availability = 99.97% — ${monday(4)} 《Platform weekly · week 4》 (of 6 readings)`,
-      `Q2: max availability = 99.99% — ${monday(14)} 《Platform weekly · week 14》 (of 2 readings)`,
+      `2025-Q1: max availability = 99.97% — ${monday(4)} 《Platform weekly · week 4》 (of 6 readings)`,
+      `2025-Q2: max availability = 99.99% — ${monday(14)} 《Platform weekly · week 14》 (of 2 readings)`,
     ]);
     const mean = await set('What was the average availability of Northwind Platform in the first half?', ['platform']);
     const expected = AVAILABILITY.reduce((s, [, v]) => s + v, 0) / AVAILABILITY.length;

@@ -329,6 +329,24 @@ export type Granularity = 'week' | 'month' | 'quarter' | 'half' | 'year';
 /** The period a reading is of: its granularity and which one ("quarter", "2025-Q1"). */
 export interface Period { gran: Granularity; key: string }
 
+/** The days a period covers (YYYY-MM-DD, both ends included). */
+export function periodSpan(p: Period): { from: string; to: string } {
+  const y = Number(p.key.slice(0, 4));
+  const day = (t: Date) => t.toISOString().slice(0, 10);
+  switch (p.gran) {
+    case 'week': {
+      const w = Number(p.key.slice(6));
+      const jan4 = new Date(Date.UTC(y, 0, 4));
+      const monday = new Date(jan4.getTime() - ((jan4.getUTCDay() + 6) % 7) * 86400000 + (w - 1) * 7 * 86400000);
+      return { from: day(monday), to: day(new Date(monday.getTime() + 6 * 86400000)) };
+    }
+    case 'month': { const m = Number(p.key.slice(5, 7)); return { from: day(new Date(Date.UTC(y, m - 1, 1))), to: day(new Date(Date.UTC(y, m, 0))) }; }
+    case 'quarter': { const q = Number(p.key.slice(6)); return { from: day(new Date(Date.UTC(y, (q - 1) * 3, 1))), to: day(new Date(Date.UTC(y, q * 3, 0))) }; }
+    case 'half': { const h = Number(p.key.slice(6)); return { from: day(new Date(Date.UTC(y, (h - 1) * 6, 1))), to: day(new Date(Date.UTC(y, h * 6, 0))) }; }
+    case 'year': return { from: `${y}-01-01`, to: `${y}-12-31` };
+  }
+}
+
 /**
  * The period a claim's figure is of: from its validity window when it has
  * one, else from the words of its statement ("2025年一季度", "上半年", "全年",
@@ -916,12 +934,14 @@ export async function computeClaimSet(
     return members.has(c.subject_id) ? c.subject_id : null;
   };
   const parentOf = (org: string | null) => (org ? parent.get(org) ?? org : null);
+  // a figure is grouped by the period it covers (its first day), not by when it was stated; quarters carry their year
   const groupLabel = (g: SetGroup, c: Cand): string => {
-    const d = dateOf(c) ?? '';
+    const covered = periodOf(c);
+    const d = (covered && (g !== 'week' || covered.gran === 'week') ? periodSpan(covered).from : null) ?? dateOf(c) ?? '';
     switch (g) {
       case 'member': { const m = memberOf(c); return m ? orgName.get(m) ?? m : '?'; }
       case 'parent': { const p = parentOf(memberOf(c)); return p ? orgName.get(p) ?? p : '?'; }
-      case 'quarter': return d ? quarterOf(d) : '?';
+      case 'quarter': return d ? `${d.slice(0, 4)}-${quarterOf(d)}` : '?';
       case 'month': return d ? d.slice(0, 7) : '?';
       case 'week': return d ? isoWeek(d) : '?';
     }
@@ -945,13 +965,20 @@ export async function computeClaimSet(
     const left = { notFact: 0, replaced: 0, recalled: 0, noNumber: 0, units: new Map<string, number>(), grans: new Map<string, number>(), peers: new Map<string, number>() };
     const readings = new Map<string, Cand>();
     const periods = new Map<string, Period | null>();
+    const conflicted = new Set<string>();
     for (const c of matched) {
       if (read.op !== 'value' && matchedAttrs.size > 0 && (!c.attribute || !matchedAttrs.has(c.attribute))) continue;
       if (c.value_num === null && (read.op !== 'value' || !c.value_text)) {
         if (c.attribute && matchedAttrs.has(c.attribute)) left.noNumber++;
         continue;
       }
-      if (!inPeriod(c)) continue;
+      // a window asked is tested on the period the figure covers ("2024年下半年" stated in 2025 is no 2025 figure); a
+      // value as of a day, on when it was stated (what was known that day)
+      const covers = periodOf(c);
+      if (!read.asOf && covers && (from || to)) {
+        const span = periodSpan(covers);
+        if ((from && span.from < from) || (to && span.to > to)) continue;
+      } else if (!inPeriod(c)) continue;
       if (peer(c)) { left.peers.set(c.subject, (left.peers.get(c.subject) ?? 0) + 1); continue; }
       if (!isFact(c)) { left.notFact++; continue; }
       if (onlyRetrospective(c)) { left.recalled++; continue; }
@@ -970,7 +997,18 @@ export async function computeClaimSet(
       // one reading per subject, period and base: a figure in another currency is another measure, never the same one restated
       const key = read.op === 'value' ? c.id : `${c.subject_id}|${unitParts(c.unit).base}|${period ? `${period.gran}:${period.key}` : d ? isoWeek(d) : c.id}`;
       const prev = readings.get(key);
+      // two figures of one subject, period and base, neither replacing the other, are two measures under one name
+      // (宁德时代's revenue and its overseas revenue): neither is the figure, and the period is left out
+      if (prev && read.op !== 'value' && prev.value_num !== null && c.value_num !== null && Math.abs(prev.value_num - c.value_num) > 1e-9 * Math.max(1, Math.abs(prev.value_num))) conflicted.add(key);
       if (!prev || byDate(dateOf(prev), d) < 0) readings.set(key, c);
+    }
+    for (const k of conflicted) readings.delete(k);
+    // the scope's own figure is the whole: when the organisations it names report one, its parts' figures (a
+    // subsidiary's, a team's) are inside it and stay out
+    let parts = 0;
+    const rootIds = new Set(roots.map((r) => r.id));
+    if (scoped && [...readings.values()].some((c) => rootIds.has(c.subject_id))) {
+      for (const [k, c] of readings) if (members.has(c.subject_id) && !rootIds.has(c.subject_id)) { readings.delete(k); parts++; }
     }
     // one base: the commonest; a tie names no figure. A base that begins another is the same one written with its
     // noun ("个" and "个连接"); a bare scale ("亿", "万") joins a base only when one base is named among the readings
@@ -1003,6 +1041,8 @@ export async function computeClaimSet(
       left.grans.size ? `${[...left.grans.values()].reduce((a, b) => a + b, 0)} of another period length (${[...left.grans.keys()].join(', ')})` : '',
       left.noNumber ? `${left.noNumber} of the attribute with no numeric value recorded` : '',
       left.peers.size ? `${[...left.peers.values()].reduce((a, b) => a + b, 0)} about other organisations (${[...left.peers.keys()].join(', ')})` : '',
+      conflicted.size ? `${conflicted.size} period${conflicted.size > 1 ? 's' : ''} whose figures disagree (two measures under one name)` : '',
+      parts ? `${parts} of the scope's parts, inside its own figure` : '',
     ].filter(Boolean);
     if (readings.size === 0) return skip('no reading');
     // figures compare in their base; they are shown in the commonest unit's scale

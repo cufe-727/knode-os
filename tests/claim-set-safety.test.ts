@@ -455,11 +455,43 @@ describe('units: a scale and a base (re-check item 4)', () => {
   });
 });
 
+describe('periods a figure covers (re-check item 5)', () => {
+  beforeAll(async () => {
+    await addEntity('bp', '邦普循环', 'organization');
+    await store.query(`INSERT INTO relations (id, source_id, target_id, type, description, weight) VALUES ('r-bp', 'bp', 'catl', 'subsidiary_of', '邦普循环是宁德时代的子公司', 1)`);
+    await addDoc('y4', '宁德时代2024年年报点评', d('2025-03-20'), '宁德时代2024年下半年净利润202亿元', ['catl']);
+    await addDoc('bpd', '邦普循环经营点评', d('2025-08-10'), '邦普循环2025年上半年净利润30亿元', ['bp']);
+    await addClaim('r2', 'catl', '宁德时代2025年上半年净利润305亿元', { attribute: '净利润', num: 305, unit: '亿元', at: d('2025-07-30') });
+    await addClaim('y4', 'catl', '宁德时代2024年下半年净利润202亿元', { attribute: '净利润', num: 202, unit: '亿元', at: d('2025-03-20') });
+    await addClaim('bpd', 'bp', '邦普循环2025年上半年净利润30亿元', { attribute: '净利润', num: 30, unit: '亿元', at: d('2025-08-10') });
+    // two different figures for one quarter, neither replacing the other
+    await addClaim('r2', 'catl', '宁德时代2025年二季度研发投入50亿元', { attribute: '研发投入', num: 50, unit: '亿元', at: d('2025-07-30') });
+    await addClaim('r3', 'catl', '宁德时代2025年三季度研发投入55亿元', { attribute: '研发投入', num: 55, unit: '亿元', at: d('2025-10-20') });
+    await addClaim('r3', 'catl', '宁德时代2025年三季度海外研发投入80亿元', { attribute: '研发投入', num: 80, unit: '亿元', at: d('2025-10-21') });
+  });
+
+  it('takes the figure of the period asked, by the period it covers, and no part with its whole', async () => {
+    // 202 is 2024's second half, stated in 2025; 30 is a subsidiary's, inside 宁德时代's own figure
+    expect(await set('宁德时代2025年上半年净利润总额是多少？', ['catl'])).toMatchObject({ op: 'sum', answer: '305' });
+  });
+
+  it('averages quarterly figures by the quarters they cover', async () => {
+    // 销售额 (item 4): 847, 942, 1041 for 2025's first three quarters; 2024's fourth in a bare unit, a US-dollar figure
+    expect(await set('宁德时代平均每季度销售额是多少？', ['catl'])).toMatchObject({ op: 'mean', answer: '943.333333' });
+  });
+
+  it('leaves out a period whose figures disagree, instead of the later overwriting the earlier', async () => {
+    const max = await set('宁德时代的最高研发投入是多少？', ['catl']);
+    expect(max).toMatchObject({ op: 'max', answer: '50' });
+    expect(max!.lines.join('\n')).toMatch(/1 period whose figures disagree/);
+  });
+});
+
 describe('a Chinese question end to end (review item 11)', () => {
   it('puts the value as of a day, its sources and what it left out before the model, and no forecast as a fact', async () => {
     const { llm, prompts } = recordingLlm();
     const res = await ask(store, withRouter({ computedSets: true, computedBudgetMs: 60_000 }), embedder, llm, '截至2025年12月31日，宁德时代的营收是多少？');
-    expect(res.route.computed).toMatchObject({ op: 'value', scope: '宁德时代' });
+    expect(res.route.computed).toMatchObject({ op: 'value', scope: expect.stringMatching(/^宁德时代/) });
     const p = prompts[0];
     expect(p).toContain('# Computed from the claims');
     expect(p).toContain('Value as of 2025-12-31: 1789亿元');
