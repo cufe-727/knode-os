@@ -756,6 +756,8 @@ export interface AskRouterConfig {
   computedSets?: boolean;
   /** A second retrieval round when the first is thin (docs/design/34 §2). Absent: on. */
   secondRound?: boolean;
+  /** Milliseconds a computed set may take; past them nothing is computed. Absent: 1000. */
+  computedBudgetMs?: number;
 }
 
 export function defaultRerankConfig(): RerankConfig {

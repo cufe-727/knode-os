@@ -259,6 +259,41 @@ describe('a scope\'s members come from recorded relations, not names (review ite
   });
 });
 
+describe('bounded work: SQL over indexes and a time budget (review item 5)', () => {
+  beforeAll(async () => {
+    // twenty thousand people, and two thousand claims about who runs 宁德时代's lines; the one named is mentioned
+    await addEntity('wq', '王强', 'person');
+    await addDoc('lines', '宁德时代产线周报', d('2025-05-05'), '宁德时代各产线由王强负责。', ['catl', 'wq']);
+    await store.query(`INSERT INTO entities (id, name, type, mention_count, aliases, description) SELECT 'p-' || i, '人' || substr(md5(i::text), 1, 3), 'person', 1, '[]'::jsonb, '' FROM generate_series(1, 20000) i`);
+    await store.query(
+      `INSERT INTO claims (id, subject_id, type, statement, status, kind, chunk_id, primary_scope_id, evidence_count, tx_from, effective_at, correction)
+       SELECT 'line-' || i, 'catl', 'other', '宁德时代第' || i || '条产线投产，由王强负责', 'fact', 'fact', 'c-lines', 's-lines', 1, now(), '2025-05-05T00:00:00Z', false FROM generate_series(1, 2000) i`,
+    );
+    await store.query(`INSERT INTO evidence (kind, target_id, scope_id, weight, extractor, tx_from) SELECT 'claim', 'line-' || i, 's-lines', 1, 'fixture', now() FROM generate_series(1, 2000) i`);
+  });
+
+  it('finds the people a set names from the mentions of its claims, never by reading every person', async () => {
+    let most = 0;
+    const query = store.query.bind(store);
+    const spied = Object.assign(Object.create(Object.getPrototypeOf(store)), store, {
+      query: async <T>(sql: string, p?: unknown[]) => {
+        const rows = await query<T>(sql, p);
+        most = Math.max(most, rows.length);
+        return rows;
+      },
+    }) as Store;
+    const q = '宁德时代的产线有哪些人负责？';
+    const s = await computeClaimSet(spied, q, classifyQuestion(q), ['catl'], { now: '2026-11-16', budgetMs: 60_000 });
+    expect(s!.lines.filter((l) => l.startsWith('- ')).map((l) => l.slice(2).split(' ')[0])).toEqual(['王强']);
+    expect(most).toBeLessThan(20000);
+  });
+
+  it('computes nothing once its time budget is spent', async () => {
+    const q = '宁德时代有哪些客户？';
+    expect(await computeClaimSet(store, q, classifyQuestion(q), ['catl'], { budgetMs: 0 })).toBeNull();
+  });
+});
+
 describe('the switches', () => {
   it('computes no set unless the workspace or the call turns computed sets on', async () => {
     const q = '宁德时代有哪些客户？';

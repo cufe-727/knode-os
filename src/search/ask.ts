@@ -184,7 +184,7 @@ export async function ask(
   const named = await namedEntities(store, question);
   const computing = opts.computed ?? router.computedSets === true;
   const computed = computing && (routed.kind === 'list' || routed.kind === 'aggregate' || routed.kind === 'lookup')
-    ? await computeClaimSet(store, question, routed, named, { now: opts.now }).catch(() => null)
+    ? await computeClaimSet(store, question, routed, named, { now: opts.now, budgetMs: router.computedBudgetMs }).catch(() => null)
     : null;
   const env: RouteEnv = { store, config, embedder, llm, question, opts, queryVector, router, routed, named, computed };
 

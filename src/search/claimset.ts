@@ -69,6 +69,10 @@ export interface SetQuestion {
 
 /** Live claims read for one computed set at most; past this the set says it may be incomplete. */
 export const SET_SCAN_CAP = 20000;
+/** Milliseconds a computed set may take by default; past them nothing is computed. */
+export const SET_BUDGET_MS = 1000;
+/** People read from the mentions of a set's claims at most. */
+const PEOPLE_CAP = 2000;
 /** Rows a computed set hands the model at most. */
 export const SET_ROWS = 240;
 /** Rows of one item listed at most (its first and its latest are always among them). */
@@ -271,7 +275,7 @@ interface Cand {
   id: string; subject_id: string; subject: string; subject_type: string; object_id: string | null; object: string | null; object_type: string | null;
   statement: string; attribute: string | null; value_num: number | null; value_text: string | null; unit: string | null;
   eff: string | Date | null; superseded_by: string | null; correction: boolean | null; kind: string | null; status: string | null;
-  valid_from: string | Date | null; valid_to: string | Date | null;
+  valid_from: string | Date | null; valid_to: string | Date | null; chunk_id: string | null;
 }
 
 /** How a claim not stated as fact was stated: its kind, and its status when hedged ("rumor, suspected"). */
@@ -526,27 +530,42 @@ interface DocInfo {
   date: string | null;
 }
 
-/** Each document's own organisation, title and date, for the paths given (scope keys of its evidence). */
+/**
+ * Each document's own organisation, title and date, for the paths given
+ * (scope keys of its evidence). Short statements over id arrays, each through
+ * its index (`= ANY($ids)`): an embedded database without statistics turns a
+ * correlated lookup into a scan of the index for every row.
+ */
 async function docsOf(store: Store, paths: string[]): Promise<Map<string, DocInfo>> {
   const out = new Map<string, DocInfo>();
-  for (let i = 0; i < paths.length; i += 1000) {
-    const part = paths.slice(i, i + 1000);
-    const rows = await store.query<{ path: string; org: string | null; title: string | null; doc_date: string | Date | null }>(
-      `WITH sc AS MATERIALIZED (SELECT id, key FROM scopes WHERE kind = ANY($2::text[]) AND key = ANY($1::text[])),
-       ev AS MATERIALIZED (
-         SELECT sc.key, ev.target_id FROM evidence ev JOIN sc ON sc.id = ev.scope_id WHERE ev.kind = 'claim' AND ev.tx_to IS NULL
-       ), per AS (
-         SELECT ev.key AS path, COALESCE(e.canonical_id, e.id) AS org, count(*) AS n
-         FROM ev
-         JOIN claims cl ON cl.id = ev.target_id AND cl.tx_to IS NULL AND cl.canonical_id IS NULL
-         JOIN entities e ON e.id = cl.subject_id AND e.type = 'organization'
-         GROUP BY 1, 2
-       ), home AS (SELECT DISTINCT ON (path) path, org FROM per ORDER BY path, n DESC, org)
-       SELECT p.path, h.org, d.title, d.doc_date
-       FROM unnest($1::text[]) AS p(path) LEFT JOIN home h ON h.path = p.path LEFT JOIN documents d ON d.path = p.path`,
-      [part, SOURCE_SCOPES],
-    );
-    for (const r of rows) out.set(r.path, { home: r.org, title: r.title, date: toDateString(r.doc_date) });
+  if (paths.length === 0) return out;
+  const scopes = await store.query<{ id: string; key: string }>(`SELECT id, key FROM scopes WHERE kind = ANY($2::text[]) AND key = ANY($1::text[])`, [paths, SOURCE_SCOPES]);
+  const keyOf = new Map(scopes.map((r) => [r.id, r.key]));
+  const ev = scopes.length
+    ? await store.query<{ scope_id: string; target_id: string }>(`SELECT scope_id, target_id FROM evidence WHERE scope_id = ANY($1::text[]) AND kind = 'claim' AND tx_to IS NULL`, [scopes.map((r) => r.id)])
+    : [];
+  const claims = ev.length
+    ? await store.query<{ id: string; subject_id: string }>(`SELECT id, subject_id FROM claims WHERE id = ANY($1::text[]) AND tx_to IS NULL AND canonical_id IS NULL`, [[...new Set(ev.map((e) => e.target_id))]])
+    : [];
+  const subjectOf = new Map(claims.map((c) => [c.id, c.subject_id]));
+  const orgs = claims.length
+    ? await store.query<{ id: string; org: string }>(`SELECT id, COALESCE(canonical_id, id) AS org FROM entities WHERE id = ANY($1::text[]) AND type = 'organization'`, [[...new Set(claims.map((c) => c.subject_id))]])
+    : [];
+  const orgOf = new Map(orgs.map((o) => [o.id, o.org]));
+  const counts = new Map<string, Map<string, number>>();
+  for (const e of ev) {
+    const key = keyOf.get(e.scope_id);
+    const subject = subjectOf.get(e.target_id);
+    const org = subject ? orgOf.get(subject) : undefined;
+    if (!key || !org) continue;
+    const per = counts.get(key) ?? counts.set(key, new Map()).get(key)!;
+    per.set(org, (per.get(org) ?? 0) + 1);
+  }
+  const docs = await store.query<{ path: string; title: string | null; doc_date: string | Date | null }>(`SELECT path, title, doc_date FROM documents WHERE path = ANY($1::text[])`, [paths]);
+  const docOf = new Map(docs.map((d) => [d.path, d]));
+  for (const p of paths) {
+    const per = [...(counts.get(p) ?? new Map<string, number>())].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    out.set(p, { home: per[0]?.[0] ?? null, title: docOf.get(p)?.title ?? null, date: toDateString(docOf.get(p)?.doc_date ?? null) });
   }
   return out;
 }
@@ -587,18 +606,32 @@ export async function computeClaimSet(
   question: string,
   routed: Pick<QuestionRoute, 'kind' | 'range'>,
   named: string[],
-  opts: { now?: string } = {},
+  opts: {
+    now?: string;
+    /** Milliseconds the computation may take; past them nothing is computed (default `SET_BUDGET_MS`). */
+    budgetMs?: number;
+    /** Told why nothing was computed, when nothing is. */
+    skipped?: (why: string) => void;
+  } = {},
 ): Promise<ComputedSet | null> {
   const started = Date.now();
+  const skip = (why: string): null => {
+    opts.skipped?.(why);
+    return null;
+  };
+  const budget = opts.budgetMs ?? SET_BUDGET_MS;
+  /** The budget is spent: whatever was read, nothing is computed. */
+  const late = () => Date.now() - started >= budget;
   const read = readSetQuestion(question, routed, opts.now ?? todayIso());
-  if (!read || read.unreadPeriod) return null;
+  if (!read || read.unreadPeriod) return skip('no set asked, or a period no rule reads');
   const typed = await typedColumns(store);
-  if (!typed.attribute || !typed.effective) return null; // a store before claim state: nothing to compute over
+  if (!typed.attribute || !typed.effective) return skip('the store has no claim state'); // a store before claim state: nothing to compute over
   // a merged spelling is its survivor: as scope, as what is asked about, and as the subject of a claim filed under it
   const survivorOf = await survivorsOf(store, named);
   named = [...new Set(named.map((id) => survivorOf.get(id) ?? id))];
   const { roots, members, parent } = await scopeOf(store, named);
-  if (roots.length === 0 && !read.company) return null;
+  if (roots.length === 0 && !read.company) return skip('no scope named');
+  if (late()) return skip('over its time budget');
 
   const memberIds = await spellingsOf(store, [...members.keys()]);
   const scoped = roots.length > 0;
@@ -609,15 +642,20 @@ export async function computeClaimSet(
   };
   // the documents in scope: those whose own organisation (the one most of their claims are about) is a member
   let docsInScope: string[] = [];
+  let docsCapped = false;
   if (scoped) {
-    const mine = await store.query<{ key: string }>(
-      `SELECT DISTINCT s.key FROM claims cl
-       JOIN evidence ev ON ev.kind = 'claim' AND ev.target_id = cl.id AND ev.tx_to IS NULL
-       JOIN scopes s ON s.id = ev.scope_id
-       WHERE cl.subject_id = ANY($1::text[]) AND cl.tx_to IS NULL AND cl.canonical_id IS NULL
-       LIMIT ${SCOPE_DOCS_CAP}`,
-      [memberIds],
+    // short statements over id arrays, each through its index (see docsOf)
+    const own = await store.query<{ id: string }>(
+      `SELECT id FROM claims WHERE subject_id = ANY($1::text[]) AND tx_to IS NULL AND canonical_id IS NULL LIMIT ${SET_SCAN_CAP}`, [memberIds],
     );
+    const scopeIds = own.length
+      ? await store.query<{ scope_id: string }>(`SELECT DISTINCT scope_id FROM evidence WHERE kind = 'claim' AND tx_to IS NULL AND target_id = ANY($1::text[])`, [own.map((r) => r.id)])
+      : [];
+    const mine = scopeIds.length
+      ? await store.query<{ key: string }>(`SELECT DISTINCT key FROM scopes WHERE id = ANY($1::text[]) AND kind = ANY($2::text[]) LIMIT ${SCOPE_DOCS_CAP + 1}`, [scopeIds.map((r) => r.scope_id), SOURCE_SCOPES])
+      : [];
+    docsCapped = mine.length > SCOPE_DOCS_CAP;
+    if (docsCapped) mine.length = SCOPE_DOCS_CAP;
     await learn(mine.map((r) => r.key));
     docsInScope = mine.map((r) => r.key).filter((k) => members.has(docs.get(k)?.home ?? ''));
   }
@@ -639,26 +677,31 @@ export async function computeClaimSet(
             COALESCE(ov.id, oe.id) AS object_id, COALESCE(ov.name, oe.name) AS object, COALESCE(ov.type, oe.type) AS object_type,
             cl.statement, ${col('attribute', 'text')} AS attribute, ${col('valueNum', 'float8')} AS value_num, ${col('valueText', 'text')} AS value_text,
             ${col('unit', 'text')} AS unit, COALESCE(${col('effective', 'timestamptz')}, cl.event_at, cl.valid_from) AS eff,
-            cl.superseded_by, cl.correction, cl.kind, cl.status, cl.valid_from, cl.valid_to
+            cl.superseded_by, cl.correction, cl.kind, cl.status, cl.valid_from, cl.valid_to, cl.chunk_id
      FROM claims cl JOIN entities se ON se.id = cl.subject_id LEFT JOIN entities sv ON sv.id = se.canonical_id
      LEFT JOIN entities oe ON oe.id = cl.object_id LEFT JOIN entities ov ON ov.id = oe.canonical_id`;
   let cands: Cand[];
   let matchedAttrs: Set<string>;
   if (scoped) {
+    // the claims stated in the scope's documents, by id (see docsOf)
+    const docScopes = docsInScope.length
+      ? await store.query<{ id: string }>(`SELECT id FROM scopes WHERE kind = ANY($2::text[]) AND key = ANY($1::text[])`, [docsInScope, SOURCE_SCOPES])
+      : [];
+    const inDocs = docScopes.length
+      ? (await store.query<{ target_id: string }>(`SELECT DISTINCT target_id FROM evidence WHERE scope_id = ANY($1::text[]) AND kind = 'claim' AND tx_to IS NULL`, [docScopes.map((r) => r.id)])).map((r) => r.target_id)
+      : [];
     // every live claim about a member, naming one, or stated in a document of the scope; a named entity's
     // claims from elsewhere are not the scope's (one name may stand for several scopes' settings)
     cands = await store.query<Cand>(
-      `WITH ids AS (
+      `WITH ids AS MATERIALIZED (
          SELECT id FROM claims WHERE subject_id = ANY($1::text[]) AND tx_to IS NULL
          UNION SELECT id FROM claims WHERE object_id = ANY($1::text[]) AND tx_to IS NULL
-         UNION SELECT COALESCE(c.canonical_id, c.id) FROM evidence ev JOIN claims c ON c.id = ev.target_id
-               WHERE ev.kind = 'claim' AND ev.tx_to IS NULL
-                 AND ev.scope_id IN (SELECT id FROM scopes WHERE kind = ANY($3::text[]) AND key = ANY($2::text[]))
+         UNION SELECT COALESCE(c.canonical_id, c.id) FROM claims c WHERE c.id = ANY($2::text[])
        )
        ${select} JOIN ids ON ids.id = cl.id
        WHERE cl.tx_to IS NULL AND cl.canonical_id IS NULL
        LIMIT ${SET_SCAN_CAP + 1}`,
-      [memberIds, docsInScope, SOURCE_SCOPES],
+      [memberIds, inDocs],
     );
     matchedAttrs = matchAttributes(new Set(cands.map((c) => c.attribute).filter((a): a is string => Boolean(a))), rest);
   } else {
@@ -677,13 +720,15 @@ export async function computeClaimSet(
       [[...matchedAttrs], words.map((w) => `%${w.replace(/[%_\\]/g, '\\$&')}%`), [...namedWhat]],
     );
   }
-  const capped = cands.length > SET_SCAN_CAP;
-  if (capped) cands.length = SET_SCAN_CAP;
-  if (cands.length === 0) return null;
+  // more claims, or more documents, than were read: the set may be incomplete, and says so
+  const capped = cands.length > SET_SCAN_CAP || docsCapped;
+  if (cands.length > SET_SCAN_CAP) cands.length = SET_SCAN_CAP;
+  if (cands.length === 0) return skip('no claim in the scope');
+  if (late()) return skip('over its time budget');
 
   const frags = fragments(rest);
-  // the whole knowledge base was read by these words already: a word every candidate holds is still the one asked
-  const terms = statementTerms(frags, cands.map((c) => c.statement), scoped ? 0.9 : 1);
+  // the scope's own names are out of the rest already: a word nearly every claim of the scope holds is still the one asked
+  const terms = statementTerms(frags, cands.map((c) => c.statement), 1);
   // a value the question names ("P1"), among the values of the attributes in scope: "P1 incidents" names a
   // severity's value without naming the severity
   const valuesOfAttrs = new Map<string, Set<string>>();
@@ -710,13 +755,13 @@ export async function computeClaimSet(
   };
   const namedWhatHit = cands.some((c) => namedWhat.has(c.subject_id) || (c.object_id !== null && namedWhat.has(c.object_id)));
   const confident = matchedAttrs.size > 0 || namedWhatHit || (terms.length > 0 && (read.asks !== undefined || frags.every(covered)));
-  if (!confident) return null;
+  if (!confident) return skip('no confident match');
 
   const matches = (c: Cand) =>
     namedWhat.has(c.subject_id) || (c.object_id !== null && namedWhat.has(c.object_id)) ||
     (c.attribute !== null && matchedAttrs.has(c.attribute)) || terms.some((t) => c.statement.toLowerCase().includes(t));
   let matched = cands.filter(matches);
-  if (matched.length === 0) return null;
+  if (matched.length === 0) return skip('no claim matched');
 
   // a value as of a date: every value of the subjects the matching claims are about
   if (read.op === 'value') {
@@ -771,6 +816,7 @@ export async function computeClaimSet(
   const sources = new Map<string, string[]>();
   for (const r of sourceRows) (sources.get(r.id) ?? sources.set(r.id, []).get(r.id)!).push(r.key);
   await learn(sourceRows.map((r) => r.key));
+  if (late()) return skip('over its time budget');
   const docDate = new Map([...docs].map(([k, v]) => [k, v.date]));
   const titleOf = new Map([...docs].map(([k, v]) => [k, v.title]));
   // the source that reports on the claim's own date: the first dated on or after it, else the first titled
@@ -860,7 +906,7 @@ export async function computeClaimSet(
     const byUnit = new Map<string, number>();
     for (const c of readings.values()) byUnit.set(unitOf(c), (byUnit.get(unitOf(c)) ?? 0) + 1);
     const unitsRanked = [...byUnit].sort((a, b) => b[1] - a[1]);
-    if (unitsRanked.length > 1 && unitsRanked[0][1] === unitsRanked[1][1]) return null;
+    if (unitsRanked.length > 1 && unitsRanked[0][1] === unitsRanked[1][1]) return skip('two units equally common');
     const theUnit = unitsRanked[0]?.[0];
     for (const [k, c] of readings) if (unitOf(c) !== theUnit) { left.units.set(c.unit ?? '(none)', (left.units.get(c.unit ?? '(none)') ?? 0) + 1); readings.delete(k); }
     // one granularity for a figure over many readings: the commonest known one; a tie, or a sum over periods not all known, names none
@@ -868,8 +914,8 @@ export async function computeClaimSet(
       const byGran = new Map<string, number>();
       for (const c of readings.values()) { const g = periods.get(c.id)?.gran ?? 'unknown'; byGran.set(g, (byGran.get(g) ?? 0) + 1); }
       const known = [...byGran].filter(([g]) => g !== 'unknown').sort((a, b) => b[1] - a[1]);
-      if (known.length > 1 && known[0][1] === known[1][1]) return null;
-      if (read.op === 'sum' && (byGran.has('unknown') || known.length !== 1)) return null;
+      if (known.length > 1 && known[0][1] === known[1][1]) return skip('two period lengths equally common');
+      if (read.op === 'sum' && (byGran.has('unknown') || known.length !== 1)) return skip('a sum over periods not all of one length');
       const theGran = known[0]?.[0];
       if (theGran) for (const [k, c] of readings) if (periods.get(c.id)?.gran !== theGran) { left.grans.set(periods.get(c.id)?.gran ?? 'unknown', (left.grans.get(periods.get(c.id)?.gran ?? 'unknown') ?? 0) + 1); readings.delete(k); }
     }
@@ -881,13 +927,13 @@ export async function computeClaimSet(
       left.grans.size ? `${[...left.grans.values()].reduce((a, b) => a + b, 0)} of another period length (${[...left.grans.keys()].join(', ')})` : '',
       left.noNumber ? `${left.noNumber} of the attribute with no numeric value recorded` : '',
     ].filter(Boolean);
-    if (readings.size === 0) return null;
+    if (readings.size === 0) return skip('no reading');
     let list = [...readings.values()].sort((a, b) => byDate(dateOf(a), dateOf(b)) || a.id.localeCompare(b.id));
     if (read.op === 'value') {
       // the value then: the latest stated on or before the date, a correction over what it corrects
       const dated = list.filter((c) => dateOf(c));
       const latest = dated[dated.length - 1];
-      if (!latest) return null;
+      if (!latest) return skip('no dated reading');
       const sameDay = dated.filter((c) => dateOf(c) === dateOf(latest));
       const pick = sameDay.find((c) => c.correction) ?? sameDay.find((c) => !c.superseded_by) ?? latest;
       const r = toRow(pick);
@@ -905,7 +951,7 @@ export async function computeClaimSet(
           const v = c.value_num!;
           return cmp === '<' ? v < value : cmp === '<=' ? v <= value : cmp === '>' ? v > value : v >= value;
         });
-        if (list.length === 0) return null;
+        if (list.length === 0) return skip('no reading past the threshold');
       }
       items = list.length;
       let groups = new Map<string, Cand[]>();
@@ -942,9 +988,18 @@ export async function computeClaimSet(
     }
   } else {
     // items: the entities the claims are about, or the ones of the kind the question asks for
-    const people = read.asks === 'person'
-      ? await store.query<{ id: string; name: string }>(`SELECT id, name FROM entities WHERE type = 'person' AND tx_to IS NULL AND canonical_id IS NULL AND length(name) >= 2`)
+    // the people a claim may name: those its own passage mentions, not every person of the knowledge base
+    const chunkIds = [...new Set(matched.map((c) => c.chunk_id).filter((x): x is string => Boolean(x)))];
+    const people = read.asks === 'person' && chunkIds.length
+      ? await store.query<{ id: string; name: string }>(
+        `SELECT DISTINCT COALESCE(sv.id, e.id) AS id, COALESCE(sv.name, e.name) AS name
+         FROM entity_mentions m JOIN entities e ON e.id = m.entity_id LEFT JOIN entities sv ON sv.id = e.canonical_id
+         WHERE m.chunk_id = ANY($1::text[]) AND e.type = 'person' AND length(e.name) >= 2
+         LIMIT ${PEOPLE_CAP}`,
+        [chunkIds],
+      )
       : [];
+    if (late()) return skip('over its time budget');
     // the scope's own organisations are where the items are, never items
     const itemsOf = (c: Cand): { key: string; name: string; id: string }[] => {
       const subjectFits = !members.has(c.subject_id) && (!read.asks || c.subject_type === read.asks);
@@ -1008,7 +1063,7 @@ export async function computeClaimSet(
     const unfactual = list.filter((it) => !it.claims.some(isFact));
     list = list.filter((it) => it.claims.some(isFact));
     // nothing found is not a computed zero: the question is answered as if no set were asked for
-    if (list.length === 0) return null;
+    if (list.length === 0) return skip('no item');
     list.sort((a, b) => byDate(dateOf(a.claims[0]), dateOf(b.claims[0])) || a.key.localeCompare(b.key));
     items = list.length;
     const relatedCount = list.some((it) => it.about.size > 0) && (read.atLeast !== undefined || read.asks === 'person' || read.asks === 'organization');
@@ -1038,7 +1093,7 @@ export async function computeClaimSet(
       for (const c of pick) rows.push(toRow(c));
     }
   }
-  if (rows.length === 0 && !lines.length) return null;
+  if (rows.length === 0 && !lines.length) return skip('nothing computed');
   return {
     op: read.op, question: read, scope: scopeText,
     matchedBy: [...[...matchedAttrs].map((a) => `attribute:${a}`), ...terms.map((t) => `term:${t}`), ...(namedValue ? [`value:${namedValue}`] : [])],
