@@ -1762,12 +1762,13 @@ export async function searchExplained(
   query: string,
   opts: SearchOptions = {},
 ): Promise<ExplainedSearch> {
-  const k = opts.k ?? 8;
+  // a number of results: anything else (a `k=abc` of a query string is NaN, and was sent as `LIMIT NaN`) is the default
+  const k = typeof opts.k === 'number' && Number.isFinite(opts.k) && opts.k >= 1 ? Math.floor(opts.k) : 8;
   const mode = opts.mode ?? 'hybrid';
   if (mode === 'sag') {
     const { sagSearch } = await import('./sag.js');
     // the walk's own direct route is not reranked: its final order is, below
-    const walked = await sagSearch(store, embedder, query, { ...opts, rerank: undefined, current: false });
+    const walked = await sagSearch(store, embedder, query, { ...opts, k, rerank: undefined, current: false });
     const channels: ExplainedSearch['channels'] = {};
     // a walk's results say which of them are pages (the direct route's hits and the expansion's rows both do)
     const results = await finish(store, query, walked, k, opts, channels, new Set(walked.filter((r) => r.generated).map((r) => r.chunkId)));

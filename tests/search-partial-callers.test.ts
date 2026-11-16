@@ -146,3 +146,27 @@ describe('a search whose vector channel came back short', () => {
     }
   });
 });
+
+describe('GET /api/search with a k that is not a number of results', () => {
+  it('answers with the eight it answers with when none is given, not with a statement the server refuses', async () => {
+    const count = async (k: string) => {
+      const res = await app.request(`/api/search?q=${encodeURIComponent('ledger entry')}&mode=keyword&k=${k}`, { headers });
+      expect(res.status, `k=${k}`).toBe(200);
+      return (await res.json() as unknown[]).length;
+    };
+    // `k=abc` became NaN, and `LIMIT NaN`
+    expect(await count('abc')).toBe(8);
+    expect(await count('')).toBe(8);
+    expect(await count('0')).toBe(8);
+    expect(await count('-3')).toBe(8);
+    expect(await count('3')).toBe(3);
+    expect(await count('3.7')).toBe(3);
+  });
+
+  it('holds for any caller of search()', async () => {
+    for (const k of [Number.NaN, 0, -1, Number.POSITIVE_INFINITY]) {
+      expect(await search(ctx.store, ctx.embedder, 'ledger entry', { k, mode: 'keyword', track: false }), String(k)).toHaveLength(8);
+    }
+    expect(await search(ctx.store, ctx.embedder, 'ledger entry', { k: 2.9, mode: 'keyword', track: false })).toHaveLength(2);
+  });
+});
