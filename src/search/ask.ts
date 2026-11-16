@@ -8,7 +8,9 @@ import { EXCERPT_CHARS, excerptsForQuestion, isListQuestion } from './excerpts.j
 import { factsForQuestion, namedEntities, namedSurface, QuestionFact } from './facts.js';
 import { search, SearchMode } from './search.js';
 import { EnumeratedClaim, Enumeration, enumerateClaims, typesInQuestion } from './enumerate.js';
-import { QuestionKind, QuestionRoute, questionRange, routeQuestion } from './route.js';
+import { ComputedSet, computeClaimSet } from './claimset.js';
+import { secondRound } from './second.js';
+import { isChainQuestion, QuestionKind, QuestionRoute, questionRange, routeQuestion } from './route.js';
 import { stepsAsFacts, walkRelations } from './walk.js';
 
 /** Characters of a retrieved passage the answering model is shown. */
@@ -23,6 +25,8 @@ export interface AskResult {
   facts: ClaimItem[];
   /** How the question was routed and what each route did (docs/design/30). */
   route: AskRoute;
+  /** The set, count or value computed from the claims for this question, when it asks for one (docs/design/34 §1). */
+  computed?: ComputedSet;
 }
 
 export interface AskRoute {
@@ -34,6 +38,10 @@ export interface AskRoute {
   enumerated?: { matched: number; listed: number; documents: number; capped: boolean; types: string[]; entities: number };
   /** For multi-hop: the relations walked and the entities reached. */
   walked?: { hops: number; relations: number; reached: number; bridges: number };
+  /** For a question asking for a set, a count or a value as of a date: what the claims gave (docs/design/34 §1). */
+  computed?: { op: string; scope: string; matched: number; items: number; rows: number; ms: number };
+  /** When the first round was thin: what the second found, and why it ran (docs/design/34 §2). */
+  second?: { chunks: number; facts: number; from: string[]; uncoveredNamed: string[]; missingTerms: string[]; statements: number; ms: number };
 }
 
 const ASK_SYSTEM = `You answer questions from a personal knowledge base. You are given retrieved context chunks, each tagged [n] — one marked "excerpt" holds only the lines of its document that name what the question asks about — and optionally a "Known facts" list: claims extracted from the whole knowledge base, each tagged [n] too, with its date and the document it comes from. The facts reach documents the chunks do not; a question that asks for every case, a list or a history is answered from both.
@@ -48,6 +56,23 @@ Rules:
 /** The rule an enumerated answer adds: the facts are the whole match, and the counts are over it. */
 const ENUMERATED_RULE = `
 - Known facts marked "enumerated" are every claim the knowledge base holds about what the question names (in the period it names): answer a list with every relevant item, merging the same item stated by several sources; count distinct items or events, not lines; the "Counts" section is computed over all matching claims, including any not listed. A fact marked "replaced later" was true until a newer fact replaced it: use it for history, not as the current state.`;
+
+/** The rule a computed set adds: its counts and values were computed in code over every matching claim. */
+const COMPUTED_RULE = `
+- The "Computed from the claims" section was computed in code over every claim of the scope it names that matched the question (each row is listed among the known facts marked "set"): take its counts, groups, extremes, averages and values as the answer's figures, and say which items it lists; a row it lists from a source you were not shown in full is still evidence. If its scope or its match is not what the question asks, say so and answer from the rest.`;
+
+/** The computed set as the prompt shows it: what was matched, where, and the lines of the answer. */
+function renderComputed(c: ComputedSet): string {
+  return `\n\n# Computed from the claims\nScope: ${c.scope}. Matched by ${c.matchedBy.join(', ') || 'nothing'}: ${c.matched} claims${c.capped ? ' (the scope was larger than read)' : ''}.\n${c.lines.join('\n')}`;
+}
+
+/** The rows of a computed set as known facts, each with every source. */
+function computedFacts(c: ComputedSet): PromptFact[] {
+  return c.rows.map((r) => ({
+    id: r.id, subject: r.subject, object: r.object, type: 'set', statement: r.statement, status: 'fact', kind: 'fact',
+    startDate: null, endDate: null, eventDate: null, date: r.date, path: r.sources[0] ?? null, sources: r.sources, superseded: r.superseded, chunkId: null,
+  }));
+}
 
 /** `[fact]` / `[suspected]` for a fact; a view, forecast or rumour is tagged by its kind, with the status when hedged. */
 export function claimTag(c: { status: string; kind?: string | null }): string {
@@ -66,7 +91,7 @@ function renderFacts(facts: PromptFact[], firstRef: number, heading = 'Known fac
     const period = f.startDate || f.endDate ? ` (${f.startDate ?? '?'} ~ ${f.endDate ?? ''})` : '';
     const when = f.eventDate ? ` (${f.eventDate})` : f.date && !period ? ` (${f.date})` : period;
     const more = f.sources && f.sources.length > 1 ? ` (+${f.sources.length - 1} more source${f.sources.length > 2 ? 's' : ''})` : '';
-    return `[${firstRef + i}] [${claimTag(f)}${f.superseded ? '; replaced later' : ''}] ${f.statement}${when}${f.path ? ` — ${f.path}${more}` : ''}`;
+    return `[${firstRef + i}] [${claimTag(f)}${f.type === 'set' ? '; set' : ''}${f.superseded ? '; replaced later' : ''}] ${f.statement}${when}${f.path ? ` — ${f.path}${more}` : ''}`;
   });
   return `\n\n# ${heading}\n${lines.join('\n')}`;
 }
@@ -133,6 +158,8 @@ export async function ask(
     route?: QuestionKind | 'auto';
     /** false: its searches record no hits (an evaluation answering against the index as built, docs/design/31 D3). */
     track?: boolean;
+    /** false: no second retrieval round however thin the first (docs/design/34 §2). */
+    second?: boolean;
   } = {},
 ): Promise<AskResult> {
   const router = { ...defaultAskRouterConfig(), ...config.retrieval.router };
@@ -149,7 +176,12 @@ export async function ask(
   const routed: QuestionRoute = opts.route && opts.route !== 'auto'
     ? { kind: opts.route, range: questionRange(question), by: 'caller' }
     : await routeQuestion(question, { classifier: router.classifier, llm });
-  const env: RouteEnv = { store, config, embedder, llm, question, opts, queryVector, router, routed };
+  // a set, a count or a value as of a date is computed from the claims, whichever route answers the rest
+  const named = await namedEntities(store, question);
+  const computed = routed.kind === 'list' || routed.kind === 'aggregate' || routed.kind === 'lookup'
+    ? await computeClaimSet(store, question, routed, named).catch(() => null)
+    : null;
+  const env: RouteEnv = { store, config, embedder, llm, question, opts, queryVector, router, routed, named, computed };
 
   if (routed.kind === 'list' || routed.kind === 'aggregate' || routed.kind === 'timeline') {
     const enumerated = await enumeratedAnswer(env);
@@ -166,10 +198,14 @@ interface RouteEnv {
   embedder: EmbeddingProvider;
   llm: LlmClient;
   question: string;
-  opts: { k?: number; mode?: SearchMode; facts?: number; excerpts?: number; track?: boolean };
+  opts: { k?: number; mode?: SearchMode; facts?: number; excerpts?: number; track?: boolean; second?: boolean };
   queryVector: number[] | undefined;
   router: ReturnType<typeof defaultAskRouterConfig>;
   routed: QuestionRoute;
+  /** The entities the question names (`namedEntities`). */
+  named: string[];
+  /** The set the claims gave, when the question asks for one. */
+  computed: ComputedSet | null;
 }
 
 const routeOf = (r: QuestionRoute, extra: Partial<AskRoute> = {}): AskRoute => ({ kind: r.kind, by: r.by, range: r.range, ...extra });
@@ -182,7 +218,7 @@ async function lookupAnswer(env: RouteEnv): Promise<AskResult> {
   const [retrieved, graph, named] = await Promise.all([
     search(store, embedder, question, { k, mode, heat: config.heat, sag: config.retrieval.sag, rerank: config.retrieval.rerank, queryVector, track: opts.track }),
     graphSearch(store, question, { depth: 2, chunkLimit: 4, heat: config.heat, track: opts.track }),
-    namedEntities(store, question),
+    Promise.resolve(env.named),
   ]);
   const seen = new Set(retrieved.map((r) => r.chunkId));
   const found = [...retrieved, ...graph.chunks.filter((c) => !seen.has(c.chunkId))].slice(0, k + 4);
@@ -207,8 +243,7 @@ async function lookupAnswer(env: RouteEnv): Promise<AskResult> {
  * search and the excerpts. Null when nothing is enumerated.
  */
 async function enumeratedAnswer(env: RouteEnv): Promise<AskResult | null> {
-  const { store, config, embedder, question, opts, queryVector, router, routed } = env;
-  const named = await namedEntities(store, question);
+  const { store, config, embedder, question, opts, queryVector, router, routed, named } = env;
   const types = await typesInQuestion(store, question);
   if (named.length === 0 && types.length === 0) return null;
   const timeline = routed.kind === 'timeline';
@@ -277,9 +312,8 @@ async function enumeratedAnswer(env: RouteEnv): Promise<AskResult | null> {
 
 /** Multi-hop: SAG search, and a bounded walk over the named entities' relations with the passages stating each hop. */
 async function multihopAnswer(env: RouteEnv): Promise<AskResult> {
-  const { store, config, embedder, question, opts, queryVector, router } = env;
+  const { store, config, embedder, question, opts, queryVector, router, named } = env;
   const k = opts.k ?? 8;
-  const named = await namedEntities(store, question);
   const [retrieved, walk] = await Promise.all([
     search(store, embedder, question, { k, mode: 'sag', heat: config.heat, sag: config.retrieval.sag, rerank: config.retrieval.rerank, queryVector, track: opts.track }),
     walkRelations(store, question, named, { maxHops: router.maxHops, queryVector, model: embedder.model }),
@@ -300,8 +334,32 @@ async function multihopAnswer(env: RouteEnv): Promise<AskResult> {
 }
 
 /** The one completion every route ends in, and its citations. */
-async function compose(env: RouteEnv, contexts: SearchResult[], facts: PromptFact[], extra: string, route: AskRoute, heading?: string): Promise<AskResult> {
-  const { llm, question } = env;
+async function compose(env: RouteEnv, firstContexts: SearchResult[], firstRanked: PromptFact[], counts: string, routedFirst: AskRoute, heading?: string): Promise<AskResult> {
+  const { llm, question, computed } = env;
+  // a thin first round gets one more, from what it found; a computed set or a timeline is complete already
+  let contexts = firstContexts;
+  let ranked = firstRanked;
+  let routed = routedFirst;
+  if (!computed && routedFirst.kind !== 'timeline' && env.opts.second !== false) {
+    const more = await secondRound(env.store, question, {
+      named: env.named, contexts, facts: ranked, chain: routedFirst.kind === 'multihop' || isChainQuestion(question),
+      queryVector: env.queryVector, model: env.embedder.model,
+    }).catch(() => null);
+    if (more) {
+      contexts = [...contexts, ...more.chunks];
+      ranked = [...ranked, ...more.facts];
+      routed = { ...routed, second: { chunks: more.chunks.length, facts: more.facts.length, ...more.reason, statements: more.statements, ms: more.ms } };
+    }
+  }
+  // the computed set's rows lead the facts; what else was ranked follows, without repeating them
+  const setRows = computed ? computedFacts(computed) : [];
+  const inSet = new Set(setRows.map((f) => f.id));
+  const facts = [...setRows, ...ranked.filter((f) => !inSet.has(f.id))];
+  const extra = `${counts}${computed ? renderComputed(computed) : ''}`;
+  const route: AskRoute = computed
+    ? { ...routed, computed: { op: computed.op, scope: computed.scope, matched: computed.matched, items: computed.items, rows: setRows.length, ms: computed.ms } }
+    : routed;
+  const system = `${ASK_SYSTEM}${route.enumerated ? ENUMERATED_RULE : ''}${computed ? COMPUTED_RULE : ''}`;
   // what a reference number stands for: the chunks first, then the facts
   const refs = [
     ...contexts.map((c) => ({ path: c.path, chunkId: c.chunkId })),
@@ -316,6 +374,7 @@ async function compose(env: RouteEnv, contexts: SearchResult[], facts: PromptFac
       contexts,
       facts,
       route,
+      ...(computed ? { computed } : {}),
     };
   }
 
@@ -323,9 +382,9 @@ async function compose(env: RouteEnv, contexts: SearchResult[], facts: PromptFac
     .map((c, i) => `[${i + 1}] (${c.path}${c.excerpt ? ', excerpt' : ''})\n${c.content.slice(0, ASK_CONTEXT_CHARS)}`)
     .join('\n\n');
   const raw = await llm.complete([
-    { role: 'system', content: route.enumerated ? `${ASK_SYSTEM}${ENUMERATED_RULE}` : ASK_SYSTEM },
+    { role: 'system', content: system },
     { role: 'user', content: `# Context\n${contextBlock}${renderFacts(facts, contexts.length + 1, heading)}${extra}\n\n# Question\n${question}` },
-  ], { maxTokens: route.enumerated ? 3000 : 1500 });
+  ], { maxTokens: route.enumerated || computed ? 3000 : 1500 });
 
   let answer = raw.trim();
   let gaps: string[] = [];
@@ -352,5 +411,6 @@ async function compose(env: RouteEnv, contexts: SearchResult[], facts: PromptFac
     contexts,
     facts,
     route,
+    ...(computed ? { computed } : {}),
   };
 }
