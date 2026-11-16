@@ -84,7 +84,11 @@ const READ_PER_ENTITY = 150;
 /** Relations of one entity ordered at most: more, and the walk makes no pick and says the set was too large. */
 const ORDER_MAX = 2000;
 
-/** The live relations of the given entities, the heaviest `$2` of each, with their ends, their source and its path. */
+/**
+ * The live relations of the given entities: the heaviest `$2` of each, and of each the `$2` whose descriptions
+ * hold the most of the question's terms (`$3`, as LIKE patterns; the heaviest among equals), so an entity with more
+ * heavy relations than are read cannot hide the light one the question asks about. With their ends, their source and its path.
+ */
 const RELATIONS_OF = `SELECT f.id AS near_id, r.id, r.source_id, r.target_id, se.name AS source, te.name AS target, se.type AS source_type, te.type AS target_type,
          r.type, r.description, r.weight, r.valid_from, r.valid_to, r.document_id, r.chunk_id,
          COALESCE((SELECT d.path FROM documents d WHERE d.id = r.document_id),
@@ -92,10 +96,19 @@ const RELATIONS_OF = `SELECT f.id AS near_id, r.id, r.source_id, r.target_id, se
                    WHERE ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL ORDER BY ev.tx_from, s.key LIMIT 1)) AS path
   FROM unnest($1::text[]) AS f(id)
   CROSS JOIN LATERAL (
-    SELECT * FROM relations r WHERE (r.source_id = f.id OR r.target_id = f.id) AND r.tx_to IS NULL AND r.type <> 'co_occurs'
-    ORDER BY r.weight DESC, r.id LIMIT $2) r
+    (SELECT * FROM relations r WHERE (r.source_id = f.id OR r.target_id = f.id) AND r.tx_to IS NULL AND r.type <> 'co_occurs'
+     ORDER BY r.weight DESC, r.id LIMIT $2)
+    UNION
+    (SELECT r.* FROM relations r
+       CROSS JOIN LATERAL (SELECT count(*) AS held FROM unnest($3::text[]) p WHERE lower(r.description) LIKE p) h
+     WHERE (r.source_id = f.id OR r.target_id = f.id) AND r.tx_to IS NULL AND r.type <> 'co_occurs' AND h.held > 0
+     ORDER BY h.held DESC, r.weight DESC, r.id LIMIT $2)) r
   JOIN entities se ON se.id = r.source_id JOIN entities te ON te.id = r.target_id
   ORDER BY r.id, f.id`;
+
+/** The question's terms as LIKE patterns for `RELATIONS_OF` (spellings of two characters or more). */
+const likePatterns = (terms: WalkTerm[]) => [...new Set(terms.map((t) => t.text).filter((t) => t.length >= 2))].map((t) => `%${t.replace(/[\\%_]/g, (c) => `\\${c}`)}%`);
+
 /** Question terms scored at most: a chain question is long, and its last clause names the last hop. */
 const WALK_TERMS_MAX = 64;
 /** Neighbours read per entity when finding what a named entity anchors (two relations out). */
@@ -232,17 +245,30 @@ interface Candidate {
 
 /** How strongly the meaning signal prefers a far end, per standard deviation above its siblings' mean. */
 const MEANING_WEIGHT = 1;
+/**
+ * The most the meaning signal adds: two points, under what a term held by few of a hop's relations weighs (a rare
+ * term weighs up to ~5), however many siblings the meaning is measured against; uncapped, the nearest of 150 gained
+ * about 12.
+ */
+const MEANING_CAP = 2;
+/** The cosine to the question below which a far end is not what the question describes, however its siblings fare. */
+const MEANING_FLOOR = 0.3;
 
-/** A bonus per standard deviation above the group's mean, for each member with a value. */
-function zBonus(group: Candidate[], value: (c: Candidate) => number | undefined, weight: number): void {
+/**
+ * A bonus of one point per standard deviation above the group's mean, at most `cap`, for each member with a value at
+ * least `floor`. Of two siblings both far from the question neither gains, and among 150 the nearest gains no more
+ * than `cap`.
+ */
+function zBonus(group: Candidate[], value: (c: Candidate) => number | undefined, weight: number, cap: number, floor: number): void {
   const withValue = group.filter((c) => value(c) !== undefined);
-  if (withValue.length < 2 || weight === 0) return;
+  if (withValue.length < 2 || weight === 0 || cap <= 0) return;
   const v = withValue.map((c) => value(c)!);
   const mean = v.reduce((a, b) => a + b, 0) / v.length;
   const sd = Math.sqrt(v.reduce((a, b) => a + (b - mean) ** 2, 0) / v.length);
   if (sd < 1e-6) return;
   for (const c of withValue) {
-    const bonus = weight * Math.max(0, (value(c)! - mean) / sd);
+    if (value(c)! < floor) continue;
+    const bonus = Math.min(cap, weight * Math.max(0, (value(c)! - mean) / sd));
     if (bonus > 0) {
       c.score += bonus;
       c.meant = true;
@@ -313,6 +339,7 @@ export async function walkRelations(
   const names = await store.query<{ name: string; aliases: unknown }>(`SELECT name, aliases FROM entities WHERE id = ANY($1::text[])`, [named]);
   const { terms, budget } = walkTerms(question, names.flatMap((e) => [e.name, ...(Array.isArray(e.aliases) ? e.aliases.filter((a): a is string => typeof a === 'string') : [])]));
   const anchors = await anchorSets(store, named);
+  const patterns = likePatterns(terms);
   const ordinal = ordinalInQuestion(question);
   // the noun the ordering is about: the first predicate family the question uses after the ordinal ("第二起…故障" → 事故)
   const orderKey = ordinal ? orderedNoun(question, ordinal, terms) : null;
@@ -330,7 +357,7 @@ export async function walkRelations(
   let frontier = [...named];
 
   for (let hop = 1; hop <= maxHops && frontier.length > 0; hop++) {
-    const rows = await store.query<RelRow & { near_id: string }>(RELATIONS_OF, [frontier, READ_PER_ENTITY]);
+    const rows = await store.query<RelRow & { near_id: string }>(RELATIONS_OF, [frontier, READ_PER_ENTITY, patterns]);
     const toCandidate = (r: RelRow & { near_id: string }): Candidate => {
       const nearId = r.near_id;
       const forward = r.source_id === nearId;
@@ -370,7 +397,7 @@ export async function walkRelations(
       const k = `${c.nearId}|${c.r.type}`;
       siblings.set(k, [...(siblings.get(k) ?? []), c]);
     }
-    for (const group of siblings.values()) zBonus(group, (c) => meaning.get(c.farId), MEANING_WEIGHT);
+    for (const group of siblings.values()) zBonus(group, (c) => meaning.get(c.farId), MEANING_WEIGHT, MEANING_CAP, MEANING_FLOOR);
     // a named entity's few siblings one of which the question describes ("第一事业部管基础设施的那个组" of a division's
     // three groups) are all walked, the described one first: the description picks among them by meaning, and the
     // later hops (an ordering, a fix) may yet tell them apart
@@ -387,7 +414,7 @@ export async function walkRelations(
       const ofKind = (c: Candidate) => spellings.some((w) => termCount(c.text, w) > 0);
       const nears = [...new Set(candidates.filter(ofKind).map((c) => c.nearId))];
       // every relation of those entities, not the heaviest READ_PER_ENTITY: the year's first incident may be a light one
-      const full = nears.length === 0 ? [] : await store.query<RelRow & { near_id: string }>(RELATIONS_OF, [nears, ORDER_MAX + 1]);
+      const full = nears.length === 0 ? [] : await store.query<RelRow & { near_id: string }>(RELATIONS_OF, [nears, ORDER_MAX + 1, patterns]);
       const pools = new Map<string, Candidate[]>();
       const byId = new Map(candidates.map((c) => [c.r.id, c]));
       for (const r of full) {

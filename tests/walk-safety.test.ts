@@ -128,6 +128,21 @@ beforeAll(async () => {
   await store.query(`INSERT INTO chunks (id, document_id, seq, content, token_count) SELECT 'ch' || i, 'dh' || i, 0, '中枢平台调用辐条服务', 3 FROM generate_series(0, 599) i`);
   await store.query(`INSERT INTO entity_mentions (entity_id, chunk_id, document_id) SELECT e, 'ch' || i, 'dh' || i FROM generate_series(0, 599) i, unnest(ARRAY['hub', 'spoke']) e`);
   await relate('hub', 'spoke', '中枢平台依赖辐条服务。', { doc: 'dh599', chunk: 'ch599' });
+  // a holding with 150 product relations, one of whose products lies near the question's vector, and one relation
+  // whose description holds a term of the question; and a pair of teams neither near the question
+  await entity('hold', '星河控股');
+  for (let i = 0; i < 150; i++) {
+    const v = i === 0 ? [0.99, 0.14, 0, 0] : [0.2 + (i % 7) * 0.02, 0.98, 0, 0];
+    await entity(`prod${i}`, `星河产品${i}号`, 'product', v);
+    await relate('hold', `prod${i}`, `星河控股旗下产品${i}号。`, await doc(`星河产品${i}号`, ['hold', `prod${i}`]), 5, 'produces');
+  }
+  await entity('auditor', '审计署', 'organization');
+  await relate('hold', 'auditor', '审计署对星河控股开展了专项审计。', await doc('专项审计', ['hold', 'auditor']), 1);
+  await entity('duo', '双子事业部');
+  for (const [id, v] of [['tw1', [0, 0, 1, 0]], ['tw2', [0, 0, 0.995, 0.1]]] as const) {
+    await entity(id, `双子${id}组`, 'organization', [...v]);
+    await relate(id, 'duo', '该组隶属于双子事业部。', await doc('组织架构', [id, 'duo']), 10, 'part_of');
+  }
 });
 
 afterAll(async () => {
@@ -223,5 +238,33 @@ describe('the passage that states a hop', () => {
     expect(walk.steps.map((s) => s.target)).toEqual(['辐条服务']);
     expect(walk.bridges[0].chunkId).toBe('ch599');
     expect(Math.max(...rows)).toBeLessThanOrEqual(250);
+  });
+});
+
+describe('the meaning signal', () => {
+  const vector = { queryVector: [1, 0, 0, 0], model: MODEL };
+
+  it('cannot outweigh a term match, however many siblings it is measured against', async () => {
+    // every product relation holds 旗下 and 产品; the audit holds the rarer 专项 and 审计; product 0 is nearest in meaning
+    const walk = await walkRelations(store, '星河控股旗下哪个产品接受过专项审计？', ['hold'], { maxHops: 1, ...vector });
+    expect(walk.steps[0].target).toBe('审计署');
+    const near = walk.steps.find((s) => s.target === '星河产品0号')!;
+    const other = walk.steps.find((s) => s.target !== '星河产品0号' && s.target !== '审计署')!;
+    // what meaning adds over a sibling that holds the same terms: at most two points, below the audit's rare terms
+    expect(near.score - other.score).toBeGreaterThan(0);
+    expect(near.score - other.score).toBeLessThanOrEqual(2);
+    expect(near.score).toBeLessThan(walk.steps[0].score);
+  });
+
+  it('gives nothing to siblings none of which is near the question', async () => {
+    const walk = await walkRelations(store, '双子事业部里管基础设施的那支队伍，今年第一起事故是谁处理好的？', ['duo'], { maxHops: 1, ...vector });
+    expect(walk.steps).toEqual([]);
+  });
+
+  it('is not read from another model\'s vectors', async () => {
+    const walk = await walkRelations(store, '星河控股旗下哪个产品接受过专项审计？', ['hold'], { maxHops: 1, queryVector: [1, 0, 0, 0], model: 'another-model' });
+    const near = walk.steps.find((s) => s.target === '星河产品0号');
+    const other = walk.steps.find((s) => s.target !== '星河产品0号' && s.target !== '审计署');
+    expect(near === undefined || near.score === other?.score).toBe(true);
   });
 });
