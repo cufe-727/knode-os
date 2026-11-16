@@ -7,6 +7,8 @@ import { entityKeyKinds } from '../src/graph/normalize.js';
 import type { EmbeddingProvider } from '../src/ingest/embeddings.js';
 import type { LlmClient } from '../src/llm/client.js';
 import { ask } from '../src/search/ask.js';
+import { stepsAsFacts, walkRelations } from '../src/search/walk.js';
+import { ordinalInQuestion } from '../src/search/walk-order.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
 
 /**
@@ -84,6 +86,35 @@ beforeAll(async () => {
   for (let y = 2021; y <= 2025; y++) {
     await doc(`宁德时代${y}年人均产值为${300 + y - 2021}万元。`, ['catl'], `${y + 1}-03-01`, [['catl', `宁德时代${y}年人均产值为${300 + y - 2021}万元`, `${y}-12-31`, 'metric']]);
   }
+  // a group with 200 incidents: the 150 heaviest relations are of March, the year's first incidents (light) of January
+  await entity('risk', '风控平台组');
+  await store.query(`INSERT INTO entities (id, name, type, mention_count, aliases, description)
+    SELECT 'ev' || i, 'EVT-' || lpad(i::text, 3, '0'), 'event', 1, '[]'::jsonb, '' FROM generate_series(0, 199) i`);
+  await store.query(`INSERT INTO documents (id, path, root, title, sha256, bytes, status, doc_date)
+    SELECT 'dev' || i, 'raw/docs/ev' || i || '.md', 'docs', 'ev' || i, 'shaev' || i, 10, 'indexed',
+      CASE WHEN i >= 150 THEN timestamptz '2026-01-01T00:00:00Z' + (i - 150) * interval '1 day' ELSE timestamptz '2026-03-01T00:00:00Z' + i * interval '1 hour' END
+    FROM generate_series(0, 199) i`);
+  await store.query(`INSERT INTO chunks (id, document_id, seq, content, token_count) SELECT 'cev' || i, 'dev' || i, 0, 'EVT-' || i || ' 事故', 3 FROM generate_series(0, 199) i`);
+  await store.query(`INSERT INTO claims (id, subject_id, type, statement, status, kind, event_at, chunk_id, evidence_count, tx_from)
+    SELECT 'clev' || i, 'ev' || i, 'event', 'EVT-' || lpad(i::text, 3, '0') || '事故发生', 'fact', 'fact', d.doc_date, 'cev' || i, 1, now()
+    FROM generate_series(0, 199) i JOIN documents d ON d.id = 'dev' || i`);
+  await store.query(`INSERT INTO relations (id, source_id, target_id, type, description, weight, document_id, chunk_id)
+    SELECT 'rev' || i, 'ev' || i, 'risk', 'related_to', 'EVT-' || lpad(i::text, 3, '0') || '是风控平台组报告的事故。', CASE WHEN i >= 150 THEN 1 ELSE 5 END, 'dev' || i, 'cev' || i
+    FROM generate_series(0, 199) i`);
+  // a group whose two incidents are of last year, in a knowledge base that states this year's dates
+  await entity('clear', '清算组');
+  for (const [id, date] of [['olda', '2025-02-03'], ['oldb', '2025-06-09']] as const) {
+    await entity(id, `INC-OLD-${id}`, 'event');
+    await relate(id, 'clear', `INC-OLD-${id}是清算组报告的事故。`, await doc(`INC-OLD-${id}事故`, [id, 'clear'], date, [[id, `INC-OLD-${id}事故发生`, date]]));
+  }
+  // a product first released in 2019 and released again in 2026, and one released once in 2024
+  await entity('sail', '远航科技');
+  await entity('pold', '旗舰一号', 'product');
+  await entity('pnew', '新品二号', 'product');
+  await relate('sail', 'pold', '远航科技发布旗舰一号。', await doc('远航科技发布旗舰一号', ['sail', 'pold'], '2019-05-01', [['pold', '旗舰一号发布', '2019-05-01']]), 3);
+  await doc('旗舰一号 2026 款发布', ['sail', 'pold'], '2026-09-01', [['pold', '旗舰一号2026款于9月发布', '2026-09-01']]);
+  await doc('旗舰一号参加展会', ['pold'], '2020-01-01', [['pold', '旗舰一号参加展会', '2020-01-01']]);
+  await relate('sail', 'pnew', '远航科技发布新品二号。', await doc('远航科技发布新品二号', ['sail', 'pnew'], '2024-03-01', [['pnew', '新品二号发布', '2024-03-01']]), 3);
 });
 
 afterAll(async () => {
@@ -117,3 +148,43 @@ describe('a question the walk cannot help', () => {
   });
 });
 
+
+describe('the ordering step', () => {
+  it('orders every candidate, not the heaviest 150 relations', async () => {
+    const walk = await walkRelations(store, '风控平台组今年第一起事故是谁修复的？', ['risk'], { maxHops: 1 });
+    const picked = walk.steps.find((s) => s.order);
+    expect(picked?.source).toBe('EVT-150');
+    expect(picked?.order).toMatch(/^the 1st of 200 dated in 2026 \(this year: the knowledge base's latest date, 2026-\d\d-\d\d\), by date \(2026-01-01\)/);
+  });
+
+  it('reads 今年 as the present year, not the latest year the candidates are dated in', async () => {
+    const walk = await walkRelations(store, '清算组今年第一起事故是谁修复的？', ['clear'], { maxHops: 1 });
+    expect(walk.steps.find((s) => s.order)).toBeUndefined();
+    expect(walk.ordering?.picks[0]).toMatch(/not ordered: .*0 .*dated in 2026/);
+    // a year the question names for the ordering is that year
+    const named = await walkRelations(store, '清算组2025年第一起事故是谁修复的？', ['clear'], { maxHops: 1 });
+    expect(named.steps.find((s) => s.order)?.source).toBe('INC-OLD-olda');
+  });
+
+  it('takes a year named elsewhere in the question as no period of the ordering', () => {
+    expect(ordinalInQuestion('周岚2024年加入清算组，清算组今年第一起事故是谁修复的？')).toMatchObject({ period: { unit: 'year', year: null } });
+    expect(ordinalInQuestion('周岚2024年加入清算组，清算组第一起事故是谁修复的？')).toMatchObject({ period: null });
+  });
+
+  it('dates a candidate by the event the question orders, not by when it was first seen', async () => {
+    const walk = await walkRelations(store, '远航科技最近一次发布的产品是谁负责的？', ['sail'], { maxHops: 1 });
+    expect(walk.steps.find((s) => s.order)?.target).toBe('旗舰一号');
+  });
+
+  it('tells the answer what it picked, from how many and by which date, or that it could not', async () => {
+    const embedder = { model: MODEL, dimensions: 4, embed: async (t: string[]) => t.map(() => [1, 0, 0, 0]) } as EmbeddingProvider;
+    const res = await ask(store, config, embedder, noLlm, '清算组第三起事故是谁修复的？此人负责哪个项目', { route: 'multihop' });
+    expect(res.route.walked?.ordering).toMatchObject({ asked: '第三起' });
+    expect(res.facts.some((f) => f.status === 'computed' && /not ordered: 第三起 asks for the 3rd/.test(f.statement))).toBe(true);
+    const picked = await ask(store, config, embedder, noLlm, '清算组2025年第二起事故是谁修复的？此人负责哪个项目', { route: 'multihop' });
+    const line = picked.facts.find((f) => f.status === 'computed');
+    expect(line?.statement).toMatch(/第二起 .*INC-OLD-oldb.*the 2nd of 2 dated in 2025, by date \(2025-06-09\)/);
+    // the relation stays a fact of the source; the pick is the walk's, said apart from it
+    expect(stepsAsFacts(await walkRelations(store, '清算组2025年第二起事故是谁修复的？', ['clear'], { maxHops: 1 }).then((w) => w.steps)).every((f) => !f.statement.includes('picked'))).toBe(true);
+  });
+});

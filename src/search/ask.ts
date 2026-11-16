@@ -37,7 +37,11 @@ export interface AskRoute {
   /** For list, aggregate and timeline: what the enumeration matched and listed. */
   enumerated?: { matched: number; listed: number; documents: number; capped: boolean; types: string[]; entities: number };
   /** For multi-hop: the relations walked and the entities reached. */
-  walked?: { hops: number; relations: number; reached: number; bridges: number };
+  walked?: {
+    hops: number; relations: number; reached: number; bridges: number;
+    /** What the question ordered ("第二起"), the hop it ordered, and each branch's pick or why there was none. */
+    ordering?: { asked: string; hop: number | null; picks: string[] };
+  };
   /** For a question asking for a set, a count or a value as of a date: what the claims gave (docs/design/34 §1). */
   computed?: { op: string; scope: string; matched: number; items: number; rows: number; ms: number };
   /** When the first round was thin: what the second found, and why it ran (docs/design/34 §2). */
@@ -348,9 +352,19 @@ async function multihopAnswer(env: RouteEnv): Promise<AskResult> {
   const contexts = [...found, ...excerpts];
   const steps = stepsAsFacts(walk.steps);
   const stepIds = new Set(steps.map((s) => s.id));
-  const facts: PromptFact[] = [...steps, ...ranked.filter((f) => !stepIds.has(f.id))];
+  // what the walk ordered is its own computation, said apart from the sources' facts: what it took, from how many,
+  // by which date, or why it took nothing
+  const ordering: PromptFact[] = (walk.ordering?.picks ?? []).map((pick, i) => ({
+    id: `ordering:${i}`, subject: '', object: null, type: 'ordering', status: 'computed', kind: 'fact',
+    statement: `Ordered by the walk from the dates the sources state (no source states this order): ${walk.ordering!.asked} — ${pick}`,
+    startDate: null, endDate: null, eventDate: null, path: null, chunkId: null,
+  }));
+  const facts: PromptFact[] = [...ordering, ...steps, ...ranked.filter((f) => !stepIds.has(f.id))];
   return compose({ ...env, computed }, contexts, [...facts, ...currentFacts(contexts, facts)], '', routeOf(env.routed, {
-    walked: { hops: walk.steps.reduce((n, s) => Math.max(n, s.hop), 0), relations: walk.steps.length, reached: walk.reached.length, bridges: walk.bridges.length },
+    walked: {
+      hops: walk.steps.reduce((n, s) => Math.max(n, s.hop), 0), relations: walk.steps.length, reached: walk.reached.length, bridges: walk.bridges.length,
+      ...(walk.ordering ? { ordering: walk.ordering } : {}),
+    },
   }));
 }
 

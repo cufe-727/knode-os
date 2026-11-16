@@ -3,7 +3,8 @@ import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { toDateString } from '../store/temporal.js';
 import { ClaimItem, SearchResult } from '../types.js';
 import { keywordTerms, termCount } from './search.js';
-import { documentDates, OrdinalAsk, ordinalInQuestion, pickByOrder, placeEntities } from './walk-order.js';
+import { asOfDate } from './claimset.js';
+import { documentDates, OrdinalAsk, ordinalInQuestion, pickByOrder, placeEntities, presentOf } from './walk-order.js';
 
 /**
  * The multi-hop route of `ask` (docs/design/30 §3): resolve → relations →
@@ -78,6 +79,21 @@ export interface Walk {
 const FRONTIER = 5;
 /** Relations read per frontier entity and hop before scoring. */
 const READ_PER_ENTITY = 150;
+/** Relations of one entity ordered at most: more, and the walk makes no pick and says the set was too large. */
+const ORDER_MAX = 2000;
+
+/** The live relations of the given entities, the heaviest `$2` of each, with their ends, their source and its path. */
+const RELATIONS_OF = `SELECT f.id AS near_id, r.id, r.source_id, r.target_id, se.name AS source, te.name AS target, se.type AS source_type, te.type AS target_type,
+         r.type, r.description, r.weight, r.valid_from, r.valid_to, r.document_id, r.chunk_id,
+         COALESCE((SELECT d.path FROM documents d WHERE d.id = r.document_id),
+                  (SELECT s.key FROM evidence ev JOIN scopes s ON s.id = ev.scope_id
+                   WHERE ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL ORDER BY ev.tx_from, s.key LIMIT 1)) AS path
+  FROM unnest($1::text[]) AS f(id)
+  CROSS JOIN LATERAL (
+    SELECT * FROM relations r WHERE (r.source_id = f.id OR r.target_id = f.id) AND r.tx_to IS NULL AND r.type <> 'co_occurs'
+    ORDER BY r.weight DESC, r.id LIMIT $2) r
+  JOIN entities se ON se.id = r.source_id JOIN entities te ON te.id = r.target_id
+  ORDER BY r.id, f.id`;
 /** Question terms scored at most: a chain question is long, and its last clause names the last hop. */
 const WALK_TERMS_MAX = 64;
 /** Neighbours read per entity when finding what a named entity anchors (two relations out). */
@@ -189,7 +205,7 @@ function typeCues(): Map<string, string[]> {
 
 interface RelRow {
   id: string; source_id: string; target_id: string; source: string; target: string; type: string; description: string;
-  source_type: string; target_type: string;
+  source_type: string; target_type: string; document_id: string | null; chunk_id: string | null;
   weight: number; path: string | null; valid_from: string | Date | null; valid_to: string | Date | null;
 }
 
@@ -300,6 +316,7 @@ export async function walkRelations(
   const orderKey = ordinal ? orderedNoun(question, ordinal, terms) : null;
   let orderedHop: number | null = null;
   const picks: string[] = [];
+  let present: Awaited<ReturnType<typeof presentOf>> | null = null;
   // per entity reached: the named entities its branch descends from (a branch is not anchored by its own start),
   // and the term keys the relations on its way have used
   const origins = new Map<string, Set<string>>(named.map((id) => [id, new Set([id])]));
@@ -311,27 +328,8 @@ export async function walkRelations(
   let frontier = [...named];
 
   for (let hop = 1; hop <= maxHops && frontier.length > 0; hop++) {
-    const rows = await store.query<RelRow & { near_id: string }>(
-      `SELECT f.id AS near_id, r.id, r.source_id, r.target_id, se.name AS source, te.name AS target, se.type AS source_type, te.type AS target_type,
-              r.type, r.description, r.weight,
-              r.valid_from, r.valid_to,
-              COALESCE((SELECT d.path FROM documents d WHERE d.id = r.document_id),
-                       (SELECT s.key FROM evidence ev JOIN scopes s ON s.id = ev.scope_id
-                        WHERE ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL ORDER BY ev.tx_from, s.key LIMIT 1)) AS path
-       FROM unnest($1::text[]) AS f(id)
-       CROSS JOIN LATERAL (
-         SELECT * FROM relations r WHERE (r.source_id = f.id OR r.target_id = f.id) AND r.tx_to IS NULL AND r.type <> 'co_occurs'
-         ORDER BY r.weight DESC, r.id LIMIT $2) r
-       JOIN entities se ON se.id = r.source_id JOIN entities te ON te.id = r.target_id
-       ORDER BY r.id, f.id`,
-      [frontier, READ_PER_ENTITY],
-    );
-    const candidates: Candidate[] = [];
-    const seen = new Set<string>();
-    for (const r of rows) {
-      // a relation between two frontier entities is read once, from the first
-      if (used.has(r.id) || seen.has(r.id)) continue;
-      seen.add(r.id);
+    const rows = await store.query<RelRow & { near_id: string }>(RELATIONS_OF, [frontier, READ_PER_ENTITY]);
+    const toCandidate = (r: RelRow & { near_id: string }): Candidate => {
       const nearId = r.near_id;
       const forward = r.source_id === nearId;
       const farId = forward ? r.target_id : r.source_id;
@@ -345,7 +343,15 @@ export async function walkRelations(
         .filter((k) => (spentHere?.get(k) ?? 0) < (budget.get(k) ?? 1));
       const from = origins.get(nearId) ?? new Set<string>();
       const anchoredBy = named.filter((n) => !from.has(n) && (n === farId || anchors.get(n)?.has(farId)));
-      candidates.push({ r, farId, nearId, held, anchors: anchoredBy, text, score: 0 });
+      return { r, farId, nearId, held, anchors: anchoredBy, text, score: 0 };
+    };
+    const candidates: Candidate[] = [];
+    const seen = new Set<string>();
+    for (const r of rows) {
+      // a relation between two frontier entities is read once, from the first
+      if (used.has(r.id) || seen.has(r.id)) continue;
+      seen.add(r.id);
+      candidates.push(toCandidate(r));
     }
     // a term or a named entity weighs by how few of this hop's candidates hold it
     const n = candidates.length;
@@ -371,27 +377,48 @@ export async function walkRelations(
         if (group.length <= FRONTIER && group.some((c) => c.meant)) for (const c of group) c.described = true;
       }
     }
-    // the ordering step, at the first hop where an entity leads to several of what the question orders:
-    // each such branch keeps the one the question names, by date, and drops the others it ordered
+    // the ordering step, at the first hop where an entity leads to several of what the question orders: each such
+    // branch keeps the one the question names, by date, and drops the others it ordered (the note lists them all)
     const dropped = new Set<Candidate>();
     if (ordinal && orderKey && orderedHop === null) {
       const spellings = terms.filter((t) => t.key === orderKey).map((t) => t.text);
+      const ofKind = (c: Candidate) => spellings.some((w) => termCount(c.text, w) > 0);
+      const nears = [...new Set(candidates.filter(ofKind).map((c) => c.nearId))];
+      // every relation of those entities, not the heaviest READ_PER_ENTITY: the year's first incident may be a light one
+      const full = nears.length === 0 ? [] : await store.query<RelRow & { near_id: string }>(RELATIONS_OF, [nears, ORDER_MAX + 1]);
       const pools = new Map<string, Candidate[]>();
-      for (const c of candidates) {
-        if (!spellings.some((w) => termCount(c.text, w) > 0)) continue;
-        pools.set(c.nearId, [...(pools.get(c.nearId) ?? []), c]);
+      const byId = new Map(candidates.map((c) => [c.r.id, c]));
+      for (const r of full) {
+        if (used.has(r.id)) continue;
+        let c = byId.get(r.id);
+        if (!c) {
+          c = toCandidate(r);
+          byId.set(r.id, c);
+          candidates.push(c);
+        }
+        if (c.nearId === r.near_id && ofKind(c)) pools.set(r.near_id, [...(pools.get(r.near_id) ?? []), c]);
       }
+      const counts = new Map<string, number>();
+      for (const r of full) counts.set(r.near_id, (counts.get(r.near_id) ?? 0) + 1);
       const ordered = [...pools.entries()].filter(([, pool]) => new Set(pool.map((c) => c.farId)).size >= 2);
       if (ordered.length > 0) {
         orderedHop = hop;
-        const placed = await placeEntities(store, [...new Set(ordered.flatMap(([, pool]) => pool.map((c) => c.farId)))]);
+        if (ordinal.period && ordinal.period.year === null && !present) present = await presentOf(store, asOfDate(question) ?? null);
+        const placed = await placeEntities(store, [...new Set(ordered.flatMap(([, pool]) => pool.map((c) => c.farId)))], { spellings, latest: ordinal.kind !== 'nth' });
         const top = Math.max(0, ...candidates.map((c) => c.score));
         for (const [nearId, pool] of ordered) {
-          const byFar = new Map(pool.map((c) => [c.farId, c]));
-          const pick = pickByOrder(ordinal, [...byFar.keys()].map((id) => placed.get(id)!));
           const nearName = pool[0].r.source_id === nearId ? pool[0].r.source : pool[0].r.target;
-          picks.push(`${nearName}: ${pick.note}`);
-          if (!pick.picked) continue;
+          if ((counts.get(nearId) ?? 0) > ORDER_MAX) {
+            picks.push(`${nearName}: not ordered: ${ordinal.text} would order more than ${ORDER_MAX} relations of ${nearName}`);
+            continue;
+          }
+          const byFar = new Map(pool.map((c) => [c.farId, c]));
+          const pick = pickByOrder(ordinal, [...byFar.keys()].map((id) => placed.get(id)!), present);
+          if (!pick.picked) {
+            picks.push(`${nearName}: ${pick.note}`);
+            continue;
+          }
+          picks.push(`${nearName}: ${placed.get(pick.picked)?.name ?? pick.picked} — ${pick.note}`);
           for (const c of pool) {
             if (c.farId === pick.picked) {
               c.score += top + 1;
@@ -560,7 +587,7 @@ export function stepsAsFacts(steps: WalkStep[]): (ClaimItem & { chunkId: string 
     subject: s.source,
     object: s.target,
     type: s.type,
-    statement: `${s.source} ${s.type.replace(/_/g, ' ')} ${s.target}${s.description ? `: ${s.description}` : ''}${s.order ? ` [picked as ${s.order}]` : ''}`,
+    statement: `${s.source} ${s.type.replace(/_/g, ' ')} ${s.target}${s.description ? `: ${s.description}` : ''}`,
     status: 'fact',
     kind: 'fact',
     startDate: s.validFrom,
