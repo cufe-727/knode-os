@@ -700,6 +700,14 @@ export interface SagSearchConfig {
   maxHops: number;
   /** Reserved share of final results for the direct retrieval route. */
   directRatio: number;
+  /**
+   * Terms of the seed passages searched for as bridges, beside the entities
+   * they mention (src/search/bridge.ts). Absent or 0: none, the walk crosses
+   * through extracted entities only.
+   */
+  bridgeTerms?: number;
+  /** Chunks the bridge terms put forward at most. Absent: 50. */
+  bridgePool?: number;
 }
 
 /**

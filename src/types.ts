@@ -133,7 +133,7 @@ export interface SearchResult {
   /** The source's reference date (date-only), when one was found. */
   docDate?: string | null;
   score: number;
-  signals: { vector?: number; keyword?: number; graph?: number; structural?: number; /** The cross-encoder's score, when a rerank stage ran (src/search/rerank.ts). */ rerank?: number };
+  signals: { vector?: number; keyword?: number; graph?: number; structural?: number; /** BM25 over the question's and the bridge terms, for a chunk a bridge term reached (search/bridge.ts). */ bridge?: number; /** The cross-encoder's score, when a rerank stage ran (src/search/rerank.ts). */ rerank?: number };
   /** Lines cut from the chunk because they hold what a list question names (search/excerpts.ts), not the whole chunk. */
   excerpt?: boolean;
   /** The chunk is of a generated page (an entity page, a timeline: search/search.ts `SideSql.generated`), not of a source. Absent on a source's chunk. */
@@ -155,6 +155,8 @@ export interface SearchResult {
     seedChunkId?: string;
     /** Entity bridge chain followed to reach this chunk. */
     bridgeEntities?: string[];
+    /** Terms of the seed passages this chunk was reached by (search/bridge.ts); absent when none was. */
+    bridgeTerms?: string[];
   };
 }
 

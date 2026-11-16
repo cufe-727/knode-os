@@ -72,7 +72,7 @@ export interface ExplainedSearch {
   channels: Partial<Record<SearchChannelName | 'rerank', SearchChannel>>;
 }
 
-interface RankedChunk {
+export interface RankedChunk {
   doc_date?: string | Date | null;
   chunk_id: string;
   document_id: string;
@@ -308,7 +308,7 @@ function mergeSides(sources: RankedChunk[], generated: RankedChunk[]): RankedChu
   return out;
 }
 
-const CJK_QUERY_STOP = new Set([
+export const CJK_QUERY_STOP = new Set([
   '什么', '哪些', '如何', '怎么', '怎样', '为何', '为什么', '多少', '是否', '哪个', '哪里',
   '分别', '相关', '关于', '对于', '通过', '以及', '或者', '还是', '及其', '其中', '此次',
   '进行', '具有', '可以', '需要', '影响', '情况', '问题', '内容', '方面', '包括', '主要',
@@ -320,7 +320,7 @@ const CJK_QUERY_STOP = new Set([
  * "on", "the") sit in nearly every chunk and many entity names. A token
  * written in capitals stays (US, IT, WHO are names).
  */
-const LATIN_QUERY_STOP = new Set([
+export const LATIN_QUERY_STOP = new Set([
   'a', 'an', 'the', 'of', 'in', 'on', 'at', 'to', 'for', 'from', 'by', 'with', 'about', 'as', 'into', 'than', 'between', 'during',
   'and', 'or', 'but', 'not', 'no', 'nor', 'if', 'then', 'so', 'such', 'also', 'both', 'either', 'each', 'any', 'all', 'some',
   'is', 'are', 'was', 'were', 'be', 'been', 'being', 'am', 'do', 'does', 'did', 'done', 'has', 'have', 'had', 'having',
@@ -1042,6 +1042,122 @@ async function scannedCandidates(
      FROM picked JOIN chunks c ON c.id = picked.chunk_id JOIN documents d ON d.id = c.document_id`,
     p.list,
   );
+}
+
+/**
+ * The grams every text holding `term` holds: a term's own, and for a phrase
+ * of several words those of its words together (a superset of the texts that
+ * hold the phrase, as a Latin term's trigrams are of the texts that hold it).
+ */
+function phraseGrams(term: string): string[] {
+  const own = termGrams(term);
+  if (own.length > 0 || !/\s/.test(term)) return own;
+  return [...new Set(term.split(/\s+/).flatMap((word) => termGrams(word)))];
+}
+
+const indexServes = (store: Store, terms: string[]) => matchIndexReady(store, 'chunks') && terms.every((t) => phraseGrams(t).length > 0);
+
+/**
+ * How many chunks hold each of `terms` (lowercased; counted to
+ * `KEYWORD_DF_CAP`) and the weight that gives it: what the keyword channel
+ * weighs a query's terms by, for any terms. Off the gram index when it is
+ * ready and serves every term, by one scan otherwise.
+ */
+export async function termStats(store: Store, terms: string[]): Promise<{ df: number[]; idf: number[] }> {
+  if (terms.length === 0) return { df: [], idf: [] };
+  const total = await chunkTotal(store);
+  let df: number[];
+  if (indexServes(store, terms)) {
+    const p = new Params();
+    const expr = MATCH_INDEXES.chunks.expr('c');
+    const cap = p.add(KEYWORD_DF_CAP);
+    const lists = terms.map((t, i) => `(SELECT ${i} AS i FROM chunks c WHERE ${expr} @@ ${p.add(gramQuery([phraseGrams(t)], 1))}::tsquery LIMIT ${cap})`);
+    const rows = await store.query<{ i: number; df: number }>(
+      `WITH hit AS MATERIALIZED (${lists.join(' UNION ALL ')}) SELECT i, count(*)::int AS df FROM hit GROUP BY i`,
+      p.list,
+    );
+    df = terms.map(() => 0);
+    for (const r of rows) df[r.i] = r.df;
+  } else {
+    df = await scannedFrequencies(store, terms);
+  }
+  return { df, idf: termIdf(df, total) };
+}
+
+/**
+ * Chunks of sources, outside `exclude`, that hold one of the first `listed`
+ * of `terms` (lowercased), scored by BM25 over all of them with the weights
+ * `idf`, best first. For each listed term about three times `perTerm` chunks
+ * are read: the ones the terms weigh the most in together, as
+ * `listedCandidates` picks a query's. Generated pages are left out: a bridge
+ * term is for the passage extraction made no link to, and a page is what
+ * extraction made.
+ */
+export async function chunksForTerms(
+  store: Store,
+  terms: string[],
+  idf: number[],
+  listed: number,
+  opts: { exclude: string[]; perTerm: number; asOf?: TimeInput; filter?: ResolvedScopeFilter },
+): Promise<RankedChunk[]> {
+  if (listed <= 0 || terms.length === 0) return [];
+  const sides = await sidesOf(store);
+  const want = Math.max(1, opts.perTerm) * 3;
+  const p = new Params();
+  let rows: RankedChunk[];
+  if (indexServes(store, terms)) {
+    const expr = MATCH_INDEXES.chunks.expr('c');
+    const cap = p.add(KEYWORD_DF_CAP);
+    const lists = terms.map((t, i) => `(SELECT ${i} AS i, c.id, c.document_id FROM chunks c WHERE ${expr} @@ ${p.add(gramQuery([phraseGrams(t)], 1))}::tsquery LIMIT ${cap})`);
+    const cond = searchable('d', p, sides, opts.asOf, opts.filter);
+    const out = p.add(opts.exclude);
+    const hits = await store.query<{ i: number; id: string }>(
+      `WITH hit AS MATERIALIZED (${lists.join(' UNION ALL ')})
+       SELECT h.i, h.id FROM hit h JOIN documents d ON d.id = h.document_id
+       WHERE ${cond} AND NOT ${sides.generated('d')} AND h.id <> ALL(${out}::text[])`,
+      p.list,
+    );
+    const weight = new Map<string, number>();
+    for (const h of hits) weight.set(h.id, (weight.get(h.id) ?? 0) + idf[h.i]);
+    const ids = new Set<string>();
+    for (let i = 0; i < listed; i++) {
+      hits
+        .filter((h) => h.i === i)
+        .map((h) => h.id)
+        .sort((a, b) => weight.get(b)! - weight.get(a)! || (a < b ? -1 : 1))
+        .slice(0, want)
+        .forEach((id) => ids.add(id));
+    }
+    if (ids.size === 0) return [];
+    rows = await store.query<RankedChunk>(
+      `SELECT ${candidateColumns(sides)}, 0::float AS raw
+       FROM chunks c JOIN documents d ON d.id = c.document_id
+       WHERE c.id = ANY($1::text[])`,
+      [[...ids]],
+    );
+  } else {
+    const held = terms.slice(0, listed).map((t) => `CASE WHEN ${holdsGramsSql('x.l', t, p)} THEN 1 ELSE 0 END`).join(' + ');
+    const cond = searchable('d', p, sides, opts.asOf, opts.filter);
+    const out = p.add(opts.exclude);
+    const lim = p.add(want * listed);
+    rows = await store.query<RankedChunk>(
+      `WITH held AS MATERIALIZED (
+         SELECT chunk_id, held FROM (
+           SELECT c.id AS chunk_id, ${held} AS held
+           FROM chunks c JOIN documents d ON d.id = c.document_id, LATERAL (SELECT lower(c.content) AS l OFFSET 0) x
+           WHERE ${cond} AND NOT ${sides.generated('d')} AND c.id <> ALL(${out}::text[])
+           OFFSET 0
+         ) scanned
+         WHERE held > 0
+         ORDER BY held DESC, chunk_id COLLATE "C"
+         LIMIT ${lim}
+       )
+       SELECT ${candidateColumns(sides)}, 0::float AS raw
+       FROM held JOIN chunks c ON c.id = held.chunk_id JOIN documents d ON d.id = c.document_id`,
+      p.list,
+    );
+  }
+  return rankBm25(rows, terms.map((term, i) => ({ term, idf: idf[i] })).filter((t) => t.idf > 0));
 }
 
 /**
