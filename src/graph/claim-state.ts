@@ -55,18 +55,43 @@ const SYNONYM: ReadonlyMap<string, string> = (() => {
 /** Keys whose value is a text (a person, a stage), read from "<key>为<text>". */
 const TEXT_KEYS = new Set(['负责人', 'lead', '状态', 'status', '阶段', 'stage']);
 
+/** Keys of a state or a stage, whose object, when a person, is who handles it. */
+const STATE_KEYS = new Set(['状态', 'status', '阶段', 'stage']);
+
+/** The object of a claim as series identity reads it. */
+export interface SeriesObject {
+  id: string | null | undefined;
+  name?: string | null;
+  type?: string | null;
+}
+
 /**
- * The object a series of `attribute` is kept apart by. A measure of a subject
- * toward one object is a series per object (a holding in each company); the
- * owner or the state of a subject is one series whatever the claim names
- * besides: "R-03由赖艳负责，处于跟进中" and "R-03已关闭" are one state, and
- * "负责人为廖欣" / "负责人为孙欣" — whose object is the value itself — one
- * owner. Kept apart by object, a risk closed in week 19 stayed open beside it
- * (108 of 120 risks on the 10× benchmark had two or more current states).
+ * The object a series of `attribute` is kept apart by: a series is one
+ * attribute of one thing, so a claim toward an object is a series of that
+ * object ("电池业务由李四负责" and "云业务由张三负责" are two owners of 比亚迪), and a
+ * claim with no object one of its own. Two exceptions, where the object is
+ * not a thing the attribute belongs to:
+ *   - the object is the value itself: 负责人 = 廖欣 with 廖欣 as the object;
+ *   - a person named on a state or stage line ("R-03由赖艳负责，处于跟进中"):
+ *     who handles it, not a part of it.
+ * Read on the attribute's synonym head, so a stored 跟进人 is an owner.
  */
-export function seriesObject(attribute: string | null | undefined, objectId: string | null | undefined): string {
-  if (attribute && TEXT_KEYS.has(attribute)) return '';
-  return objectId ?? '';
+export function seriesObject(attribute: string | null | undefined, object: SeriesObject | string | null | undefined, valueText?: string | null): string {
+  const o: SeriesObject = typeof object === 'string' || object == null ? { id: object ?? null } : object;
+  if (!o.id) return '';
+  const head = attributeHead(attribute);
+  if (head && TEXT_KEYS.has(head)) {
+    const bare = (n: string) => fold(n.replace(/[（(][^）)]*[）)]$/u, ''));
+    if (valueText && o.name && bare(o.name) === bare(valueText)) return '';
+    if (STATE_KEYS.has(head) && o.type === 'person') return '';
+  }
+  return o.id;
+}
+
+/** The head of a key's synonym group (跟进人 → 负责人), or the key. */
+export function attributeHead(attribute: string | null | undefined): string | null {
+  if (!attribute) return null;
+  return SYNONYM.get(fold(attribute)) ?? attribute;
 }
 
 /** Verbs and hedges between an attribute and its value, longest first. */

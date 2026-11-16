@@ -147,6 +147,9 @@ export interface StateRow {
   subject: string;
   attribute: string;
   object_id: string | null;
+  /** The object's name and type, which say whether it is the value or who handles a state (seriesObject). */
+  object_name?: string | null;
+  object_type?: string | null;
   kind: string;
   value_num: number | null;
   value_text: string | null;
@@ -200,8 +203,8 @@ export function seriesSupersession(series: StateRow[]): Map<string, string | nul
 
 /**
  * Supersession by attribute, in every domain: the series of a subject's
- * attribute (its canonical key, per object unless it is an owner or a state —
- * seriesObject —, facts and forecasts apart) runs
+ * attribute (its canonical key, per object — seriesObject says when an
+ * object is the value or who handles a state —, facts and forecasts apart) runs
  * by effective date, and only the newest is current (seriesSupersession).
  * Disputed, absent, opinion and rumour claims take no part. Returns the
  * claims whose mark changed.
@@ -229,7 +232,7 @@ export async function supersedeByAttribute(store: Store, opts: { claimsPerBatch?
     await pause();
     const rows = await store.query<StateRow>(
       `SELECT c.id, COALESCE(se.canonical_id, c.subject_id) AS subject, COALESCE(ak.canonical, c.attribute) AS attribute,
-              COALESCE(oe.canonical_id, c.object_id) AS object_id, c.kind, c.value_num, c.value_text, c.unit,
+              COALESCE(oe.canonical_id, c.object_id) AS object_id, oe.name AS object_name, oe.type AS object_type, c.kind, c.value_num, c.value_text, c.unit,
               COALESCE(c.effective_at, c.event_at, c.valid_from, c.observed_at) AS eff, c.valid_to, c.correction, c.superseded_by, c.tx_from
        FROM claims c
        JOIN entities se ON se.id = c.subject_id
@@ -240,7 +243,7 @@ export async function supersedeByAttribute(store: Store, opts: { claimsPerBatch?
     );
     const ids: string[] = [];
     const marks: (string | null)[] = [];
-    for (const series of groupBy(rows, (r) => `${r.subject}\u0000${r.attribute}\u0000${seriesObject(r.attribute, r.object_id)}\u0000${r.kind}`).values()) {
+    for (const series of groupBy(rows, (r) => `${r.subject}\u0000${r.attribute}\u0000${seriesObject(r.attribute, { id: r.object_id, name: r.object_name, type: r.object_type }, r.value_text)}\u0000${r.kind}`).values()) {
       await pause();
       const want = seriesSupersession(series);
       for (const r of series) {

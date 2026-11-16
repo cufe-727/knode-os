@@ -98,6 +98,8 @@ interface ClaimLite {
   subject_id: string;
   subject: string;
   object: string | null;
+  object_name?: string | null;
+  object_type?: string | null;
   subject_name: string;
   statement: string;
   status: string;
@@ -681,14 +683,18 @@ export function monthsApart(
  * One day with two values is a real disagreement or a misreading: the judge's.
  */
 export function seriesRelation(
-  a: Pick<ClaimLite, 'subject' | 'object' | 'kind' | 'attribute' | 'value_num' | 'value_text' | 'unit' | 'eff'>,
-  b: Pick<ClaimLite, 'subject' | 'object' | 'kind' | 'attribute' | 'value_num' | 'value_text' | 'unit' | 'eff'>,
+  a: Pick<ClaimLite, 'subject' | 'object' | 'kind' | 'attribute' | 'value_num' | 'value_text' | 'unit' | 'eff'> & Partial<Pick<ClaimLite, 'object_name' | 'object_type'>>,
+  b: Pick<ClaimLite, 'subject' | 'object' | 'kind' | 'attribute' | 'value_num' | 'value_text' | 'unit' | 'eff'> & Partial<Pick<ClaimLite, 'object_name' | 'object_type'>>,
 ): 'different_time' | 'same' | null {
-  if (!a.attribute || a.attribute !== b.attribute || a.subject !== b.subject || seriesObject(a.attribute, a.object) !== seriesObject(b.attribute, b.object) || a.kind !== b.kind) return null;
+  if (!a.attribute || a.attribute !== b.attribute || a.subject !== b.subject || a.kind !== b.kind) return null;
+  const of = (c: typeof a) => seriesObject(c.attribute, { id: c.object, name: c.object_name, type: c.object_type }, c.value_text);
+  if (of(a) !== of(b)) return null;
   const da = toDateString(a.eff);
   const db = toDateString(b.eff);
   if (!da || !db) return null;
   if (da !== db) return 'different_time';
+  // one claim reworded only toward one object: two objects' claims are never merged by rule
+  if ((a.object ?? '') !== (b.object ?? '')) return null;
   const va = { valueNum: a.value_num, valueText: a.value_text, unit: a.unit };
   const vb = { valueNum: b.value_num, valueText: b.value_text, unit: b.unit };
   return sameValue(va, vb) ? 'same' : null;
@@ -742,7 +748,7 @@ export const CLAIMS_PER_BATCH = 40_000;
 
 /** Every representative claim that takes part, with its canonical subject / object; narrowed by the caller. */
 const CLAIM_SELECT = `SELECT c.id, c.subject_id, COALESCE(se.canonical_id, c.subject_id) AS subject, COALESCE(oe.canonical_id, c.object_id) AS object,
-            se.name AS subject_name, c.statement, c.status, c.kind, c.type, c.valid_from, c.valid_to, c.event_at, c.observed_at,
+            oe.name AS object_name, oe.type AS object_type, se.name AS subject_name, c.statement, c.status, c.kind, c.type, c.valid_from, c.valid_to, c.event_at, c.observed_at,
             c.evidence_count, (SELECT count(*)::int FROM claims m WHERE m.canonical_id = c.id) AS members,
             c.tx_from, s.key AS source_path, c.chunk_id,
             COALESCE(ak.canonical, c.attribute) AS attribute, c.value_num, c.value_text, c.unit,

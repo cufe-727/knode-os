@@ -166,13 +166,18 @@ describe('a series of one attribute', () => {
     expect(marks.get('w30')).toBeNull();
   });
 
-  it('keeps one owner and one state per subject whatever object a claim names, and a measure toward an object apart', () => {
-    expect(seriesObject('状态', '赖艳')).toBe('');
-    expect(seriesObject('负责人', '廖欣')).toBe(seriesObject('负责人', '孙欣'));
+  it('keeps a series per object, except where the object is the value or who handles a state', () => {
+    // a person named on a state line, and an owner whose object is the owner: one series of the subject
+    expect(seriesObject('状态', { id: '赖艳', name: '赖艳', type: 'person' }, '跟进中')).toBe('');
+    expect(seriesObject('负责人', { id: '廖欣', name: '廖欣', type: 'person' }, '廖欣')).toBe(seriesObject('负责人', { id: '孙欣', name: '孙欣', type: 'person' }, '孙欣'));
+    expect(seriesObject('跟进人', { id: '陈伟平台组', name: '陈伟（平台组）', type: 'person' }, '陈伟')).toBe('');
     expect(normalizeAttribute('跟进人')).toBe('负责人');
+    // a thing the attribute belongs to keeps its own series
+    expect(seriesObject('负责人', { id: '电池业务', name: '电池业务', type: 'product' }, '李四')).toBe('电池业务');
+    expect(seriesObject('状态', { id: '半导体业务', name: '半导体业务', type: 'product' }, '审核中')).toBe('半导体业务');
     expect(seriesObject('持股比例', 'company-a')).not.toBe(seriesObject('持股比例', 'company-b'));
     const base = { subject: 'r-03', kind: 'fact', attribute: '状态', unit: null, value_num: null };
-    expect(seriesRelation({ ...base, object: '赖艳', value_text: '跟进中', eff: '2025-06-16' }, { ...base, object: null, value_text: '已关闭', eff: '2025-07-18' })).toBe('different_time');
+    expect(seriesRelation({ ...base, object: '赖艳', object_name: '赖艳', object_type: 'person', value_text: '跟进中', eff: '2025-06-16' }, { ...base, object: null, value_text: '已关闭', eff: '2025-07-18' })).toBe('different_time');
   });
 
   it('settles pairs of one series without a model: other days are history, one day and one value are one claim', () => {
