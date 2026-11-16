@@ -75,9 +75,18 @@ beforeAll(async () => {
   await addDoc('raised7', 'Li Wei raised risk R-07 on the payment gateway.', ['liwei', 'r-07']);
   await addDoc('liwei-move', 'Li Wei moved over to the Growth group.', ['liwei']);
   await addDoc('liwei-duty', 'Li Wei is on call.', ['liwei']);
+  // a step known only from a claim: the passage naming R-11 does not name who raised it, the review that does names
+  // no entity a mention records, and nothing relates them — no search or graph of the first round reaches Zhao Min
+  await addEntity('r-11', 'R-11', 'other');
+  await addEntity('zhao', 'Zhao Min', 'person');
+  await addDoc('risk11', 'Risk R-11 on the settlement queue was opened at the quarterly review.', ['r-11']);
+  await addDoc('review11', 'Minutes of the quarterly review.', []);
+  await addDoc('zhao-move', 'Zhao Min moved over to the Billing group.', ['zhao']);
+  await addDoc('zhao-duty', 'Zhao Min is on call.', ['zhao']);
   for (const [id, subject, object, statement, doc] of [
     ['cl-raised', 'r-03', 'fang', 'R-03 was raised by Fang Jie', 'raised'],
     ['cl-raised7', 'r-07', 'liwei', 'R-07 was raised by Li Wei', 'raised7'],
+    ['cl-raised11', 'r-11', 'zhao', 'R-11 was raised by Zhao Min', 'review11'],
   ]) {
     await store.query(
       `INSERT INTO claims (id, subject_id, object_id, type, statement, status, kind, chunk_id, primary_scope_id, evidence_count, tx_from)
@@ -159,18 +168,36 @@ describe('ask with a second round', () => {
   const llm = { enabled: false } as unknown as LlmClient;
   it('adds what the second round found to the contexts and says why it ran; off when asked', async () => {
     const q = 'Who raised risk R-07, and where is that person now?';
+    // routed to the walk, the first round runs the lookup route's graph search as well (docs/design/30 §3), which
+    // reaches the passage on its own; the second round still runs from Li Wei, and adds only what the first lacks
     const res = await ask(store, defaultConfig(), embedder, llm, q, { queryVector: [1, 0, 0, 0], k: 1 });
     expect(res.route.kind).toBe('multihop');
+    // it looks from the step's person (the passage this fixture's top hit adds may bring other entities to look from)
     expect(res.route.second).toMatchObject({ from: expect.arrayContaining(['Li Wei']) });
-    expect(res.route.second!.chunks).toBeGreaterThan(0);
     expect(res.contexts.map((c) => c.path)).toContain('raw/docs/liwei-move.md');
+    const second = res.route.second!.chunks;
     const off = await ask(store, defaultConfig(), embedder, llm, q, { queryVector: [1, 0, 0, 0], k: 1, second: false });
     expect(off.route.second).toBeUndefined();
+    // what the second round added is what turning it off loses
+    expect(res.contexts.length - off.contexts.length).toBe(second);
+  });
+
+  it('adds a passage the first round lacks, from a step only a claim knew; the workspace switch and the call over it', async () => {
+    const q = 'Who raised risk R-11, and where is that person now?';
+    const res = await ask(store, defaultConfig(), embedder, llm, q, { queryVector: [1, 0, 0, 0], k: 1 });
+    expect(res.route.kind).toBe('multihop');
+    expect(res.route.second).toMatchObject({ from: expect.arrayContaining(['Zhao Min']) });
+    expect(res.route.second!.chunks).toBeGreaterThan(0);
+    expect(res.contexts.map((c) => c.path)).toContain('raw/docs/zhao-move.md');
+    const off = await ask(store, defaultConfig(), embedder, llm, q, { queryVector: [1, 0, 0, 0], k: 1, second: false });
+    expect(off.route.second).toBeUndefined();
+    // the first round alone does not reach it, and what the round added is what turning it off loses
+    expect(off.contexts.map((c) => c.path)).not.toContain('raw/docs/zhao-move.md');
+    expect(res.contexts.length - off.contexts.length).toBe(res.route.second!.chunks);
     // the workspace's switch, and the call over it
     const config = defaultConfig();
     config.retrieval.router = { ...config.retrieval.router!, secondRound: false };
     expect((await ask(store, config, embedder, llm, q, { queryVector: [1, 0, 0, 0], k: 1 })).route.second).toBeUndefined();
-    expect((await ask(store, config, embedder, llm, q, { queryVector: [1, 0, 0, 0], k: 1, second: true })).route.second).toBeDefined();
-    expect(off.contexts.map((c) => c.path)).not.toContain('raw/docs/liwei-move.md');
+    expect((await ask(store, config, embedder, llm, q, { queryVector: [1, 0, 0, 0], k: 1, second: true })).route.second).toMatchObject({ from: expect.arrayContaining(['Zhao Min']) });
   });
 });

@@ -185,7 +185,6 @@ describe("knode-ask's retrieval", () => {
 
   it('scores the ranking and `retrieved` from what the answer sent its model', async () => {
     const docs = new Set(env.staged.docs.map((d) => d.path));
-    let viaPage = 0;
     for (const id of ['q1', 'c-runs', 'c-chain']) {
       const task = env.staged.tasks.find((t) => t.id === id)!;
       backend.asked.length = 0;
@@ -212,7 +211,6 @@ describe("knode-ask's retrieval", () => {
       // every document the prompt puts before the model, once, in the prompt's order — and no other
       expect(retrieved, id).toEqual([...new Set(sent)]);
       for (const d of retrieved) expect(docs.has(d), d).toBe(true);
-      viaPage += retrieved.filter((d) => !sources.includes(d)).length;
       // what the answer cites is a passage's documents, among those sent
       for (const c of a.citations ?? []) expect(retrieved, id).toContain(c.doc);
       // the retrieval probe is the same retrieval without the completion
@@ -220,7 +218,9 @@ describe("knode-ask's retrieval", () => {
       expect(ranked, id).toEqual(retrieved.slice(0, 5));
       expect(backend.asked, id).toHaveLength(1);
     }
-    // some document reached the model only through a generated page that cites it
-    expect(viaPage).toBeGreaterThan(0);
+    // These three questions no longer have a document that reaches the model only through a generated page: a
+    // question routed to the walk now also gets the lookup route's graph search and excerpts (docs/design/30 §3),
+    // which reach every cited document directly. The page's citations are still read (the per-task equality above,
+    // and passageDocuments' test); a case of a document reached only through a page is wanted.
   });
 });

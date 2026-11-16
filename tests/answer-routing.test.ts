@@ -441,7 +441,7 @@ describe('ordering and meaning in the walk', () => {
     await entity('proj', '司命系统', 'project');
     // the fix is stated in the report of its week, and restated by a later summary, which is the relation's own source
     await doc('本周钱勇修复了INC-003-D2T1。', ['qian', 'i3'], [['qian', '钱勇修复了INC-003-D2T1。', '2025-05-05']]);
-    await relate('qian', 'i3', '钱勇修复了INC-003-D2T1。', await doc('季度回顾：钱勇修复INC-003-D2T1', ['qian', 'i3'], [['qian', '季度回顾', '2025-06-30']]));
+    await relate('qian', 'i3', '钱勇修复了INC-003-D2T1。', await doc('季度回顾：钱勇修复INC-003-D2T1', ['qian', 'i3'], [['qian', '季度回顾', '2025-05-30']]));
     await relate('lin', 'i1', '林婷修复了INC-001-D2T1。', await doc('林婷修复了INC-001-D2T1。', ['lin', 'i1']));
     await relate('lin', 'p2', '林婷修复了INC-011-D2T2。', await doc('林婷修复了INC-011-D2T2。', ['lin', 'p2']));
     // a person 负责 an incident (the heavier relation) and a project
@@ -469,9 +469,9 @@ describe('ordering and meaning in the walk', () => {
     expect(placed.get('i2')).toMatchObject({ date: '2025-03-10', level: 2 });
     expect(placed.get('i5')).toMatchObject({ date: null, level: 1 });
     const ask = ordinalInQuestion('今年第三起最严重一档的故障')!;
-    const pick = pickByOrder(ask, [...(await placeEntities(ws, ['i1', 'i2', 'i3', 'i4', 'i5'])).values()]);
+    const pick = pickByOrder(ask, [...(await placeEntities(ws, ['i1', 'i2', 'i3', 'i4', 'i5'])).values()], { date: '2025-12-31', by: 'knowledge base' });
     expect(pick.picked).toBeNull();
-    expect(pick.note).toMatch(/not ordered: 第三起 asks for the 3rd, 2 P1 candidates are dated in 2025 \(1 have no date\)/);
+    expect(pick.note).toMatch(/^not ordered: 第三起 asks for the 3rd, 2 P1 candidates are dated in 2025 \(this year: the knowledge base's latest date, 2025-12-31\) \(1 have no date\); in order: INC-001-D2T1 \(2025-02-03, first seen\), INC-003-D2T1 \(2025-04-28, first seen\)$/);
   });
 
   it('takes the Nth of the group the question describes, by date, and walks on from it', async () => {
@@ -480,17 +480,30 @@ describe('ordering and meaning in the walk', () => {
     const hop2 = walk.steps.filter((s) => s.hop === 2);
     // of the platform group's 2025 P1 incidents (INC-001, INC-003; INC-002 was P2 in its week, INC-099 is of 2024, INC-005 undated), the second
     const picked = hop2.find((s) => s.source === 'INC-003-D2T1')!;
-    expect(picked.order).toMatch(/^the 2nd of 2 P1 dated in 2025, by date \(2025-04-28\); 1 without a date left out/);
+    expect(picked.order).toMatch(/^the 2nd of 2 P1 dated in 2025 \(this year: the knowledge base's latest date, 2025-\d\d-\d\d\), by date \(2025-04-28\); 1 without a date left out/);
     expect(hop2.map((s) => s.source)).not.toContain('INC-001-D2T1');
     expect(hop2.map((s) => s.source)).toContain('INC-011-D2T2');
     expect(walk.ordering?.picks).toHaveLength(2);
     expect(walk.steps.filter((s) => s.hop === 3).map((s) => `${s.source}→${s.target}`)).toContain('钱勇→INC-003-D2T1');
-    expect(stepsAsFacts([picked])[0].statement).toContain('[picked as the 2nd of 2 P1');
+    // the relation stays the source's fact; the pick is the walk's, said apart from it (walk.ordering, and through ask a computed fact)
+    expect(stepsAsFacts([picked])[0].statement).not.toContain('picked');
+    expect(walk.ordering?.picks.some((p) => p.startsWith('二部平台组: INC-003-D2T1 — the 2nd of 2 P1'))).toBe(true);
     // the group the question describes leads: its chain's passages come first
     expect(walk.bridges[0].trace?.bridgeEntities).toContain('二部平台组');
-    // the fix's passage is the report of its week, not the later summary the relation was read from
+    // the fix's passage is the report of its week, not the summary the relation was read from 25 days later
     const fix = walk.bridges.find((b) => b.trace?.bridgeEntities?.includes('钱勇'))!;
     expect(fix.content).toBe('本周钱勇修复了INC-003-D2T1。');
+  });
+
+  it('owes the described group to the question\'s meaning: none without a vector, another with another vector', async () => {
+    const q = '第二事业部管基础设施的那个组今年第二起最严重一档的故障，是谁处理好的？';
+    // no vector, or vectors of another model: nothing tells the three groups apart, and nothing else matches the question
+    expect((await walkRelations(ws, q, ['d2'], { maxHops: 3 })).steps).toEqual([]);
+    expect((await walkRelations(ws, q, ['d2'], { maxHops: 3, queryVector: [1, 0, 0, 0], model: 'another-model' })).steps).toEqual([]);
+    // a vector nearest the payments group: its chain leads
+    const pay = await walkRelations(ws, q, ['d2'], { maxHops: 3, queryVector: [0, 1, 0, 0], model: MODEL });
+    expect(pay.bridges[0].trace?.bridgeEntities).toContain('二部支付组');
+    expect(pay.steps.find((s) => s.order && s.source === 'INC-011-D2T2')).toBeDefined();
   });
 
   it('walks to the kind of thing the last sentence asks for', async () => {
