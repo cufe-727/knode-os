@@ -495,6 +495,17 @@ describe('ordering and meaning in the walk', () => {
     expect(fix.content).toBe('本周钱勇修复了INC-003-D2T1。');
   });
 
+  it('owes the described group to the question\'s meaning: none without a vector, another with another vector', async () => {
+    const q = '第二事业部管基础设施的那个组今年第二起最严重一档的故障，是谁处理好的？';
+    // no vector, or vectors of another model: nothing tells the three groups apart, and nothing else matches the question
+    expect((await walkRelations(ws, q, ['d2'], { maxHops: 3 })).steps).toEqual([]);
+    expect((await walkRelations(ws, q, ['d2'], { maxHops: 3, queryVector: [1, 0, 0, 0], model: 'another-model' })).steps).toEqual([]);
+    // a vector nearest the payments group: its chain leads
+    const pay = await walkRelations(ws, q, ['d2'], { maxHops: 3, queryVector: [0, 1, 0, 0], model: MODEL });
+    expect(pay.bridges[0].trace?.bridgeEntities).toContain('二部支付组');
+    expect(pay.steps.find((s) => s.order && s.source === 'INC-011-D2T2')).toBeDefined();
+  });
+
   it('walks to the kind of thing the last sentence asks for', async () => {
     const walk = await walkRelations(ws, '（第二事业部）钱勇名下的那个项目是在哪一周投产的？', ['qian', 'd2'], { maxHops: 1 });
     const fromQian = walk.steps.filter((s) => s.source === '钱勇').map((s) => s.target);
