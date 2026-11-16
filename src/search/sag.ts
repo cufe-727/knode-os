@@ -5,6 +5,7 @@ import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { NO_FILTER, ResolvedScopeFilter, evidenceFilterSql } from '../store/resolver.js';
 import { Params, TimeInput, rowLiveAt, toIso } from '../store/temporal.js';
 import { SearchResult } from '../types.js';
+import { BridgeCandidate, lexicalBridge } from './bridge.js';
 import { GENERATED_SHARE, SearchOptions, docLiveAt, entityMatchSql, generatedPlaces, queryTerms, search, sidesOf } from './search.js';
 
 interface EntityMentionRow {
@@ -63,7 +64,7 @@ function boundedInteger(value: number, fallback: number, min: number, max: numbe
   return Math.min(max, Math.max(min, Math.floor(value)));
 }
 
-function normalizedConfig(override?: Partial<SagSearchConfig>): SagSearchConfig {
+function normalizedConfig(override?: Partial<SagSearchConfig>): Required<SagSearchConfig> {
   const base = defaultConfig().retrieval.sag;
   const directRatio = override?.directRatio ?? base.directRatio;
   return {
@@ -78,6 +79,8 @@ function normalizedConfig(override?: Partial<SagSearchConfig>): SagSearchConfig 
     candidatePool: boundedInteger(override?.candidatePool ?? base.candidatePool, base.candidatePool, 1, 500),
     maxHops: boundedInteger(override?.maxHops ?? base.maxHops, base.maxHops, 1, 4),
     directRatio: Number.isFinite(directRatio) ? Math.min(1, Math.max(0, directRatio)) : base.directRatio,
+    bridgeTerms: boundedInteger(override?.bridgeTerms ?? base.bridgeTerms ?? 0, 0, 0, 40),
+    bridgePool: boundedInteger(override?.bridgePool ?? base.bridgePool ?? 50, 50, 1, 200),
   };
 }
 
@@ -249,29 +252,57 @@ async function coarseVectorRank(
   );
 }
 
+/**
+ * The walk's candidates as one list: those the entities reached, in the order
+ * of their structural score, and those the bridge terms reached, in the order
+ * the terms put them forward (bridge.ts), each list and the vector ranking of
+ * all of them counted by reciprocal rank. A chunk both routes reached counts
+ * on both. With no bridge candidates this is the entity route as it always
+ * ranked.
+ */
 function fuseStructuralCandidates(
   candidates: StructuralCandidate[],
+  bridged: BridgeCandidate[],
   vectorRows: VectorRankRow[],
 ): SearchResult[] {
   const vectorRanks = new Map(vectorRows.map((row, rank) => [row.chunk_id, { rank, raw: row.raw }]));
-  return candidates
+  const entries = new Map<string, { result: SearchResult; structural?: { rank: number; candidate: StructuralCandidate }; bridge?: { rank: number; candidate: BridgeCandidate } }>();
+  candidates
     .sort((a, b) => b.structuralScore - a.structuralScore)
-    .map((candidate, structuralRank) => {
-      const vector = vectorRanks.get(candidate.result.chunkId);
-      const score = 1 / (RRF_K + structuralRank + 1) + (vector ? 1 / (RRF_K + vector.rank + 1) : 0);
+    .forEach((candidate, rank) => entries.set(candidate.result.chunkId, { result: candidate.result, structural: { rank, candidate } }));
+  bridged.forEach((candidate, rank) => {
+    const { row } = candidate;
+    const entry = entries.get(row.chunk_id);
+    if (entry) entry.bridge = { rank, candidate };
+    else {
+      entries.set(row.chunk_id, {
+        result: { chunkId: row.chunk_id, documentId: row.document_id, path: row.path, title: row.title, content: row.content, score: 0, signals: {} },
+        bridge: { rank, candidate },
+      });
+    }
+  });
+  return [...entries.values()]
+    .map(({ result, structural, bridge }) => {
+      const vector = vectorRanks.get(result.chunkId);
+      const score =
+        (structural ? 1 / (RRF_K + structural.rank + 1) : 0) +
+        (bridge ? 1 / (RRF_K + bridge.rank + 1) : 0) +
+        (vector ? 1 / (RRF_K + vector.rank + 1) : 0);
       return {
-        ...candidate.result,
+        ...result,
         score,
         signals: {
-          ...candidate.result.signals,
-          structural: candidate.structuralScore,
+          ...result.signals,
+          ...(structural ? { structural: structural.candidate.structuralScore } : {}),
+          ...(bridge ? { bridge: bridge.candidate.row.raw } : {}),
           ...(vector ? { vector: vector.raw } : {}),
         },
         trace: {
           route: 'sag' as const,
-          hop: candidate.provenance.hop,
-          seedChunkId: candidate.provenance.seedChunkId,
-          bridgeEntities: candidate.provenance.bridges,
+          hop: structural?.candidate.provenance.hop ?? 1,
+          seedChunkId: structural?.candidate.provenance.seedChunkId,
+          bridgeEntities: structural?.candidate.provenance.bridges ?? [],
+          ...(bridge ? { bridgeTerms: bridge.candidate.terms } : {}),
         },
       };
     })
@@ -450,8 +481,19 @@ export async function sagSearch(
   const structuralPool = [...structural.values()]
     .sort((a, b) => b.structuralScore - a.structuralScore)
     .slice(0, cfg.candidatePool);
-  const vectorRows = await coarseVectorRank(store, queryVector, embedder.model, structuralPool.map((item) => item.result.chunkId));
-  const structuralResults = fuseStructuralCandidates(structuralPool, vectorRows);
+  // the seeds' own terms as bridges, beside the entities they mention (bridge.ts); off unless configured
+  const bridged = cfg.bridgeTerms > 0
+    ? await lexicalBridge(
+        store,
+        query,
+        direct.slice(0, cfg.seedChunks).map((r) => ({ chunkId: r.chunkId, content: r.content, weight: direct[0].score > 0 ? r.score / direct[0].score : 1 })),
+        new Set(seedChunkIds),
+        { terms: cfg.bridgeTerms, pool: cfg.bridgePool, asOf: scope.asOf, filter: scope.filter },
+      )
+    : { terms: [], candidates: [] };
+  const pooled = [...new Set([...structuralPool.map((item) => item.result.chunkId), ...bridged.candidates.map((c) => c.row.chunk_id)])];
+  const vectorRows = await coarseVectorRank(store, queryVector, embedder.model, pooled);
+  const structuralResults = fuseStructuralCandidates(structuralPool, bridged.candidates, vectorRows);
   const share = opts.generatedShare ?? GENERATED_SHARE;
   const pages = new Set([...direct, ...structuralResults].filter((r) => r.generated).map((r) => r.chunkId));
   // the direct route's first result is the best candidate of all: a page there keeps a place
