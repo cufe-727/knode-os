@@ -116,18 +116,19 @@ afterAll(async () => {
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
-const set = (q: string, named: string[]) => computeClaimSet(store, q, classifyQuestion(q), named);
+/** Asked at the end of the fixture's year: its yearless periods are 2025's. */
+const set = (q: string, named: string[]) => computeClaimSet(store, q, classifyQuestion(q), named, { now: '2025-12-31' });
 
 describe('reading what a question asks of the claims', () => {
   it('reads the operation, the grouping, the filters and the period by rules', () => {
-    const r = (q: string) => readSetQuestion(q, classifyQuestion(q));
+    const r = (q: string) => readSetQuestion(q, classifyQuestion(q), '2025-12-31');
     expect(r('（第一事业部）按组和季度统计：第一事业部的三个组在每个季度各报告了几起事故（截至第44周）？')).toMatchObject({ op: 'count', groupBy: ['member', 'quarter'], asks: 'event', throughWeek: 44 });
     expect(r('平台组的服务可用性在哪些周低于99.917%（截至第44周）？')).toMatchObject({ op: 'list', threshold: { cmp: '<', value: 99.917 } });
     expect(r('平台组的服务可用性每个季度的最高周值分别是多少？')).toMatchObject({ op: 'max', groupBy: ['quarter'] });
-    expect(r('平台组上半年服务可用性的周均值是多少？保留3位小数。')).toMatchObject({ op: 'mean', yearless: { from: 1, to: 6 } });
+    expect(r('平台组上半年服务可用性的周均值是多少？保留3位小数。')).toMatchObject({ op: 'mean', period: { from: '2025-01-01', to: '2025-06-30' } });
     expect(r('修复过两起及以上事故的有哪些人？')).toMatchObject({ atLeast: 2, asks: 'person' });
     expect(r('截至2025年11月7日，平台组的订单库连接池上限是多少？')).toMatchObject({ op: 'value', asOf: '2025-11-07' });
-    expect(r('每个事业部第二季度各报告了几起事故？')).toMatchObject({ op: 'count', groupBy: ['parent'], company: true, yearless: { from: 4, to: 6 } });
+    expect(r('每个事业部第二季度各报告了几起事故？')).toMatchObject({ op: 'count', groupBy: ['parent'], company: true, period: { from: '2025-04-01', to: '2025-06-30' } });
     expect(r('截至第44周，还有哪些风险没有关闭？')).toMatchObject({ op: 'list', notIn: '关闭' });
     expect(r('Which people fixed at least two incidents?')).toMatchObject({ op: 'list', atLeast: 2, asks: 'person' });
     expect(r('What is Northwind?')).toBeNull();

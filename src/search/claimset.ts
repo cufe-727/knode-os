@@ -48,8 +48,15 @@ export interface SetQuestion {
   asOf?: string;
   /** The question names the whole knowledge base as its scope. */
   company: boolean;
-  /** A period without a year: a quarter, a half or a month of the data's year. */
-  yearless?: { from: number; to: number; text: string };
+  /**
+   * The window the question's own words give (ISO days): a relative one read from today ("去年", "上季度",
+   * "近3个月", "last year"), a fiscal year ("2025财年"), a quarter, half or month in the question's own year or
+   * else today's ("三季度", "截至三季度" from the year's start). Absent when it names none; the router's
+   * explicit range, when it has one, comes first.
+   */
+  period?: { from: string | null; to: string | null; text: string };
+  /** It names a period in words no rule reads ("最近", "recently"): nothing is computed. */
+  unreadPeriod?: boolean;
   /** The kind of entity the question asks for, when its words say. */
   asks?: 'person' | 'organization' | 'event' | 'project';
   /** A state the items must not be in ("没有关闭" → 关闭). */
@@ -115,8 +122,61 @@ const ASKING_WORDS = new RegExp([
   '\\b(?:which|what|who|how many|how much|list|every|all|each|per|by|the|a|an|of|in|on|at|as of|was|were|is|are|did|does|do|has|have|had|to|for|and|or|this year|company-wide)\\b',
 ].join('|'), 'gi');
 
+const todayIso = () => new Date().toISOString().slice(0, 10);
+const lastDay = (y: number, m: number) => new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
+const span = (y: number, m1: number, m2: number, text: string) => ({ from: `${y}-${pad(m1)}-01`, to: lastDay(y, m2), text });
+
+/** The window a question's period words give, relative ones from `now` (see `SetQuestion.period`). */
+export function readPeriod(q: string, now: string, groupBy: SetGroup[] = []): { period?: SetQuestion['period']; unreadPeriod?: boolean } {
+  const y = Number(now.slice(0, 4));
+  const month = Number(now.slice(5, 7));
+  const quarter = Math.floor((month - 1) / 3) + 1;
+  const back = (n: number, unit: string) => {
+    const t = new Date(`${now}T00:00:00Z`);
+    if (/月|month/.test(unit)) t.setUTCMonth(t.getUTCMonth() - n);
+    else if (/年|year/.test(unit)) t.setUTCFullYear(t.getUTCFullYear() - n);
+    else if (/周|week/.test(unit)) t.setUTCDate(t.getUTCDate() - 7 * n);
+    else t.setUTCDate(t.getUTCDate() - n);
+    return t.toISOString().slice(0, 10);
+  };
+  // the last N months / years / weeks / days
+  let m = /(?:近|过去|最近)\s*([\d一二两三四五六七八九十]+)\s*个?\s*(月|年|周|天|日)|\b(?:last|past) (\d+) (months?|years?|weeks?|days?)\b/i.exec(q);
+  if (m) {
+    const n = numOf(m[1] ?? m[3]);
+    if (n > 0) return { period: { from: back(n, m[2] ?? m[4]), to: now, text: m[0] } };
+  }
+  if (/本季度|这个?季度|\bthis quarter\b/i.test(q)) return { period: span(y, (quarter - 1) * 3 + 1, quarter * 3, '本季度') };
+  if (/上个?季度|\blast quarter\b/i.test(q)) {
+    const qy = quarter === 1 ? y - 1 : y;
+    const qq = quarter === 1 ? 4 : quarter - 1;
+    return { period: span(qy, (qq - 1) * 3 + 1, qq * 3, '上季度') };
+  }
+  if (/本月|这个月|\bthis month\b/i.test(q)) return { period: span(y, month, month, '本月') };
+  if (/上个?月|\blast month\b/i.test(q)) return { period: month === 1 ? span(y - 1, 12, 12, '上月') : span(y, month - 1, month - 1, '上月') };
+  // the year: one the question names (a fiscal year as the calendar year), a relative one, else today's
+  const fiscal = /(\d{4})\s*财年|\bFY\s?(\d{4})\b|\bfiscal (?:year )?(\d{4})\b/i.exec(q);
+  const named = /(\d{4})\s*年/.exec(q) ?? /\b((?:19|20)\d{2})\b/.exec(q);
+  const relative = /前年|\bthe year before last\b/i.test(q) ? y - 2 : /去年|上一年|\blast year\b/i.test(q) ? y - 1 : /今年|本年|\bthis year\b/i.test(q) ? y : null;
+  const year = fiscal ? Number(fiscal[1] ?? fiscal[2] ?? fiscal[3]) : named ? Number(named[1]) : relative ?? y;
+  const through = /截至|截止|到|\bthrough\b|\bup to\b/i;
+  const qm = /第?([一二三四1-4])\s*季度|\bQ([1-4])\b/i.exec(q);
+  const perQuarter = groupBy.includes('quarter') && /每个?季度|各季度|按季度|\bper quarter\b|\beach quarter\b/i.test(q) && !/第[一二三四1-4]季度/.test(q);
+  if (qm && !perQuarter) {
+    const n = numOf(qm[1] ?? qm[2]);
+    const cumulative = through.test(q.slice(Math.max(0, qm.index - 4), qm.index));
+    return { period: span(year, cumulative ? 1 : (n - 1) * 3 + 1, n * 3, qm[0]) };
+  }
+  if (/上半年|\bfirst half\b|\bH1\b/i.test(q)) return { period: span(year, 1, 6, '上半年') };
+  if (/下半年|\bsecond half\b|\bH2\b/i.test(q)) return { period: span(year, 7, 12, '下半年') };
+  const mm = /(?<![\d年])(\d{1,2})\s*月(?!\s*\d{1,2}\s*[日号])/.exec(q);
+  if (mm && !groupBy.includes('month') && Number(mm[1]) >= 1 && Number(mm[1]) <= 12 && !named) return { period: span(year, Number(mm[1]), Number(mm[1]), mm[0]) };
+  if (fiscal || relative !== null) return { period: span(year, 1, 12, fiscal ? fiscal[0] : relative === y ? '今年' : relative === y - 1 ? '去年' : '前年') };
+  if (/近期|最近|近来|这段时间|\brecent(?:ly)?\b|\blately\b|\bthese days\b/i.test(q)) return { unreadPeriod: true };
+  return {};
+}
+
 /** Read what a question asks of the claims, or null when it asks for no set, count or state. */
-export function readSetQuestion(question: string, routed: Pick<QuestionRoute, 'kind'>): SetQuestion | null {
+export function readSetQuestion(question: string, routed: Pick<QuestionRoute, 'kind'>, now = todayIso()): SetQuestion | null {
   const q = question;
   const asOf = asOfDate(q);
   const listy = /哪些|哪几|列出|\bwhich\b|\blist\b/i.test(q);
@@ -157,20 +217,7 @@ export function readSetQuestion(question: string, routed: Pick<QuestionRoute, 'k
     if (n > 0) atLeast = n;
   }
 
-  let yearless: SetQuestion['yearless'];
-  if (!/\d{4}\s*年/.test(q) && !/\b\d{4}\b/.test(q)) {
-    const qm = /第?([一二三四1-4])\s*季度|\bQ([1-4])\b/i.exec(q);
-    const groupedByQuarter = groupBy.includes('quarter');
-    if (qm && !(groupedByQuarter && /每个?季度|各季度|按季度/.test(q) && !/第[一二三四1-4]季度/.test(q))) {
-      const n = numOf(qm[1] ?? qm[2]);
-      yearless = { from: (n - 1) * 3 + 1, to: n * 3, text: qm[0] };
-    } else if (/上半年|\bfirst half\b|\bH1\b/i.test(q)) yearless = { from: 1, to: 6, text: '上半年' };
-    else if (/下半年|\bsecond half\b|\bH2\b/i.test(q)) yearless = { from: 7, to: 12, text: '下半年' };
-    else {
-      const mm = /(?<![\d年])(\d{1,2})\s*月(?!\s*\d{1,2}\s*[日号])/.exec(q);
-      if (mm && !groupBy.includes('month') && Number(mm[1]) >= 1 && Number(mm[1]) <= 12) yearless = { from: Number(mm[1]), to: Number(mm[1]), text: mm[0] };
-    }
-  }
+  const { period, unreadPeriod } = readPeriod(q, now, groupBy);
 
   const not = /(?:没有|还没|尚未|仍未|未|不再)\s*([一-鿿]{2})|\bnot (?:yet )?(\w+)|\bstill open\b/i.exec(q);
   const notIn = not ? (not[1] ?? not[2] ?? 'closed') : undefined;
@@ -178,7 +225,7 @@ export function readSetQuestion(question: string, routed: Pick<QuestionRoute, 'k
   const throughWeek = wk ? Number(wk[1] ?? wk[2] ?? wk[3]) : undefined;
   const company = /全公司|所有事业部|各个?事业部|每个事业部|整个公司|全集团|\bcompany-wide\b|\bwhole company\b|\ball divisions\b|\bacross the company\b/i.test(q);
   const rest = q.replace(ASKING_WORDS, ' ').replace(/[，。？?！!、：:；;,.]/g, ' ').replace(/\s+/g, ' ').trim();
-  return { op, groupBy: [...new Set(groupBy)], threshold, atLeast, asOf, company, yearless, asks: askedKind(q), notIn, throughWeek, rest };
+  return { op, groupBy: [...new Set(groupBy)], threshold, atLeast, asOf, company, period, unreadPeriod, asks: askedKind(q), notIn, throughWeek, rest };
 }
 
 /** A row the computed set lists: one claim, its date, its value and every source behind it. */
@@ -503,10 +550,11 @@ export async function computeClaimSet(
   question: string,
   routed: Pick<QuestionRoute, 'kind' | 'range'>,
   named: string[],
+  opts: { now?: string } = {},
 ): Promise<ComputedSet | null> {
   const started = Date.now();
-  const read = readSetQuestion(question, routed);
-  if (!read) return null;
+  const read = readSetQuestion(question, routed, opts.now ?? todayIso());
+  if (!read || read.unreadPeriod) return null;
   const typed = await typedColumns(store);
   if (!typed.attribute || !typed.effective) return null; // a store before claim state: nothing to compute over
   // a merged spelling is its survivor: as scope, as what is asked about, and as the subject of a claim filed under it
@@ -647,19 +695,11 @@ export async function computeClaimSet(
     matched = cands.filter((c) => (subjects.has(c.subject_id) && (have.has(c.id) || !members.has(c.subject_id))) || (have.has(c.id) && c.value_num !== null));
   }
 
-  // the period: a year range from the router, or a yearless one of the data's year
+  // the period: the router's explicit range, else what the question's period words give; a value as of a day is read
+  // up to that day (the month the day is in is no window)
   const dateOf = (c: Cand) => toDateString(c.eff);
-  // the data's year: its latest report's, not the latest date a claim names (a plan may name next year)
-  const [latestReport] = await store.query<{ d: string | Date | null }>(`SELECT max(doc_date) AS d FROM documents WHERE doc_date IS NOT NULL`);
-  const dates = matched.map(dateOf).filter((d): d is string => Boolean(d)).sort();
-  const refYear = (toDateString(latestReport?.d ?? null) ?? dates[dates.length - 1])?.slice(0, 4) ?? null;
-  // a value as of a day is read up to that day: the month the day is in is no window
-  let from: string | null = read.asOf ? null : routed.range?.from?.slice(0, 10) ?? null;
-  let to: string | null = routed.range?.to?.slice(0, 10) ?? null;
-  if (read.yearless && refYear) {
-    from = `${refYear}-${pad(read.yearless.from)}-01`;
-    to = new Date(Date.UTC(Number(refYear), read.yearless.to, 0)).toISOString().slice(0, 10);
-  }
+  let from: string | null = read.asOf ? null : routed.range?.from?.slice(0, 10) ?? read.period?.from ?? null;
+  let to: string | null = read.asOf ? null : routed.range?.to?.slice(0, 10) ?? read.period?.to ?? null;
   if (read.throughWeek) {
     // the last report that names the week as its own, and the days of its week
     const [w] = await store.query<{ d: string | Date | null }>(
@@ -824,6 +864,7 @@ export async function computeClaimSet(
           const v = c.value_num!;
           return cmp === '<' ? v < value : cmp === '<=' ? v <= value : cmp === '>' ? v > value : v >= value;
         });
+        if (list.length === 0) return null;
       }
       items = list.length;
       let groups = new Map<string, Cand[]>();
@@ -925,6 +966,8 @@ export async function computeClaimSet(
     // an item no claim states as fact (only forecast, rumoured, suspected) is not counted; it is named apart
     const unfactual = list.filter((it) => !it.claims.some(isFact));
     list = list.filter((it) => it.claims.some(isFact));
+    // nothing found is not a computed zero: the question is answered as if no set were asked for
+    if (list.length === 0) return null;
     list.sort((a, b) => byDate(dateOf(a.claims[0]), dateOf(b.claims[0])) || a.key.localeCompare(b.key));
     items = list.length;
     const relatedCount = list.some((it) => it.about.size > 0) && (read.atLeast !== undefined || read.asks === 'person' || read.asks === 'organization');

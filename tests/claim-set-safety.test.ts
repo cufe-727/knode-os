@@ -209,6 +209,34 @@ describe('merged spellings are their survivor (review item 3)', () => {
   });
 });
 
+describe('periods read from today and the question\'s own year; an empty set is not computed (review item 4)', () => {
+  const customers = (x: Awaited<ReturnType<typeof set>>) => x!.lines.filter((l) => l.startsWith('- ')).map((l) => l.slice(2).split(' ')[0]).sort();
+
+  it('reads a yearless quarter in today\'s year, and gives nothing — not zero — when that quarter holds nothing', async () => {
+    // the latest report is of 2026-01: the fourth quarter asked on 2026-11-16 is 2026's, which holds no customer
+    expect(await set('宁德时代四季度有哪些客户？', ['catl'], '2026-11-16')).toBeNull();
+    expect(customers(await set('宁德时代四季度有哪些客户？', ['catl'], '2025-12-20'))).toEqual(['比亚迪']);
+    expect(await set('截至三季度宁德时代有几个客户？', ['catl'], '2026-11-16')).toBeNull();
+    expect(await set('截至三季度宁德时代有几个客户？', ['catl'], '2025-11-01')).toMatchObject({ answer: 2 });
+  });
+
+  it('reads last year, a fiscal year and the last N months from today', async () => {
+    expect(await set('去年宁德时代有几个客户？', ['catl'], '2026-11-16')).toMatchObject({ answer: 3 });
+    // in 2026 only a rumoured customer: nothing to count
+    expect(await set('去年宁德时代有几个客户？', ['catl'], '2027-03-01')).toBeNull();
+    expect(await set('宁德时代2025财年有几个客户？', ['catl'])).toMatchObject({ answer: 3 });
+    expect(customers(await set('宁德时代近3个月有哪些客户？', ['catl'], '2025-11-15'))).toEqual(['比亚迪']);
+  });
+
+  it('computes nothing for a period it cannot read', async () => {
+    expect(await set('宁德时代最近有哪些客户？', ['catl'])).toBeNull();
+  });
+
+  it('computes nothing when no item of the kind asked for is found', async () => {
+    expect(await set('宁德时代的客户有哪些人负责？', ['catl'])).toBeNull();
+  });
+});
+
 describe('the switches', () => {
   it('computes no set unless the workspace or the call turns computed sets on', async () => {
     const q = '宁德时代有哪些客户？';

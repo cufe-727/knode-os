@@ -162,6 +162,8 @@ export async function ask(
     second?: boolean;
     /** true / false: compute a set, count or value from the claims, whatever `retrieval.router.computedSets` says (docs/design/34 §1). */
     computed?: boolean;
+    /** The day relative periods ("去年", "三季度", "last 3 months") are read from (YYYY-MM-DD); default today. An evaluation of a past corpus sets its own. */
+    now?: string;
   } = {},
 ): Promise<AskResult> {
   const router = { ...defaultAskRouterConfig(), ...config.retrieval.router };
@@ -182,7 +184,7 @@ export async function ask(
   const named = await namedEntities(store, question);
   const computing = opts.computed ?? router.computedSets === true;
   const computed = computing && (routed.kind === 'list' || routed.kind === 'aggregate' || routed.kind === 'lookup')
-    ? await computeClaimSet(store, question, routed, named).catch(() => null)
+    ? await computeClaimSet(store, question, routed, named, { now: opts.now }).catch(() => null)
     : null;
   const env: RouteEnv = { store, config, embedder, llm, question, opts, queryVector, router, routed, named, computed };
 
