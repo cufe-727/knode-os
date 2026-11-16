@@ -459,3 +459,22 @@ describe('who a back-reference credits', () => {
     expect(await ctx.store.query(`SELECT 1 FROM relations WHERE tx_to IS NULL AND target_id = 'inc-001-t1'`)).toEqual([]);
   });
 });
+
+describe('an identifier written without its tail', () => {
+  it('is not kept apart from the same counter with a tail, and other counters or tails still are', async () => {
+    const { namesApartByCode } = await import('../src/graph/resolve.js');
+    expect(namesApartByCode('INC-006', 'INC-006-T1')).toBe(false);
+    expect(namesApartByCode('R-07', 'R-7')).toBe(false);
+    expect(namesApartByCode('INC-006-T1', 'INC-006-D2T1')).toBe(true);
+    expect(namesApartByCode('INC-006', 'INC-007-T1')).toBe(true);
+  });
+
+  it('lands on the incident that carries the short form', async () => {
+    const ctx = await workspace('short-id', {
+      'raw/docs/a.md': fm('a', '  - { name: INC-006-T1, type: event, aliases: ["INC-006"] }\n'),
+      'raw/docs/b.md': fm('b', '  - { name: INC-006, type: event }\n', '  - { subject: INC-006, statement: INC-006已由方杰修复, type: event }\n'),
+    });
+    const [row] = await ctx.store.query<{ subject_id: string }>(`SELECT subject_id FROM claims WHERE tx_to IS NULL AND statement = 'INC-006已由方杰修复'`);
+    expect(row.subject_id).toBe('inc-006-t1');
+  });
+});

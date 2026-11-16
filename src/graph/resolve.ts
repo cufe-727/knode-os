@@ -142,7 +142,8 @@ export function seriesCode(name: string): SeriesCode | null {
 export function namesApartByCode(a: string, b: string): boolean {
   const x = seriesCode(a);
   const y = seriesCode(b);
-  return Boolean(x && y && x.prefix === y.prefix && (x.counter !== y.counter || x.rest !== y.rest));
+  // INC-006 and INC-006-T1: one written without its tail is not another member (it may be that one)
+  return Boolean(x && y && x.prefix === y.prefix && (x.counter !== y.counter || (x.rest !== '' && y.rest !== '' && x.rest !== y.rest)));
 }
 
 /** Whether an entity carries one of these identifier keys among its spellings. */
