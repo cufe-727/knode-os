@@ -239,6 +239,27 @@ function countsOrLists(text: string): boolean {
 }
 
 /**
+ * One clause that describes what to find by what it did and then asks about it:
+ * "提出R-03的人现在在哪个组？", "修复INC-7的工程师现在负责哪个项目？". The
+ * description needs an act (提出, 修复, 收购 …), so "我们公司的人…" is no hop;
+ * the rest of the clause must ask something of what is found, not what it is
+ * ("提出R-03的人是谁" is one step) or how many there are ("…的工程师有几个").
+ */
+const HOP_ACT = '(?:提出|修复|修好|负责|处理|升级|上报|发现|引入|创建|编写|签署|签下|收购|推荐|介绍|发起|主导|批准|审批|接手|接替|创立|创办|投资|买入|卖出|提交|关闭|解决|跟进|对接|带领|领导|发布|起草|设计|开发|承销|举报)';
+const HOP_HEAD = '(?:人(?![均工民口才数员事气们类生物格性力体群权身脉选家心])|工程师|同事|员工|负责人|团队|小组|公司|企业|客户|项目|事故|供应商|分析师|机构|券商|基金)';
+const DESCRIBED_HOP = new RegExp(`^\\s*(?:请问|那么)?\\s*([^，,。？?；;的]{0,12}${HOP_ACT}[^，,。？?；;的]{1,16})的(?:那(?:一)?[个位家名])?${HOP_HEAD}([^，,。？?；;]{0,40})`);
+
+function describedHop(text: string): boolean {
+  const starts = [0, ...[...text.matchAll(CLAUSE_END)].map((m) => (m.index ?? 0) + m[0].length)];
+  return starts.some((at) => {
+    const m = DESCRIBED_HOP.exec(text.slice(at, at + 120));
+    if (!m) return false;
+    const [, description, rest] = m;
+    return !/^\s*(?:是|叫|为|有|就是)/.test(rest) && /哪|什么|谁|多少|几|吗|如何|怎么|怎样/.test(rest) && !countsOrLists(description);
+  });
+}
+
+/**
  * True when a later clause asks about something an earlier part identified
  * only by description, and that part is not itself a count or a list (which
  * the enumeration answers).
@@ -246,7 +267,7 @@ function countsOrLists(text: string): boolean {
 export function isChainQuestion(question: string): boolean {
   const chained = (text: string) => {
     const at = chainAt(text);
-    return at >= 0 && !countsOrLists(text.slice(0, at));
+    return (at >= 0 && !countsOrLists(text.slice(0, at))) || describedHop(text);
   };
   if (question.length <= HEAD_CHARS + TAIL_CHARS) return chained(question);
   // a long paste: the question is at its start or at its end (the last sentence or two)

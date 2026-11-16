@@ -110,6 +110,12 @@ const NOT_CHAINS: string[] = [
   'Who owns Instagram, and what is its revenue?',
   'Which customer spent the most last year, and what is its CEO\'s name?',
   'Which bank has the highest deposit rate, and is its app any good?',
+  // a described person or thing asked for itself, counted, ranked, or no act described: one step, not two
+  '提出R-03的人是谁？',
+  '修复INC-7的工程师有几个？',
+  '我们公司的人现在在哪个城市办公？',
+  '提出风险最多的人现在在哪个组？',
+  '收购了Figma的公司叫什么？',
 ];
 
 /** Real phrasing that does chain: the later clause asks about what the first part has to find. */
@@ -147,6 +153,10 @@ const CHAINS: string[] = [
   'Who is the largest shareholder of Xpeng? What else does he invest in?',
   '腾讯最大股东是谁，它还持有哪些公司',
   'Which bank underwrote Arm\'s IPO, and who is its CEO?',
+  // one clause: a description of what to find, then a question about it (the Ask re-check, 2026-11-16)
+  '提出R-03的人现在在哪个组？',
+  '修复INC-7的工程师现在负责哪个项目？',
+  '收购了Figma的公司今年营收多少？',
 ];
 
 describe('the chain rule on real phrasing', () => {
@@ -168,8 +178,18 @@ describe('the chain rule on real phrasing', () => {
       ['比亚迪去年营收最高的业务是什么，它的毛利率是多少？', 'aggregate'],
       ['平台组修复事故最多的工程师是谁，他今年调去哪了？', 'aggregate'],
       ['Which customer spent the most last year, and what is its CEO\'s name?', 'aggregate'],
+      ['修复INC-7的工程师有几个？', 'aggregate'],
+      ['提出风险最多的人现在在哪个组？', 'aggregate'],
     ];
     for (const [q, kind] of expected) expect(classifyQuestion(q).kind, q).toBe(kind);
+  });
+
+  it('reads a one-clause description hop as a chain, for the second round too', () => {
+    // src/search/second.ts looks further when isChainQuestion holds
+    for (const q of ['提出R-03的人现在在哪个组？', '修复INC-7的工程师现在负责哪个项目？']) {
+      expect(isChainQuestion(q), q).toBe(true);
+      expect(classifyQuestion(q), q).toMatchObject({ kind: 'multihop', by: 'rule:chain' });
+    }
   });
 
   it.each(CHAINS)('walks %s', (q) => {
