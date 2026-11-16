@@ -8,7 +8,7 @@ import { entityKeyKinds } from '../src/graph/normalize.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
 import type { ChatMessage, LlmClient } from '../src/llm/client.js';
 import { ask } from '../src/search/ask.js';
-import { computeClaimSet, SET_BLOCK_CHARS } from '../src/search/claimset.js';
+import { computeClaimSet, readSetQuestion, SET_BLOCK_CHARS } from '../src/search/claimset.js';
 import { classifyQuestion } from '../src/search/route.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
 
@@ -321,6 +321,22 @@ describe('a bounded block (review item 6)', () => {
     expect(block).toMatch(/1000 distinct organization/);
     expect(block).toMatch(/\d+ more lines not shown/);
     expect(res.facts.length).toBeLessThanOrEqual(defaultConfig().retrieval.router!.enumerateLimit);
+  });
+});
+
+describe('lookups stay lookups (review item 9)', () => {
+  const r = (q: string) => readSetQuestion(q, classifyQuestion(q), '2026-11-16');
+  it('reads a singular which-question as no set', () => {
+    expect(r('Which company acquired Northwind?')).toBeNull();
+    expect(r('Which P1 incidents did Northwind have?')).toMatchObject({ op: 'list' });
+    expect(r('Which people in Northwind fixed at least two incidents?')).toMatchObject({ op: 'list' });
+  });
+
+  it('reads a day in an event question as no value asked as of it', () => {
+    expect(r('宁德时代2025年11月7日那天发布了什么公告？')?.op).not.toBe('value');
+    expect(r('What did CATL announce on 2025-11-07?')?.op).not.toBe('value');
+    expect(r('截至2025年11月7日，平台组的订单库连接池上限是多少？')).toMatchObject({ op: 'value', asOf: '2025-11-07' });
+    expect(r('What was the pool limit of Northwind Platform as of 2025-03-01?')).toMatchObject({ op: 'value' });
   });
 });
 

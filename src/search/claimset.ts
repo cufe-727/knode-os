@@ -1,5 +1,6 @@
 import { Store } from '../store/db.js';
 import { toDateString } from '../store/temporal.js';
+import { isListQuestion } from './excerpts.js';
 import { QuestionRoute } from './route.js';
 import { typedColumns } from './enumerate.js';
 
@@ -204,7 +205,12 @@ export function readPeriod(q: string, now: string, groupBy: SetGroup[] = []): { 
 export function readSetQuestion(question: string, routed: Pick<QuestionRoute, 'kind'>, now = todayIso()): SetQuestion | null {
   const q = question;
   const asOf = asOfDate(q);
-  const listy = /哪些|哪几|列出|\bwhich\b|\blist\b/i.test(q);
+  // a list: 哪些 / 列出, or an English plural after which ("which incidents", "which people") — "which company
+  // acquired X" asks for one
+  const listy = /哪些|哪几|列出/.test(q) || isListQuestion(q) || /\bwhich (?:\w+ )?(?:people|persons|staff|children|men|women)\b/i.test(q);
+  // a value asked as of a day: a quantity or a setting, not what happened that day ("那天发布了什么公告")
+  const valueAsked = /多少|几|数值|水平|上限|下限|阈值|比例|\bhow (?:much|many)\b|\bwhat (?:is|was) the (?!\w+ (?:that|which)\b)[\w -]{0,40}\b(?:of|for|at)\b/i.test(q)
+    && !/发布|宣布|公告|发生|举行|召开|签署|\bannounc|\bhappen|\breleas|\bpublish|\bsign(?:ed)?\b|\bsaid\b/i.test(q);
   const counting = /几[起个位名家项次人]|多少[起个位名家项次人]|一共|总共|总数|\bhow many\b|\bnumber of\b|\bcount\b/i.test(q);
   let op: SetOp;
   if (/平均|均值|\baverage\b|\bmean\b/i.test(q)) op = 'mean';
@@ -212,7 +218,7 @@ export function readSetQuestion(question: string, routed: Pick<QuestionRoute, 'k
   else if (/最低|最小|\blowest\b|\bminimum\b/i.test(q)) op = 'min';
   else if (/总额|总和|累计|\bsum\b|\btotal (?:amount|value)\b/i.test(q)) op = 'sum';
   else if (counting) op = 'count';
-  else if (asOf && !listy) op = 'value';
+  else if (asOf && !listy && valueAsked) op = 'value';
   else if (listy || routed.kind === 'list' || routed.kind === 'aggregate') op = 'list';
   else return null;
 
