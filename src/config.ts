@@ -436,6 +436,13 @@ export interface RemoteApiConfig {
    */
   evalOfferSeconds?: number;
   /**
+   * The most an evaluation run's tasks and results may take in serve's queue
+   * (`<data root>/.knode/eval-queue/`, docs/design/32 §5), in MB (default
+   * 2048). Past it a run's publish is refused with that word; results already
+   * collected go first.
+   */
+  evalQueueMB?: number;
+  /**
    * The remote models whose verdicts may merge or reject without a person
    * (`review.llmJudge` / `review.claimMerge` set to auto): model labels as a
    * worker reports them ("codex:gpt-6.1-sol"), or a prefix ending in * ("codex:*").

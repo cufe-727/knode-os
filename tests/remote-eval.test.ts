@@ -465,8 +465,8 @@ describe('a run that waits for workers (docs/design/32 §3)', () => {
     const err = await runEval({ ...common, packs: [packDir], systems: ['closed-book'], runDir, remote: remoteOpts(), waitMinutes: 0.03, waitCheckMs: 50 }).catch((e) => e);
     expect(err).toBeInstanceOf(WaitLimitError);
     expect(new RunStore(runDir).allAnswers()).toEqual([]);
-    // its pieces are withdrawn from serve
-    expect((await runStatus('limit')).run).toEqual({ waiting: 0, leased: 0 });
+    // its pieces stay in serve, which keeps them (docs/design/32 §5): a worker may take them, and the resume collects them
+    expect((await runStatus('limit')).run.waiting).toBeGreaterThan(0);
     startWorker('w7', {}, 'codex:2,claude:1');
     await runEval({ ...common, packs: [packDir], systems: ['closed-book'], runDir, remote: remoteOpts() });
     const lines = fs.readFileSync(path.join(runDir, 'answers.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l) as { key: string; error?: string });

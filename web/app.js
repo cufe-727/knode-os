@@ -1542,8 +1542,9 @@ const STAGES = {
   summarize: { title: 'Summarize', icon: '¶', about: 'one summary page per document' },
   translate: { title: 'Translate', icon: '文', about: 'into the primary content language' },
   review: { title: 'Review', icon: '⚖', about: 'judge calls: duplicate entities and claims' },
+  evaluation: { title: 'Evaluation', icon: '◎', about: "evaluation runs' model calls and agent sessions, kept in serve's queue until a slot takes them and their run collects the result (the server's, shown in every workspace)" },
 };
-const UNIT_WORDS = { documents: ['document', 'documents'], chunks: ['chunk', 'chunks'], translations: ['translation', 'translations'], calls: ['call', 'calls'] };
+const UNIT_WORDS = { documents: ['document', 'documents'], chunks: ['chunk', 'chunks'], translations: ['translation', 'translations'], calls: ['call', 'calls'], pieces: ['piece', 'pieces'] };
 const WORK_KIND_WORDS = { extract: 'Extract', summarize: 'Summarize', translate: 'Translate', judge: 'Review', embed: 'Embed', session: 'Research', 'eval-call': 'Eval call', 'eval-session': 'Eval agent' };
 const JOB_KIND_WORDS = { study: 'Study', research: 'Page', init: 'Initialize', ask: 'Ask' };
 const SCHEDULE_WORDS = {

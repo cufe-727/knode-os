@@ -26,7 +26,7 @@ import type { WorkspaceServices } from './app.js';
  * the database says, and the rest is empty.
  */
 
-export type TaskStageId = 'index' | 'embed' | 'extract' | 'summarize' | 'translate' | 'review';
+export type TaskStageId = 'index' | 'embed' | 'extract' | 'summarize' | 'translate' | 'review' | 'evaluation';
 
 export interface TaskStage {
   id: TaskStageId;
@@ -34,7 +34,7 @@ export interface TaskStage {
   enabled: boolean;
   /** Work waiting, counted in `unit`. */
   waiting: number;
-  unit: 'documents' | 'chunks' | 'translations' | 'calls';
+  unit: 'documents' | 'chunks' | 'translations' | 'calls' | 'pieces';
   /** Model calls out right now. */
   inFlight: number;
   /** Done in the last hour: documents written, pages written, vectors… in the stage's own unit. */
@@ -62,6 +62,14 @@ export interface InFlightTask {
   class: WorkClass;
   /** The pool the task requires (an evaluation run's `--pool`); null: any. */
   pool: string | null;
+}
+
+export interface EvalQueueRow {
+  run: string;
+  waiting: number;
+  leased: number;
+  uncollected: number;
+  oldestSeconds: number | null;
 }
 
 export interface TaskWorker {
@@ -148,6 +156,12 @@ export interface TasksSnapshot {
   processing: { running: boolean; since: string | null; by: string | null } | null;
   stages: TaskStage[];
   inFlight: InFlightTask[];
+  /**
+   * Evaluation runs' pieces in serve's queue (docs/design/32 §5), by run:
+   * waiting for a slot, out, and done with results the run has not collected;
+   * null when nothing is there. The server's, shown in every workspace.
+   */
+  evaluation: EvalQueueRow[] | null;
   workers: TaskWorker[];
   jobs: TaskJob[];
   activity: { running: ActivityItem[]; recent: ActivityItem[] };
@@ -193,6 +207,23 @@ function jobTitle(kind: string, target: string | null, query: string | null, pay
     if (typeof payload.topic === 'string') return payload.topic.slice(0, 160);
   }
   return target || query || kind;
+}
+
+/** Both evaluation kinds' pieces by run, or null when no run has any here. */
+export function evalQueueRows(statuses: (import('../work/eval.js').EvalStatus | undefined)[]): EvalQueueRow[] | null {
+  const rows = new Map<string, EvalQueueRow>();
+  for (const s of statuses) {
+    for (const r of s?.runs ?? []) {
+      const row = rows.get(r.run) ?? { run: r.run, waiting: 0, leased: 0, uncollected: 0, oldestSeconds: null };
+      row.waiting += r.waiting;
+      row.leased += r.leased;
+      row.uncollected += r.uncollected;
+      if (r.oldestSeconds !== null) row.oldestSeconds = Math.max(row.oldestSeconds ?? 0, r.oldestSeconds);
+      rows.set(r.run, row);
+    }
+  }
+  const list = [...rows.values()].filter((r) => r.waiting + r.leased + r.uncollected > 0).sort((a, b) => b.waiting + b.leased - (a.waiting + a.leased) || a.run.localeCompare(b.run));
+  return list.length ? list : null;
 }
 
 export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices | null): Promise<TasksSnapshot> {
@@ -286,6 +317,19 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
       failed: sumFailed(judge?.totals.failed), note: resting('judge'),
     },
   ];
+  // evaluation runs' pieces, durable in serve's queue: shown once there is any
+  const evalRows = evalQueueRows(evalWork);
+  if (evalRows) {
+    const store = evalWork.find((e) => e?.store)?.store ?? null;
+    const age = (s: number | null) => (s === null ? '' : s < 120 ? ` (oldest ${s} s)` : ` (oldest ${Math.round(s / 60)} min)`);
+    const where = store ? (store.durable ? `kept in serve's queue, ${(store.bytes / 1024 ** 2).toFixed(1)} of ${Math.round(store.maxBytes / 1024 ** 2)} MB` : `in memory only${store.reason ? `: ${store.reason}` : ''}`) : '';
+    stages.push({
+      id: 'evaluation', enabled: true, unit: 'pieces', waiting: evalRows.reduce((n, r) => n + r.waiting, 0), inFlight: evalRows.reduce((n, r) => n + r.leased, 0),
+      doneLastHour: null, callsLastHour: null, failed: evalWork.reduce((n, e) => n + sumFailed(e?.totals.failed), 0),
+      note: [...evalRows.slice(0, 4).map((r) => `run ${r.run}: ${[r.waiting ? `${r.waiting} waiting${age(r.oldestSeconds)}` : '', r.leased ? `${r.leased} out` : '', r.uncollected ? `${r.uncollected} done, not collected` : ''].filter(Boolean).join(', ')}`),
+        ...(evalRows.length > 4 ? [`and ${evalRows.length - 4} more runs`] : []), where].filter(Boolean).join(' · '),
+    });
+  }
 
   const inFlight: InFlightTask[] = [
     ...(labeling?.leases ?? []).map((l) => ({
@@ -434,6 +478,7 @@ export async function tasksSnapshot(ctx: AppContext, services: WorkspaceServices
     processing,
     stages,
     inFlight,
+    evaluation: evalRows,
     workers,
     jobs,
     activity,

@@ -197,6 +197,34 @@ describe('GET /api/tasks', () => {
     expect(t.serving).toBe(true);
   });
 
+  it('shows evaluation runs\' pieces waiting in serve\'s durable queue, by run (docs/design/32 §5)', async () => {
+    const { EvalWork } = await import('../src/work/eval.js');
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-tasks-eval-'));
+    const evalWork = new EvalWork(root, { retryMs: 0 });
+    try {
+      const agent = { family: 'codex' as const, model: 'gpt-test', effort: null, speed: null };
+      const spec = (key: string) => ({ kind: 'eval-call' as const, run: 'bench-1', key, eligible: 'any' as const, pool: null, label: key, agent, prompt: 'p', schema: null, timeoutMs: 60_000 });
+      evalWork.publish([spec('piece-0001'), spec('piece-0002'), spec('piece-0003')]);
+      const who = { worker: 'laptop/w1/eval-codex#1', backend: 'codex', remote: true, pool: 'laptop' };
+      const [done] = await evalWork.calls.lease(who);
+      await evalWork.calls.complete(done.id, who, { ok: true, text: 'x' });
+      await evalWork.calls.lease(who);
+      const services = {
+        mcp: () => null, kickResearch: () => {}, track: <T>(job: Promise<T>) => job,
+        processing: { state: () => ({ running: true, since: null, by: null }) },
+        work: { status: async () => ({ shares: { extract: 3, summarize: 1, translate: 1, eval: 1 }, kinds: { 'eval-call': await evalWork.calls.status(), 'eval-session': await evalWork.sessions.status() }, workers: [] }) },
+      } as unknown as Parameters<typeof tasksSnapshot>[1];
+      const t = await tasksSnapshot(ws, services);
+      expect(t.evaluation).toEqual([{ run: 'bench-1', waiting: 1, leased: 1, uncollected: 1, oldestSeconds: expect.any(Number) }]);
+      const stage = t.stages.find((s) => s.id === 'evaluation')!;
+      expect(stage).toMatchObject({ waiting: 1, inFlight: 1, unit: 'pieces' });
+      expect(stage.note).toMatch(/run bench-1: 1 waiting \(oldest \d+ s\), 1 out, 1 done, not collected · kept in serve's queue, [\d.]+ of 2048 MB/);
+    } finally {
+      evalWork.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('belongs to the ingest group, as the labeling status does; explore and suggest to search', () => {
     expect(apiGroupOf('GET', '/api/tasks')).toBe('ingest');
     expect(apiGroupOf('GET', '/api/search/explore')).toBe('search');

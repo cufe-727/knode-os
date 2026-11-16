@@ -6,7 +6,8 @@ import type { EvalAgent } from '../work/broker.js';
 import { readArchive } from '../work/eval-archive.js';
 import type { FailureKind } from '../labeling/failures.js';
 import type { TaskOutcome, WorkerIdentity } from '../labeling/scheduler.js';
-import { EVAL_FAMILIES, EvalFamily, EvalRunStatus, EvalSpec, EvalWork } from '../work/eval.js';
+import { DEFAULT_TASK_TTL_MS, EVAL_FAMILIES, EvalFamily, EvalRunStatus, EvalSpec, EvalWork } from '../work/eval.js';
+import { EvalStoreFullError } from '../work/eval-store.js';
 import { isEvalKind } from '../work/kinds.js';
 import { offeredRemotely } from '../work/config.js';
 
@@ -17,9 +18,17 @@ import { offeredRemotely } from '../work/config.js';
  *
  *   GET  /eval/v1/status[?run=<id>]      whether eval work is offered to remote workers, the slots online per kind
  *                                        (each with its CLI, whether it is on this machine and whose run it serves),
- *                                        and the run's pieces waiting and out
- *   POST /eval/v1/offer                  {spec}: held open (whitespace every 10 s) until the piece is answered,
- *                                        stuck or cancelled; closing it cancels the piece
+ *                                        the run's pieces waiting and out, and `tasks`: where tasks are kept
+ *                                        (docs/design/32 §5; a serve from stage 1 has no `tasks`)
+ *   POST /eval/v1/tasks                  {run, scope?, deadlineMs?, specs: [...]}: publish a batch (at most 200);
+ *                                        each answer is its task's state, or the result kept for its key
+ *   POST /eval/v1/tasks/poll             {run, keys, waitMs?}: what became of them, held (at most 25 s) until
+ *                                        one is done; keys serve does not have come back as `missing`
+ *   POST /eval/v1/runs/<run>/detach      the run went away: what only it can serve is dropped, the rest stays
+ *   DELETE /eval/v1/runs/<run>[?scope=]  `eval drop`: every task and result of the run removed
+ *   POST /eval/v1/offer                  stage 1's held offer, kept for a run from before stage 2: {spec},
+ *                                        held open (whitespace every 10 s) until the piece is answered, stuck
+ *                                        or cancelled; closing it cancels the piece
  *   HEAD|PUT /eval/v1/archives/<sha256>  a file agent's folder (src/work/eval-archive.ts), before its session is offered
  *   POST /eval/v1/runs/<run>/cancel      every piece of a run: leases end at the next renewal, session tokens now
  *   POST /eval/v1/slots/lease|complete|renew|release
@@ -32,6 +41,11 @@ import { offeredRemotely } from '../work/config.js';
  */
 
 const KEEPALIVE_MS = 10_000;
+const MAX_BATCH = 200;
+const MAX_POLL_KEYS = 5_000;
+const MAX_POLL_MS = 25_000;
+/** The protocol of `/eval/v1/tasks` (docs/design/32 §5): a run that finds no `tasks.version` in status uses `/offer`. */
+export const EVAL_TASKS_VERSION = 2;
 const MAX_ARCHIVE_UPLOAD = 1024 ** 3;
 const MAX_TIMEOUT_MS = 6 * 3_600_000;
 
@@ -141,13 +155,16 @@ export function mountEvalProducer(app: Hono<any>, deps: EvalProducerDeps): void 
     if (!tokenMatches(presented, deps.token)) return c.json({ error: 'eval: missing or invalid bearer token (the data root\'s .knode/mcp-token)' }, 401);
     await next();
   });
-  api.onError((err, c) => c.json({ error: err instanceof Error ? err.message : String(err) }, err instanceof BadSpec ? 400 : 500));
+  // the store at its bound is serve's to say plainly: 507, and the run stops with it
+  api.onError((err, c) => c.json({ error: err instanceof Error ? err.message : String(err) }, err instanceof BadSpec ? 400 : err instanceof EvalStoreFullError ? 507 : 500));
 
   const offered = () => offeredRemotely(deps.config(), 'eval-call');
 
   api.get('/status', (c) => {
     const run = c.req.query('run');
+    if (run && RUN_RE.test(run)) deps.work.attach(run);
     return c.json({
+      tasks: { version: EVAL_TASKS_VERSION, ...deps.work.storeStatus() },
       offered: offered(),
       online: {
         'eval-call': Object.fromEntries(EVAL_FAMILIES.map((f) => [f, deps.work.calls.online(f)])),
@@ -221,6 +238,66 @@ export function mountEvalProducer(app: Hono<any>, deps: EvalProducerDeps): void 
     let released = 0;
     for (const source of deps.work.sources) released += await source.release(ids.filter((id) => source.holds(id)), who);
     return c.json({ released });
+  });
+
+  const runOf = (v: unknown) => {
+    const run = text(v, 120);
+    if (!RUN_RE.test(run)) throw new BadSpec('run must be a run id');
+    return run;
+  };
+  const scopeOf = (v: unknown) => {
+    if (v == null || v === '') return null;
+    const scope = text(v, 64);
+    if (!/^[0-9a-f]{8,64}$/.test(scope)) throw new BadSpec('scope must be a hex digest');
+    return scope;
+  };
+
+  api.post('/tasks', async (c) => {
+    const b = await json(c);
+    const run = runOf(b.run);
+    const scope = scopeOf(b.scope);
+    if (!Array.isArray(b.specs) || b.specs.length > MAX_BATCH) throw new BadSpec(`specs must be a list of at most ${MAX_BATCH}`);
+    const specs = b.specs.map((spec) => evalSpecOf({ spec }));
+    for (const spec of specs) {
+      if (spec.run !== run) throw new BadSpec(`spec ${spec.key} is of run ${spec.run}, not ${run}`);
+      if (spec.kind === 'eval-session' && spec.archive && !deps.work.archives.file(spec.archive.sha256)) {
+        throw new BadSpec(`archive ${spec.archive.sha256.slice(0, 12)} is not here: upload it first`);
+      }
+    }
+    const ttl = Math.min(7 * 24 * 3_600_000, Math.max(1_000, Math.trunc(Number(b.deadlineMs) || DEFAULT_TASK_TTL_MS)));
+    deps.work.attach(run);
+    const published = deps.work.publish(specs, { deadline: Date.now() + ttl, scope });
+    return c.json({ tasks: published.map(({ key, published: p }) => ({ key, state: p.state, ...(p.outcome ? { outcome: p.outcome } : {}) })) });
+  });
+
+  api.post('/tasks/poll', async (c) => {
+    const b = await json(c);
+    const run = runOf(b.run);
+    const keys = Array.isArray(b.keys) ? b.keys.map((k) => text(k, 64)).filter((k) => KEY_RE.test(k)) : [];
+    if (keys.length > MAX_POLL_KEYS) throw new BadSpec(`at most ${MAX_POLL_KEYS} keys a poll`);
+    const waitMs = Math.min(MAX_POLL_MS, Math.max(0, Math.trunc(Number(b.waitMs) || 0)));
+    deps.work.attach(run);
+    let found = deps.work.collect(run, keys);
+    if (!found.done.length && !found.missing.length && waitMs > 0 && keys.length) {
+      await deps.work.settled(run, keys, waitMs, c.req.raw.signal);
+      deps.work.attach(run);
+      found = deps.work.collect(run, keys);
+    }
+    return c.json(found);
+  });
+
+  api.post('/runs/:run/detach', (c) => {
+    const run = runOf(c.req.param('run'));
+    const n = deps.work.detachRun(run);
+    if (n) log(`eval run ${run} went away: ${n} piece(s) only it could serve dropped; the rest wait for its resume`);
+    return c.json({ dropped: n });
+  });
+
+  api.delete('/runs/:run', (c) => {
+    const run = runOf(c.req.param('run'));
+    const removed = deps.work.dropRun(run, scopeOf(c.req.query('scope')));
+    if (removed) log(`eval run ${run} dropped: ${removed} task(s) and their results removed`);
+    return c.json({ removed });
   });
 
   api.post('/offer', async (c) => {
