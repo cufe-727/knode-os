@@ -54,49 +54,102 @@ Cost: the same single completion, one embedding, two SQL queries over the match 
 
 ## 3. Multi-hop: resolve → relations → read
 
-`src/search/walk.ts` starts from the entities the question names and, for at most `retrieval.router.maxHops` hops (4; 3 before 2026-11-15, and a workspace whose config holds 3 keeps it), reads the live relations of every entity on the frontier (the heaviest 150 of each, so a hub cannot crowd out the one relation a person has), scores them, and moves to the far ends of the ones it keeps. A relation scores by
-- the question's terms that its type, description and far end hold. The near end's own name is left out of the description, the spellings of the named entities are left out of the question (事业部 of 第七事业部 would match every sibling group), and each predicate the question uses is widened to its other spellings (处理好 / 修复 / fixed, 名下 / 盯着 / 负责, 投产 / 上线, 预警 / 提出, 隐患 / 风险, 故障 / 事故, 调到 / 调入, 接手, 升级 / 投诉: verbs and relation nouns, no domain words). Each term weighs by how few of the hop's candidates hold it, and a branch may use a term only as often as the question does: 升级 twice in "修复过一起…升级的事故…另一个组升级过事故", once in "升级的那起事故", so an escalation does not lead to the customer's next escalation unless the question asks for it.
-- its far end lying within two relations of another entity the question names than the one its branch started from. "（第七事业部）华鼎零售升级的那起P1事故" then prefers the customer's incident whose group belongs to the seventh division over its heavier incidents in other divisions. Each named entity weighs as a term does, by how few candidates it anchors.
+`src/search/walk.ts` starts from the entities the question names and, for at most `retrieval.router.maxHops` hops (4; 3 before 2026-11-15, and a workspace whose config holds 3 keeps it), reads relations of every entity on the frontier, scores them, and moves to the far ends of the ones it keeps.
 
-Every branch takes its best step and the five best of the rest join it (five on the first hop), so a hop holds at most ten. Past the first hop only a relation that holds a term or is anchored leads on. For each relation kept the walk reads one passage where both ends are mentioned together: the sentence that states the hop. The passages are ordered by chain: the best-scored step (scores add up along a branch) with the steps that led to it, from the first hop down, then the next best.
+- **What it reads.** Two sets per entity: the heaviest 150, and the 150 whose descriptions hold the most of the question's terms (as LIKE patterns, the heaviest among equals). A hub's heavy relations then cannot hide the light one the question asks about, and a hub cannot crowd out the one relation a person has.
+- **How a relation scores.**
+  - **Terms.** The question's terms that the relation's type, description and far end hold. The near end's own name is left out of the description, and the named entities' spellings are left out of the question (事业部 of 第七事业部 would match every sibling group). Each predicate the question uses is widened to the spellings that mean the same in general:
+    - 修复 / 修好 / 处理好 / 处理 / 解决 / fixed
+    - 负责 / 名下 / 盯着 / 跟进 / owner
+    - 接手 / 接管 / took over
+    - 提出 / 预警 / raised / flagged
+    - 风险 / 隐患 / risk
+    - 事故 / 故障 / 宕机 / incident / outage
+    - 上线 / 投产 / go-live
+    - 发布 / released
+    - 调到 / 调入 / 转岗 / transferred
+    - 升级 / escalated
+    - 客户 / customer
+    - 成员 / member
 
-`ask` then answers from a SAG search (design 04: chunk → entity → chunk expansion) plus those bridge passages. The top eight are the search's first four and the walk's first four, then the rest of each up to twelve: a chain's later hops are rarely what a search of the whole question finds. The walked relations are listed first among the facts ("Nimbus Freight acquired Borealis Logistics: … — raw/docs/deal.md"), with the claims about every entity reached. Still one completion: the walk needs no model, because its scoring is the question's own terms and the graph around the named entities.
+    Until 2026-11-16 they also held a benchmark's vocabulary: 升级 = 投诉, 发布 = 上线 = 交付, 提示 / 上报 = 提出, 加入 = 调入. Each term weighs by how few of the hop's candidates hold it. A branch may use a term only as often as the question does: 升级 twice in "修复过一起…升级的事故…另一个组升级过事故", once in "升级的那起事故".
+  - **Anchors.** A far end within two relations of another entity the question names than the one its branch started from scores like a term. "（第七事业部）华鼎零售升级的那起P1事故" then prefers the customer's incident whose group belongs to the seventh division over its heavier incidents elsewhere. Each named entity weighs by how few candidates it anchors.
+  - **Meaning and type.** See §3.1.
+- **What leads on.** A relation is kept only when it holds a term, is anchored, or (first hop) leads to one of a named entity's few siblings the question describes (§3.1). The first hop is held to this too: a question the walk cannot help gets nothing from it. Before 2026-11-16 the first hop kept the heaviest relations whatever they were: "宁德时代的人均产值是多少，它在行业里排第几" got five `competes_with` relations as facts.
+- **How many it keeps.** Every branch takes its best step (branches ranked by their path's score), and the five best of the rest join it, so a hop holds at most ten.
+- **The passage that states a hop.** Read near the relation's own sources: the document it was read from and those its evidence names (at most 20), the earliest of which dates it.
+  - Of the chunks that mention both ends (at most 200, read from the end mentioned less), the walk takes the one in the earliest document dated within 45 days before that source. That is the report of the week it happened, which a monthly summary the relation was read from restates.
+  - A co-mention long before the relation's first source, on a knowledge base that has mentioned both for years, is never taken.
+  - Else a chunk of that source; else the chunk the relation was read from.
+  - A document's date is its own, or else the day its claims state most often.
+  - Every read is bounded per step: on a synthetic finance-sized store (a hub with 6,594 relations and 23,520 mentions) the walk takes 149 ms for one hub and 386 ms for six, against 731 ms and 985 ms on main 7a299bf.
+- **Chain order.** The passages come chain by chain: the best-scored step (scores add up along a branch) with the steps that led to it, from the first hop down, then the next best.
+- **What the walk does not read.** The question's time window that routing reads (`questionRange`) does not constrain the walk. Only the ordering step (§3.1) reads a period, from the ordinal's own clause.
+
+`ask` (`multihopAnswer`) answers from a search plus those bridge passages.
+- **The search.** SAG when it has the question's embedding; otherwise (the embedder down, or keyword asked for) the caller's mode, whose hybrid search falls back to the keyword and graph channels.
+- **What else it runs.** What the lookup route would have run: the set computed from the claims, the depth-2 graph search, and the excerpts of a list question.
+- **Context order.** The top eight contexts are the search's first four and the walk's first four. The rest of each follow, and then the graph search's chunks, up to twelve.
+- **Facts.** The walk's computed ordering lines come first (§3.1), then the walked relations as the sources' facts ("Nimbus Freight acquired Borealis Logistics: … — raw/docs/deal.md"), then the claims about every entity reached.
+
+Still one completion: the walk needs no model.
 
 A first measurement (2026-11-15, the copy of the run's 10× index): deep-hop hit@8 0.22 → 0.72, complete chains 1 → 10 of 18; nonlexical-hop 0 → 5 complete chains, but hit@8 stayed at 0.06. From the division alone the walk could not tell which group or which incident was meant.
 
-### 3.1 Non-lexical hops (added 2026-11-15)
+### 3.1 Non-lexical hops (added 2026-11-15, revised 2026-11-16)
 
-A non-lexical question names only the division and describes the rest: "第一事业部管基础设施的那个组今年第二起最严重一档的故障，是谁处理好的？此人曾预警过一个隐患，眼下是谁在盯着那个隐患？". The reports never say 基础设施, 收款 or 拉新, so no term matches the group. "第二起" is an ordering over dated events, not a relation. Four additions answer it, all in the walk (`src/search/walk.ts`, `src/search/walk-order.ts`):
+A non-lexical question names only the division and describes the rest: "第一事业部管基础设施的那个组今年第二起最严重一档的故障，是谁处理好的？此人曾预警过一个隐患，眼下是谁在盯着那个隐患？". The reports never say 基础设施, 收款 or 拉新, so no term matches the group. "第二起" is an ordering over dated events, not a relation. What is built, all in the walk (`src/search/walk.ts`, `src/search/walk-order.ts`):
 
-- **An entity described, not named.** `ask` passes the question's embedding and model (`multihopAnswer`, one line). Among the relations of one type from one entity (a division's three `part_of` groups), a far end whose entity embedding (name, type, aliases, description) lies above its siblings' mean cosine to the question gains one point per standard deviation. On the benchmark the nearest group is the described one in 13 of 17 divisions, with small margins, so this is a preference, not a filter. It also orders the chains, so the described group's chain gives the first passages.
-- **An ordering step.** `ordinalInQuestion` reads "第N起/个/次…", "最近/最新…", "最早/首…", "上一起/前一次" and "the first … / the latest / the one before". It also reads the period around it ("今年 / this year", "本月 / this month", an explicit year), "最严重 / most severe" and a named level (P1, SEV2). The first hop at which one entity leads to two or more of the noun the ordinal is about (the first predicate family after it: 故障 → 事故) is ordered. Each such branch keeps the one the question names and drops the others it ordered; the step carries the note ("[picked as the 2nd of 4 P1 dated in 2025, by date (2025-04-28)]"), and so does its fact.
-  - **Dates:** a candidate's date is the earliest its own claims state, else the earliest start of its relations, else the date of the earliest document that mentions it. A document's date is its own, or the earliest its claims state.
+- **An entity described, not named (by meaning).** `ask` passes the question's embedding and model to the walk (one line in `multihopAnswer`).
+  - Among the relations of one type from one entity (a division's three `part_of` groups), a far end gains one point per standard deviation that its entity embedding (name, type, aliases, description) lies above its siblings' mean cosine to the question.
+  - It gains at most two points, under what a term held by few relations weighs (up to ~5). Uncapped, the nearest of 150 siblings gained about 12.
+  - It gains nothing when its cosine is below 0.3, so of two siblings both far from the question neither gains.
+  - A named entity's siblings, at most five, of which the question describes one this way are all walked on the first hop, the described one first; later hops (an ordering, a fix) may yet tell them apart.
+  - Vectors of another model than the question's are not read. With no vector, a described entity is not found, and the walk adds nothing for it.
+  - On the benchmark the nearest group is the described one in 13 of 17 divisions, with small margins: a preference, not a filter.
+- **Relations are not matched by meaning.** Relation wording is matched by the general predicate families of §3 only. Matching it by meaning, through the question's cosine to the claims that join the same two entities (70% of relations have one), was tried and dropped: deep-hop chains 11 → 9. The ontology's relation-type labels and synonyms (属于, 加入, 任职…) in the scored text gave no gain either.
+- **An ordering step.** `ordinalInQuestion` reads "第N起/个/次…", "最近/最新…", "最早/首…", "上一起/前一次" and "the first … / the latest / the one before". From the ordinal's own clause only, it also reads:
+  - a period: "今年 / this year", "本月 / this month", or a year written there ("周岚2024年加入清算组，清算组今年第一起事故" orders this year's);
+  - "最严重 / most severe";
+  - a named level (P1, SEV2).
+
+  The first hop at which one entity leads to two or more of the noun the ordinal is about (the first predicate family after it: 故障 → 事故) is ordered, over all of that entity's relations, read again in full up to 2000. More than that and no pick is made: the note says the set was too large. Each branch keeps the one the question names and drops the others it ordered.
+  - **Dates:** a candidate is dated by the event asked about: the claims and relations that state it (the spellings of the ordinal's noun), the latest of them for "the latest", the earliest for "the first". A product released in 2019 and again in 2026 was last released in 2026. When nothing states the event, it is dated by first sight (marked so): the earliest date its claims state, else its relations' starts, else the date of the earliest document that mentions it.
   - **Levels:** a candidate's level is the one its earliest claim states, dating an undated claim by its document. The reports contradict themselves: "本周新增P2事故INC-004-T1" in the week, "级别为P1" in the month's summary, so the week wins.
-  - **Periods:** "今年" is the latest year the candidates are dated in; the relative words are not read against today.
-  - **Missing dates:** a candidate with no date is left out of the order and counted in the note. When fewer remain than the position asks for, nothing is picked: the note says "not ordered: 第三起 asks for the 3rd, 2 P1 candidates are dated in 2025 (1 have no date)", and the walk goes on as if the question had not ordered.
-- **The kind of thing the question ends at.** The last clause, split at sentence ends and commas but not at a dash, may name an entity type: 项目 → project; 组 / 团队 → organization; 事故 / 故障 / 事件 → event. The words come from the ontology's type labels plus these nouns. A far end of that type then holds the cue like a term. "此人名下的那个项目" then reaches 司命系统 rather than the heavier incident the person "负责修复". A person is never cued, because nearly every chain asks 谁. Cues from every clause were measured and pull early hops toward later clauses (deep-hop 10 → 6 chains).
-- **The passage that states a hop:** of the chunks mentioning both ends, the one in the earliest dated document, the relation's own document first among equals. That is the report of the week it happened, not a monthly summary restating it. The relation's own document alone (v20 relation sources) did worse: it is often the summary.
+  - **Periods:** a relative period is read against the present: the day the question says it is asked as of ("截至2025年5月21日", "as of 2025-05-21"), else the date of the knowledge base's latest source up to today (a source's date: its own, or the earliest its claims state). On a knowledge base kept current that is this year. On the 10× reports, whose sources stop in December 2025, it is 2025, and the note says so: "dated in 2025 (this year: the knowledge base's latest date, 2025-12-05)". Before 2026-11-16 it was the latest year the candidates themselves were dated in.
+  - **Missing dates:** a candidate with no date is left out of the order and counted in the note. When fewer remain than the position asks for, nothing is picked, and the walk goes on as if the question had not ordered.
+  - **What the answer is told:** every branch's pick, or why there was none, with the order made ("in order: INC-001-T1 (2025-02-03), …"). It goes to the answer as a computed fact, apart from the sources' facts ("Ordered by the walk from the dates the sources state (no source states this order): 第二起 — 第一事业部平台组: INC-003-T1 — the 2nd of 4 P1 dated in 2025 …"), and in `route.walked.ordering`. The relation's own fact no longer carries the pick.
+- **The kind of thing the question ends at.** The last clause, split at sentence ends and commas but not at a dash, may name an entity type: 项目 → project; 组 / 团队 → organization; 事故 / 故障 / 事件 → event. The words come from the ontology's type labels plus these nouns. 组 counts only as a word (那个组, 另一个组), not inside 组合, 组件 or 投资组合. A far end of that type then holds the cue like a term: "此人名下的那个项目" reaches 司命系统 rather than the heavier incident the person "负责修复". A person is never cued, because nearly every chain asks 谁. Cues from every clause pull early hops toward later clauses (deep-hop 10 → 6 chains).
 
-Tried and dropped, measured on the same copy:
-- The ontology's relation-type labels and synonyms (属于, 加入, 任职…) added to the scored text: no gain, one deep-hop question worse. Most relations here are `related_to`.
-- Matching the relation's wording by meaning, through the best cosine of the question to the claims that join the same two entities (70% of relations have one): deep-hop complete chains 11 → 9.
-- The predicate families (处理好 / 修复 …) stay the wording match.
-
-**Measured 2026-11-15.** Set-up: a fresh no-model rebuild of the 10× workspace from its stored extractions (`src/bench/replay-build.ts` on main 7f44c8f), given the run's own bge-m3 vectors: chunks from the run's vector cache by content, and 704 of 806 entities and 16,865 of 16,874 claims from the run's index by name and statement. Then `ask()` with no model and the cached question vectors, ~18 questions per type. hit@8 is a gold document among the first eight contexts; gold-in-contexts is gold recall over all contexts; a chain is complete when every bridge entity (customer codes left out) is named in the facts.
+**Measured 2026-11-16, after the review fixes.** Set-up:
+- **The index:** a fresh no-model rebuild of the 10× workspace from its stored extractions (`src/bench/replay-build.ts` on main 7a299bf).
+- **Its vectors:** the run's own bge-m3 vectors: chunks from the run's vector cache by content, and 718 of 822 entities and 16,865 of 16,874 claims from the run's index by name and statement.
+- **The run:** `ask()` with no model and the cached question vectors, ~18 questions per type.
+- **The measures:**
+  - hit@8 is a gold document among the first eight contexts;
+  - gold-in-contexts is gold recall over all contexts;
+  - a chain is complete when every bridge entity (customer codes left out) is named in the relations and claims among the facts. The walk's ordering lines, which list candidates by name, are not counted.
 
 | type | hit@8 | gold in contexts | bridges named | chains complete |
 |---|---|---|---|---|
-| deep-hop, main | 0.78 | 0.28 | 0.77 | 10 / 18 |
-| deep-hop, this change | **0.89** | **0.32** | **0.84** | **11 / 18** |
-| nonlexical-hop, main | 0.11 | 0.08 | 0.37 | 5 / 18 |
-| nonlexical-hop, this change | **0.56** | **0.27** | **0.81** | **12 / 18** |
+| deep-hop, main 7a299bf | 0.89 | 0.31 | 0.86 | 11 / 18 |
+| deep-hop, this change | 0.83 | 0.30 | 0.87 | **12 / 18** |
+| nonlexical-hop, main 7a299bf | 0.67 | 0.34 | 0.94 | 16 / 18 |
+| nonlexical-hop, this change | 0.61 | 0.29 | 0.93 | 15 / 18 |
 
-All 196 questions of the other eleven types have byte-identical contexts, facts and route. The walk alone (same process, median of 3 runs) takes ~155 ms and 13–16 statements per question, against ~20 ms and 6–7 on main. Most of the increase is the passage choice (the co-mention read and the document dates) and the meaning read per hop. The whole `ask` measured 250–285 ms against 133–185 ms, but under a machine load that also moved the unchanged types from 188 to 272 ms.
+All 196 questions of the other eleven types have byte-identical contexts, facts and route.
+- **Deep-hop hit@8.** The two questions lost (d8-h5, d10-h5) had their gold report among the top eight only as an old co-mention. d8's first hop, 八部增长组—远景银行, is stated in week 43; main showed week 4, which mentions both but states another relation.
+- **Nonlexical chains.** The chain lost (d9-nh-risk-INC-021-D9T3) has no "raised" relation for R-106 in the index. It completed only while 上报 matched another relation in the beam's spare slots.
+- **Cost on the 10× index.**
+  - The walk alone (same process, median of 3 runs): 30–35 ms and 9–12 statements per question on main, 55–78 ms and 15–22 here. The increase is the sources' evidence and co-mention reads, the term-matching read, and the full read an ordering makes.
+  - `ask` as a whole: 41–44 statements per question on main, 60–67 here. It now also runs the graph search, the claim set and the excerpts the lookup route would.
 
-Where the 13 incomplete chains stop:
-- **Extraction (8 chains).** No fix relation INC-007-D2T1—林婷, 陈平—INC-003-D3T1, INC-001-D6T1—任杰. No "raised" relation for 方艳—R-45, 汤婷—R-58 or 尹婷—R-106: the reports' extracted relations only say who follows them. No customer shared by INC-003-D4T1 and INC-012-D4T2, or by INC-003-D10T1 and INC-012-D10T2.
-- **Entity resolution (3 chains).** Incident codes of different divisions are merged: INC-017-D6T3 into INC-017-D7T3, INC-010-D10T2 into the concept 退款卡单. 九部增长组's incident list holds INC-015-D7T3 and INC-017-D7T3, so its "second P1" is the wrong one.
-- **The walk (2 chains).** The customer's second incident among its ~40 is missed in h5r-C0 and d3-h5r-C0. h5r-C0 was complete on main: there the meaning preference among the customer's many incidents outweighs the division anchor. Capping it at one point measured the same in total.
+Where the 9 incomplete chains stop:
+- **Extraction (6).**
+  - No fix relation INC-007-D2T1—林婷 or INC-001-D6T1—任杰.
+  - No "raised" relation for 方艳—R-45 or 尹婷—R-106: the extracted relations only say who follows them.
+  - No customer shared by INC-003-D3T1 and INC-012-D3T2, or by INC-003-D10T1 and INC-012-D10T2.
+- **The walk (3).** A customer's second incident among its ~40 is not reached (h5r-C0, d3-h5r-C0, d10-h5r-C0). The anchor to the division competes with the meaning bonus among the customer's many incidents.
 
 ## 4. Fusion: optional rerank, current state
 
