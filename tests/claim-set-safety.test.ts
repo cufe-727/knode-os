@@ -573,6 +573,13 @@ describe('round three (C1-C7)', () => {
     expect(best!.lines.join('\n')).toMatch(/of another period length \(ytd\)/);
   });
 
+  it('C5: counts no fiscal quarter as the calendar quarter of its number', async () => {
+    expect(periodOf({ statement: '远帆公司2025财年第一季度营收40亿元', eff: '2025-02-10' })).toBeNull();
+    const total = await set('远帆公司2025年上半年营收合计多少？', ['yfx']);
+    expect(total).toMatchObject({ op: 'sum', answer: '95' });
+    expect(total!.lines.join('\n')).toMatch(/fiscal/);
+  });
+
   it('C2: reads a scale written after the currency', async () => {
     expect(await set('港华集团的最高营业额是多少？', ['hkx'])).toMatchObject({ op: 'max', answer: '7' });
     expect(await set('美联公司的最高营业额是多少？', ['usx'])).toMatchObject({ op: 'max', answer: '31' });

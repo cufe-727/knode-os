@@ -367,6 +367,10 @@ export function periodSpan(p: Period): { from: string; to: string } {
   }
 }
 
+/** A quarter, half or month of a fiscal year, which need not be the calendar's ("2025财年第一季度", "FY2025 Q1", "fiscal Q2"). */
+const fiscalPart = (st: string) =>
+  /财年|会计年度|\bFY\s?'?\d{2,4}\b|\bfiscal\b/i.test(st) && /季度|半年|\bQ[1-4]\b|\bH[12]\b|\bquarter\b|\bhalf\b|月/i.test(st);
+
 /** A running total from the year's start: "前三季度", "前8个月", "1-9月", "截至三季度末", "Q3 YTD", "9M"; the months it covers. */
 function runningMonths(st: string): number | null {
   let m = /前\s*([一二两三1-3])\s*(?:个)?季度|\bQ([1-3])\s*YTD\b|截[至止]\s*第?([一二三1-3])\s*季度末?/i.exec(st);
@@ -406,6 +410,9 @@ export function periodOf(c: { statement: string; valid_from?: string | Date | nu
   const eff = toDateString(c.eff ?? null);
   const year = /(\d{4})\s*(?:年|财年)/.exec(st)?.[1] ?? /\b(?:FY\s?)?((?:19|20)\d{2})\b/.exec(st)?.[1] ?? eff?.slice(0, 4);
   if (!year) return null;
+  // a quarter or half of a fiscal year ("2025财年第一季度", "FY25 Q1") is of a calendar this claim does not give:
+  // a company whose year starts in October has its first quarter in the calendar's last
+  if (fiscalPart(st)) return null;
   const running = runningMonths(st);
   if (running) return { gran: 'ytd', key: `${year}-${pad(running)}` };
   let m = /第?([一二三四1-4])\s*季度|\bQ([1-4])\b/i.exec(st);
@@ -1046,7 +1053,7 @@ async function computeWithin(
     const inScope = new Map(cands.map((c) => [c.id, c]));
     const replacedBy = new Map<string, Cand>();
     for (const c of matched) if (c.superseded_by && inScope.has(c.superseded_by)) replacedBy.set(c.superseded_by, inScope.get(c.superseded_by)!);
-    const left = { notFact: 0, replaced: 0, recalled: 0, noNumber: 0, units: new Map<string, number>(), grans: new Map<string, number>(), peers: new Map<string, number>() };
+    const left = { notFact: 0, replaced: 0, recalled: 0, noNumber: 0, fiscal: 0, units: new Map<string, number>(), grans: new Map<string, number>(), peers: new Map<string, number>() };
     const readings = new Map<string, Cand>();
     const periods = new Map<string, Period | null>();
     const conflicted = new Set<string>();
@@ -1065,6 +1072,8 @@ async function computeWithin(
       // a window asked is tested on the period the figure covers ("2024年下半年" stated in 2025 is no 2025 figure); a
       // value as of a day, on when it was stated (what was known that day)
       const covers = periodOf(c);
+      // a fiscal quarter without its days is in no calendar window
+      if (!read.asOf && !covers && (from || to) && fiscalPart(c.statement)) { left.fiscal++; continue; }
       if (!read.asOf && covers && (from || to)) {
         // a week belongs to the window its first day is in (its report may close in the next month); a longer period
         // must lie inside the window ("2024年下半年" is no part of 2025's first half)
@@ -1132,6 +1141,7 @@ async function computeWithin(
       left.notFact ? `${left.notFact} not stated as fact (a forecast, opinion or rumour, or suspected)` : '',
       left.replaced ? `${left.replaced} replaced for its own period by a later claim` : '',
       left.recalled ? `${left.recalled} only recalling an earlier value` : '',
+      left.fiscal ? `${left.fiscal} of a fiscal quarter or half whose calendar months are not recorded` : '',
       left.units.size ? `${[...left.units.values()].reduce((a, b) => a + b, 0)} in another unit (${[...left.units.keys()].join(', ')})` : '',
       left.grans.size ? `${[...left.grans.values()].reduce((a, b) => a + b, 0)} of another period length (${[...left.grans.keys()].join(', ')})` : '',
       left.noNumber ? `${left.noNumber} of the attribute with no numeric value recorded` : '',
