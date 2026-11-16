@@ -1,6 +1,6 @@
 import { builtinOntology } from '../graph/ontology.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
-import { toDateString } from '../store/temporal.js';
+import { SOURCE_SCOPE_KINDS, toDateString } from '../store/temporal.js';
 import { ClaimItem, SearchResult } from '../types.js';
 import { keywordTerms, termCount } from './search.js';
 import { asOfDate } from './claimset.js';
@@ -585,7 +585,8 @@ export function chainOrder(steps: WalkStep[]): number[] {
 
 /**
  * For each step, the passage that states it: the chunk the relation was read from (relations record it since v20);
- * else a passage of its source document (the one it was read from, or else the first its evidence names) that
+ * else a passage of its source document (the one it was read from, or else the first its evidence names in a
+ * source scope: a page knode wrote is no source, `SOURCE_SCOPE_KINDS`) that
  * mentions both ends, or either. Only a relation with no recorded source falls back to a chunk that merely
  * mentions both ends, and that passage says so: on a knowledge base where two names appear together daily, a
  * co-mention is no statement of the relation. One bounded read per step; no document needs a date.
@@ -598,7 +599,7 @@ async function bridgePassages(store: Store, steps: WalkStep[]): Promise<SearchRe
      JOIN relations r ON r.id = pair.rid
      CROSS JOIN LATERAL (
        SELECT COALESCE(r.document_id, (
-         SELECT dd.id FROM evidence ev JOIN scopes s ON s.id = ev.scope_id JOIN documents dd ON dd.path = s.key
+         SELECT dd.id FROM evidence ev JOIN scopes s ON s.id = ev.scope_id AND s.kind = ANY($4::text[]) JOIN documents dd ON dd.path = s.key
          WHERE ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL ORDER BY ev.tx_from, dd.id LIMIT 1)) AS doc
      ) src
      CROSS JOIN LATERAL (
@@ -619,7 +620,7 @@ async function bridgePassages(store: Store, steps: WalkStep[]): Promise<SearchRe
      ) x
      JOIN chunks c ON c.id = x.chunk_id
      JOIN documents d ON d.id = c.document_id`,
-    [steps.map((s) => s.relationId), steps.map((s) => s.sourceId), steps.map((s) => s.targetId)],
+    [steps.map((s) => s.relationId), steps.map((s) => s.sourceId), steps.map((s) => s.targetId), [...SOURCE_SCOPE_KINDS]],
   );
   const byStep = new Map(rows.map((r) => [Number(r.i) - 1, r]));
   const seen = new Set<string>();

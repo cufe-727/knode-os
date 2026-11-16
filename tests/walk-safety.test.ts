@@ -259,6 +259,30 @@ describe('the passage that states a hop', () => {
     expect(walk.bridges[0].content).toBe('2024年第12周：安娜开始负责轨道计划。');
   });
 
+  it('takes no generated page for the source of a relation whose only evidence is that page', async () => {
+    await entity('jh', '镜湖基金');
+    for (const [id, name, kind] of [['yf', '云帆物流', 'wiki-human'], ['qs', '青石建材', 'page']] as const) {
+      await entity(id, name);
+      const page = `wiki/entities/${id}.md`;
+      await store.query(`INSERT INTO documents (id, path, root, title, sha256, bytes, status) VALUES ($1, $2, 'wiki', $1, $1, 10, 'indexed')`, [`d-${id}`, page]);
+      await store.query(`INSERT INTO chunks (id, document_id, seq, content, token_count) VALUES ($1, $2, 0, $3, 3)`, [`c-${id}`, `d-${id}`, `${name}：镜湖基金投资了${name}。`]);
+      await store.query(`INSERT INTO scopes (id, kind, key, sha, status, applied_at) VALUES ($1, $2, $3, $1, 'active', now())`, [`s-${id}`, kind, page]);
+      for (const e of ['jh', id]) await store.query(`INSERT INTO entity_mentions (entity_id, chunk_id, document_id, scope_id) VALUES ($1, $2, $3, $4)`, [e, `c-${id}`, `d-${id}`, `s-${id}`]);
+      await store.query(`INSERT INTO relations (id, source_id, target_id, type, description, weight) VALUES ($1, 'jh', $2, 'invested_in', $3, 1)`, [`r-${id}`, id, `镜湖基金投资了${name}。`]);
+      await store.query(`INSERT INTO evidence (kind, target_id, scope_id, extractor, tx_from) VALUES ('relation', $1, $2, 'test', now())`, [`r-${id}`, `s-${id}`]);
+    }
+    const walk = await walkRelations(store, '镜湖基金投资了哪些公司？它们的负责人是谁', ['jh'], { maxHops: 1 });
+    expect(walk.steps.map((s) => s.target).sort()).toEqual(['云帆物流', '青石建材']);
+    for (const name of ['云帆物流', '青石建材']) {
+      const passage = walk.bridges.find((b) => b.trace?.bridgeEntities?.includes(name));
+      // a page knode wrote is no source: the passage is shown only as a co-mention, and says so
+      if (passage) {
+        expect(passage.trace?.coMention).toBe(true);
+        expect(passage.content).toMatch(/^\(mentions 镜湖基金 and /);
+      }
+    }
+  });
+
   it('reads a bounded number of rows for a hub mentioned in hundreds of chunks', async () => {
     const rows: number[] = [];
     const q0 = store.query.bind(store);
