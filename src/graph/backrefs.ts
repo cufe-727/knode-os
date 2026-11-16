@@ -39,7 +39,10 @@ import { nameCode } from './resolve.js';
  * (removed, replaced, re-extracted), with its trust and acl, its document and
  * passage as the relation's source. A run reads only the claims of documents
  * applied since the last run and of the report after each of them (cursor in
- * meta 'backrefs'), and disposes the links among those that no longer hold.
+ * meta 'backrefs'), and the claims whose link rests on an earlier report that
+ * changed or went since; it disposes the links among those that no longer
+ * hold, every link whose report is no longer in a periodic folder, and — the
+ * step turned off — every link.
  */
 
 /** "上周那起配置下发失败", "上周发生的登录失败事故", "last week's cache stampede": the description after the back-reference. */
@@ -158,7 +161,20 @@ export async function linkBackReferences(
   const stats: BackrefStats = { references: 0, resolved: 0, linked: 0, disposed: 0 };
   const setting = opts.config?.review?.backReferences;
   const periodic = (setting?.periodic ?? []).map((p) => p.replace(/\/+$/, ''));
-  if (!setting || (periodic.length === 0 && !setting.detect)) return stats;
+  const live = await store.query<{ id: string; key: string; sha: string; document: string | null; previous: string | null; document_id: string | null }>(
+    `SELECT id, key, sha, meta->>'document' AS document, meta->>'previous' AS previous, meta->>'documentId' AS document_id
+     FROM scopes WHERE kind = 'backref' AND status = 'active' ORDER BY id COLLATE "C"`,
+  );
+  const dispose = async (id: string) => {
+    await disposeScope(store, id, { actor: 'backref', reason: 'removed', log: false });
+    stats.disposed++;
+  };
+  // turned off: no link stays
+  if (!setting || (periodic.length === 0 && !setting.detect)) {
+    for (const s of live) await dispose(s.id);
+    if (live.length > 0) progress(`backref: off, ${live.length} links disposed`);
+    return stats;
+  }
 
   // the documents to read: applied since the last run, and the report after each of them
   const started = new Date().toISOString();
@@ -169,6 +185,16 @@ export async function linkBackReferences(
     cursor ? [cursor] : [],
   );
   const read = new Set(changed.map((d) => d.id));
+  // a link rests on two reports: the one with the fix (its parent scope goes with it) and the earlier one it
+  // was resolved from — a link whose earlier report changed or went is read again
+  if (cursor) {
+    const gone = await store.query<{ key: string }>(
+      `SELECT DISTINCT key FROM scopes WHERE kind IN ('doc', 'tier1') AND (applied_at > $1::timestamptz OR disposed_at > $1::timestamptz)`,
+      [cursor],
+    );
+    const touched = new Set(gone.map((g) => g.key));
+    for (const s of live) if (s.previous && touched.has(s.previous) && s.document_id) read.add(s.document_id);
+  }
   for (const d of changed) {
     if (!d.doc_date) continue;
     const dir = path.posix.dirname(d.path);
@@ -197,6 +223,9 @@ export async function linkBackReferences(
     folders.set(dir, yes);
     return yes;
   };
+
+  // a link whose report is no longer in a periodic folder goes
+  for (const s of live) if (s.document && !(await inSeries(s.document))) await dispose(s.id);
 
   const rows = read.size === 0 ? [] : await store.query<Omit<Ref, 'docDate' | 'acl'> & { doc_date: string | Date; said_at: string | Date | null; acl: unknown }>(
     `SELECT c.id AS "claimId", c.statement, c.subject_id AS "subjectId", c.object_id AS "objectId",
@@ -304,12 +333,12 @@ export async function linkBackReferences(
   }
   // among the claims read, links whose reading no longer holds go first
   const readClaims = [...new Set(rows.map((r) => r.claimId))];
-  const live = readClaims.length === 0 ? [] : await store.query<{ id: string; key: string; sha: string }>(
-    `SELECT id, key, sha FROM scopes WHERE kind = 'backref' AND status = 'active' AND key = ANY($1::text[]) ORDER BY id`,
+  const current = readClaims.length === 0 ? [] : await store.query<{ id: string; key: string; sha: string }>(
+    `SELECT id, key, sha FROM scopes WHERE kind = 'backref' AND status = 'active' AND key = ANY($1::text[]) ORDER BY id COLLATE "C"`,
     [readClaims],
   );
   const shaOf = (w: { incident: string; people: string[]; ref: Ref }) => crypto.createHash('sha256').update(`${w.incident}|${w.people.join(',')}|${w.ref.scopeId}`).digest('hex').slice(0, 24);
-  for (const s of live) {
+  for (const s of current) {
     const w = want.get(s.key);
     if (w && shaOf(w) === s.sha) continue;
     await disposeScope(store, s.id, { actor: 'backref', reason: 'replaced', log: false });

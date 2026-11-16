@@ -401,3 +401,36 @@ describe('owner and state claims the model gave no object', () => {
     expect(statementObject('R-03状态为已关闭', '状态', ['R-03'])).toBe('');
   });
 });
+
+describe('back-reference links that no longer hold', () => {
+  const rep = (date: string, fm: string) => dated('平台组周报', date, fm);
+  const docs = {
+    'raw/docs/周报/平台组/w05.md': rep('2025-02-03', 'entities:\n  - { name: INC-001-T1, type: event }\nclaims:\n  - { subject: INC-001-T1, statement: INC-001-T1为P1级支付超时事故, type: event }\n'),
+    'raw/docs/周报/平台组/w06.md': rep('2025-02-10', 'entities:\n  - { name: 方杰, type: person }\nclaims:\n  - { subject: 方杰, statement: 上周那起支付超时已由方杰修复, type: event }\n'),
+  };
+  const linked = async (ctx: AppContext) => (await ctx.store.query(`SELECT 1 FROM relations WHERE tx_to IS NULL AND target_id = 'inc-001-t1'`)).length;
+
+  it('goes with the earlier report it was resolved from, in an incremental run', async () => {
+    const { linkBackReferences } = await import('../src/graph/backrefs.js');
+    const ctx = await workspace('stale-previous', docs);
+    const config = { review: { ...ctx.config.review, backReferences: { periodic: ['raw/docs/周报'] } } };
+    expect((await linkBackReferences(ctx.store, { config })).linked).toBe(1);
+    fs.rmSync(path.join(ctx.dataDir, 'raw/docs/周报/平台组/w05.md'));
+    await sync(ctx, { llmGraph: false });
+    expect(await linkBackReferences(ctx.store, { config })).toMatchObject({ disposed: 1, linked: 0 });
+    expect(await linked(ctx)).toBe(0);
+  });
+
+  it('goes when the workspace turns the step off', async () => {
+    const { linkBackReferences } = await import('../src/graph/backrefs.js');
+    const ctx = await workspace('stale-off', docs);
+    const config = { review: { ...ctx.config.review, backReferences: { periodic: ['raw/docs/周报'] } } };
+    expect((await linkBackReferences(ctx.store, { config })).linked).toBe(1);
+    expect(await linkBackReferences(ctx.store, { config: { review: { ...ctx.config.review } } })).toMatchObject({ disposed: 1 });
+    expect(await linked(ctx)).toBe(0);
+    // and a folder no longer listed loses its links the same way
+    expect((await linkBackReferences(ctx.store, { config, full: true })).linked).toBe(1);
+    expect(await linkBackReferences(ctx.store, { config: { review: { ...ctx.config.review, backReferences: { periodic: ['raw/docs/月报'] } } } })).toMatchObject({ disposed: 1 });
+    expect(await linked(ctx)).toBe(0);
+  });
+});
