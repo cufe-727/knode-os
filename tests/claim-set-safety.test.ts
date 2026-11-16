@@ -534,6 +534,27 @@ describe('periods a figure covers (re-check item 5)', () => {
 });
 
 describe('round three (C1-C7)', () => {
+  const quarter = (n: number) => ({ from: d(`2025-${String((n - 1) * 3 + 1).padStart(2, '0')}-01`), to: d(`2025-${String(n * 3).padStart(2, '0')}-${n === 1 || n === 4 ? 31 : 30}`) });
+  beforeAll(async () => {
+    await addEntity('hkx', '港华集团', 'organization');
+    await addEntity('usx', '美联公司', 'organization');
+    await addDoc('hk1', '港华集团季报', d('2025-10-30'), '港华集团营业额。', ['hkx']);
+    await addDoc('us1', '美联公司季报', d('2025-10-30'), '美联公司营业额。', ['usx']);
+    // a scale written after the currency
+    await addClaim('hk1', 'hkx', '港华集团2025年一季度营业额50亿港元', { attribute: '营业额', num: 5e9, unit: 'HK$', at: d('2025-04-20'), ...quarter(1) });
+    await addClaim('hk1', 'hkx', '港华集团2025年二季度营业额6 bn', { attribute: '营业额', num: 6, unit: 'HK$ bn', at: d('2025-07-20'), ...quarter(2) });
+    await addClaim('hk1', 'hkx', '港华集团2025年三季度营业额7 bn', { attribute: '营业额', num: 7, unit: 'HK$ bn', at: d('2025-10-20'), ...quarter(3) });
+    await addClaim('us1', 'usx', '美联公司2025年一季度营业额280亿美元', { attribute: '营业额', num: 28e9, unit: 'USD', at: d('2025-04-20'), ...quarter(1) });
+    await addClaim('us1', 'usx', '美联公司2025年二季度营业额30 billion', { attribute: '营业额', num: 30, unit: 'USD billion', at: d('2025-07-20'), ...quarter(2) });
+    await addClaim('us1', 'usx', '美联公司2025年三季度营业额31 billion', { attribute: '营业额', num: 31, unit: 'USD billion', at: d('2025-10-20'), ...quarter(3) });
+    await tier0Known(store, { force: true });
+  });
+
+  it('C2: reads a scale written after the currency', async () => {
+    expect(await set('港华集团的最高营业额是多少？', ['hkx'])).toMatchObject({ op: 'max', answer: '7' });
+    expect(await set('美联公司的最高营业额是多少？', ['usx'])).toMatchObject({ op: 'max', answer: '31' });
+  });
+
   it('C1: reads 合计 as a sum, and lists no peer organisation\'s own figures as the scope\'s items', async () => {
     expect(readSetQuestion('宁德时代2025年营收合计多少？', classifyQuestion('宁德时代2025年营收合计多少？'), '2026-11-16')).toMatchObject({ op: 'sum' });
     // 比亚迪's 毛利率 and 市值, stated in 宁德时代's reports, are 比亚迪's: no item of 宁德时代's

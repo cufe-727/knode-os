@@ -328,6 +328,9 @@ export function unitParts(unit: string | null): { scale: number; base: string } 
   for (const [prefix, factor] of CJK_SCALES) if (u.startsWith(prefix)) return { scale: factor, base: u.slice(prefix.length).trim() };
   const m = /^(trillion|tn|billion|bn|million|mn|thousand|k)\b\.?\s*(.*)$/.exec(u);
   if (m) return { scale: EN_SCALES[m[1]], base: m[2].trim() };
+  // a scale written after the currency: "HK$ bn", "USD billion"
+  const after = /^(.*?)\s+(trillion|tn|billion|bn|million|mn|thousand|k)\.?$/.exec(u);
+  if (after) return { scale: EN_SCALES[after[2]], base: after[1].trim() };
   return { scale: 1, base: u };
 }
 
