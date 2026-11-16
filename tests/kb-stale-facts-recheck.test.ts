@@ -322,3 +322,27 @@ describe('负责 before a word that begins with 人 or 方', () => {
     expect(statementObject('张三负责人', '负责人', ['比亚迪'], '张三')).toBe('');
   });
 });
+
+describe('the first mention of a new thing', () => {
+  it('keeps its own reading whatever else the statement names', async () => {
+    const { settleSeriesObjects } = await import('../src/graph/claim-state.js');
+    const row = (statement: string, about: string, object = '') => ({ statement, about, object });
+    expect(settleSeriesObjects([row('云业务由张三负责', '云业务'), row('海外云业务由李四负责', '海外云业务')])).toEqual(['~云业务', '~海外云业务']);
+    expect(settleSeriesObjects([row('云业务由张三负责', '云业务'), row('云业务拆分后，储能业务由王五负责', '储能业务')])).toEqual(['~云业务', '~储能业务']);
+    expect(settleSeriesObjects([row('当前市场由量化主导', '市场'), row('当前A股市场由游资主导', 'a股市场')])).toEqual(['~市场', '~a股市场']);
+  });
+
+  it('is its own series end to end, said once or twice', async () => {
+    for (const [i, later] of [['海外云业务由李四负责'], ['海外云业务由李四负责', '海外云业务由李四负责。']].entries()) {
+      const ctx = await twoDocs(`first-mention-${i}`, '比亚迪', [['云业务由张三负责', '负责人', '张三']], later.map((s) => [s, '负责人', '李四'] as [string, string, string]));
+      const current = await currentStatements(ctx);
+      expect(current, later.join(' / ')).toContain('云业务由张三负责');
+    }
+  });
+
+  it('reads the thing an owner with a modifier takes on', async () => {
+    expect(statementObject('原云业务团队的赵六现在负责储能业务', '负责人', ['比亚迪'], '赵六')).toBe('储能业务');
+    const ctx = await twoDocs('modifier', '比亚迪', [['云业务由张三负责', '负责人', '张三']], [['原云业务团队的赵六现在负责储能业务', '负责人', '赵六']]);
+    expect(await currentStatements(ctx)).toEqual(['云业务由张三负责', '原云业务团队的赵六现在负责储能业务'].sort());
+  });
+});

@@ -167,7 +167,7 @@ const BRACKETED = /\([^()]*\)|\[[^\[\]]*\]|【[^【】]*】/gu;
 const LEAD_PHRASE = /^(?:(?:自|从|于)[^起]{0,16}?(?:起|开始)|经(?:过)?[\p{Script=Han}A-Za-z]{0,8}?(?:评审|审议|审批|批准|决定|决议|讨论|研究|协商|确认|同意|评估|复核|会议)(?:后|通过)?)/u;
 
 /** Verbs an owner takes a thing on with, written after the owner: "张三负责云业务", "李四接手电池业务". */
-const OWNER_VERB = /^(?:\s*(?:、|和|与|及)\s*[\p{Script=Han}A-Za-z·]{2,4}?)*\s*(?:将|已|仍|现|也|继续|正式|开始|改为|转为|共同|一起|联合){0,2}\s*(?:负责|主导|牵头|跟进|接手|接管|分管|主管)(?!(?:人|方)(?:[为是:：，,。；;、\s]|$))/u;
+const OWNER_VERB = /^(?:\s*(?:、|和|与|及)\s*[\p{Script=Han}A-Za-z·]{2,4}?)*\s*(?:现在|目前|如今|将|已|仍|现|也|继续|正式|开始|改为|转为|共同|一起|联合){0,2}\s*(?:负责|主导|牵头|跟进|接手|接管|分管|主管)(?!(?:人|方)(?:[为是:：，,。；;、\s]|$))/u;
 
 /** In the active voice, the clause after the owner's verb with its "…的工作" tail dropped; null when the owner is not written so. */
 function activeOwnerObject(text: string, valueText: string | null | undefined): string | null {
@@ -206,14 +206,18 @@ export interface SeriesReading {
  * The object part of each owner or state claim's series among one subject's
  * claims, settled against the things that subject's claims are known to be
  * about. Clause reading misses wordings ("原由张三负责的云业务现由李四负责",
- * "张三不再负责云业务，改由李四接手"), and a claim read as about nothing, or as
- * about something no other claim is about, would be a series of its own and
- * leave two current owners. So such a claim goes to the series of the one
- * known thing its statement names — an object another claim carries
- * (`objects`: key and names) or a reading of another claim; the longest when
- * one contains another. Two named, or none: as read ("" is the subject's own
- * series: "由李四负责" says nothing of 云业务). A reading another claim shares,
- * or the name of a carried object, is known already and stays.
+ * "张三不再负责云业务，改由李四接手"), and a claim read as about nothing would be
+ * the subject's own series and leave two current owners. So a claim read as
+ * about nothing goes to the series of the one known thing its statement
+ * names — an object another claim carries (`objects`: key and names) or a
+ * reading of another claim; the longest when one contains another. Two
+ * named, or none: the subject's own ("由李四负责" says nothing of 云业务).
+ * A claim read as about something keeps that reading, said once or many
+ * times, whatever else its statement names ("海外云业务由李四负责" beside
+ * 云业务, "云业务拆分后，储能业务由王五负责"): moving the first mention of a new
+ * thing onto a known one would make the outcome depend on how many reports
+ * have arrived. Only a reading that is a carried object's name joins that
+ * object's series.
  * Returns "~reading", an object key, or "" for each row.
  */
 export function settleSeriesObjects(rows: readonly SeriesReading[], objects: readonly { key: string; names: readonly string[] }[] = []): string[] {
@@ -227,13 +231,12 @@ export function settleSeriesObjects(rows: readonly SeriesReading[], objects: rea
     if (r.object) return r.object;
     const carried = [...new Set(known.filter((k) => !k.key.startsWith('~') && k.name === r.about).map((k) => k.key))];
     if (r.about && carried.length === 1) return carried[0];
-    if (r.about && (read.get(r.about) ?? 0) >= 2) return `~${r.about}`;
+    if (r.about) return `~${r.about}`;
     const text = fold(r.statement).replace(/\s+/g, '');
-    const hits = known.filter((k) => k.name !== r.about && text.includes(k.name.replace(/\s+/g, '')));
+    const hits = known.filter((k) => text.includes(k.name.replace(/\s+/g, '')));
     const longest = hits.filter((h) => !hits.some((o) => o.name !== h.name && o.name.includes(h.name)));
     const keys = [...new Set(longest.map((h) => h.key))];
-    if (keys.length === 1) return keys[0];
-    return r.about ? `~${r.about}` : '';
+    return keys.length === 1 ? keys[0] : '';
   });
 }
 

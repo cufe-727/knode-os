@@ -407,16 +407,20 @@ What the rules are now:
   the owner being the claim's value) the thing is what follows the verb.
   Clause reading will keep missing wordings, so a subject's owner and state
   claims are then settled together (`settleSeriesObjects`): one read as about
-  nothing, or about something no other claim is about, goes to the series of
-  the one known thing its statement names (an object another claim carries,
-  or another claim's reading; the longest when one contains another); two or
-  none, as read. "由李四负责" names nothing and stays the subject's own owner.
+  nothing goes to the series of the one known thing its statement names (an
+  object another claim carries, or another claim's reading; the longest when
+  one contains another); two or none, the subject's own ("由李四负责" names
+  nothing). A claim read as about something keeps that reading, said once or
+  many times, whatever else its statement names ("海外云业务由李四负责" beside
+  云业务, "云业务拆分后，储能业务由王五负责"): moving the first mention of a new
+  thing onto a known one would depend on how many reports have arrived. Only
+  a reading that is a carried object's name joins that object's series.
   Two owners named together ("张三、李四共同负责云业务") are two current owners of
   one thing: one day, two values, neither supersedes the other. On finance's
   stored extractions (read only; 522 owner or state claims on 345 subjects,
   mostly "市场由量化主导" commentary) 321 claims are alone in their series on
-  main, 429 here: of the 108 more, 63 carry an object of their own (the
-  first review's rule), 41 are read as about something no other claim is,
+  main, 461 here: of the 140 more, 69 carry an object of their own (the
+  first review's rule), 66 are read as about something no other claim is,
   and 5 about nothing beside claims that are about something.
 - **Identifiers.** Only identifiers of one numbered series (letters, a
   separator, a counter: INC-001-T1, R-07, GPT-4) with another counter or two
