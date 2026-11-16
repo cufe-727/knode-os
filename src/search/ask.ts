@@ -314,8 +314,12 @@ async function enumeratedAnswer(env: RouteEnv): Promise<AskResult | null> {
 async function multihopAnswer(env: RouteEnv): Promise<AskResult> {
   const { store, config, embedder, question, opts, queryVector, router, named } = env;
   const k = opts.k ?? 8;
+  // the SAG search needs the question's embedding: without one (the embedder down, or keyword asked for) the caller's
+  // mode answers, whose hybrid search falls back to the keyword and graph channels as the lookup route's does
+  const asked = opts.mode ?? 'hybrid';
+  const mode: SearchMode = asked === 'keyword' ? 'keyword' : queryVector ? 'sag' : 'hybrid';
   const [retrieved, walk] = await Promise.all([
-    search(store, embedder, question, { k, mode: 'sag', heat: config.heat, sag: config.retrieval.sag, rerank: config.retrieval.rerank, queryVector, track: opts.track }),
+    search(store, embedder, question, { k, mode, heat: config.heat, sag: config.retrieval.sag, rerank: config.retrieval.rerank, queryVector, track: opts.track }),
     walkRelations(store, question, named, { maxHops: router.maxHops, queryVector, model: embedder.model }),
   ]);
   const seen = new Set(retrieved.map((r) => r.chunkId));
