@@ -526,10 +526,13 @@ describe('periods a figure covers (re-check item 5)', () => {
     expect(await set('宁德时代平均每季度销售额是多少？', ['catl'])).toMatchObject({ op: 'mean', answer: '943.333333' });
   });
 
-  it('leaves out a period whose figures disagree, instead of the later overwriting the earlier', async () => {
-    const max = await set('宁德时代的最高研发投入是多少？', ['catl']);
-    expect(max).toMatchObject({ op: 'max', answer: '50' });
-    expect(max!.lines.join('\n')).toMatch(/1 period whose figures disagree/);
+  it('computes no maximum a period whose figures disagree may hold, instead of the later overwriting the earlier', async () => {
+    // the third quarter's 55 and 80 (two measures under one name) are each above the second quarter's 50
+    expect(await set('宁德时代的最高研发投入是多少？', ['catl'])).toBeNull();
+    // whichever the third quarter's is, the lowest is the second quarter's
+    const min = await set('宁德时代的最低研发投入是多少？', ['catl']);
+    expect(min).toMatchObject({ op: 'min', answer: '50' });
+    expect(min!.lines.join('\n')).toMatch(/1 period whose figures disagree/);
   });
 });
 
@@ -561,7 +564,29 @@ describe('round three (C1-C7)', () => {
     await addClaim('yf1', 'yfx', '远帆公司2025年二季度营收50亿元', { attribute: '营收', num: 50, unit: '亿元', at: d('2025-07-20'), ...quarter(2) });
     await addClaim('yf1', 'yfx', '远帆公司2025财年第一季度营收40亿元', { attribute: '营收', num: 40, unit: '亿元', at: d('2025-02-10') });
     await addClaim('yf1', 'yfx', '远帆公司2025财年第二季度营收42亿元', { attribute: '营收', num: 42, unit: '亿元', at: d('2025-05-10') });
+    // a quarter restated (12, then 11) with no record that the later replaces the earlier
+    await addEntity('rsx', '瑞声电子', 'organization');
+    await addEntity('rsy', '瑞声光学', 'organization');
+    await addDoc('rs1', '瑞声电子二季报', d('2025-07-20'), '瑞声电子净利润。', ['rsx', 'rsy']);
+    await addDoc('rs2', '瑞声电子更正', d('2025-08-15'), '瑞声电子净利润。', ['rsx', 'rsy']);
+    await addClaim('rs1', 'rsx', '瑞声电子2025年一季度净利润10亿元', { attribute: '净利润', num: 10, unit: '亿元', at: d('2025-04-20'), ...quarter(1) });
+    await addClaim('rs1', 'rsx', '瑞声电子2025年二季度净利润12亿元', { attribute: '净利润', num: 12, unit: '亿元', at: d('2025-07-20'), ...quarter(2) });
+    await addClaim('rs2', 'rsx', '瑞声电子2025年二季度净利润11亿元', { attribute: '净利润', num: 11, unit: '亿元', at: d('2025-08-15'), ...quarter(2) });
+    await addClaim('rs1', 'rsy', '瑞声光学2025年一季度净利润20亿元', { attribute: '净利润', num: 20, unit: '亿元', at: d('2025-04-20'), ...quarter(1) });
+    await addClaim('rs1', 'rsy', '瑞声光学2025年二季度净利润12亿元', { attribute: '净利润', num: 12, unit: '亿元', at: d('2025-07-20'), ...quarter(2) });
+    await addClaim('rs2', 'rsy', '瑞声光学2025年二季度净利润11亿元', { attribute: '净利润', num: 11, unit: '亿元', at: d('2025-08-15'), ...quarter(2) });
     await tier0Known(store, { force: true });
+  });
+
+  it('C6: a maximum and a value as of a day agree on a period whose figures disagree', async () => {
+    // either figure of the second quarter may be the highest: no maximum is computed, and no value as of September
+    expect(await set('瑞声电子的最高净利润是多少？', ['rsx'])).toBeNull();
+    expect(await set('截至2025年9月1日，瑞声电子的净利润是多少？', ['rsx'])).toBeNull();
+    // 20 is the highest whichever figure the second quarter has; the lowest is not known
+    const best = await set('瑞声光学的最高净利润是多少？', ['rsy']);
+    expect(best).toMatchObject({ op: 'max', answer: '20' });
+    expect(best!.lines.join('\n')).toMatch(/1 period whose figures disagree/);
+    expect(await set('瑞声光学的最低净利润是多少？', ['rsy'])).toBeNull();
   });
 
   it('C4: reads 前三季度 and a year-to-date window as a running total, not the third quarter', async () => {

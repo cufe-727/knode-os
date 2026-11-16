@@ -1055,6 +1055,11 @@ async function computeWithin(
     for (const c of matched) if (c.superseded_by && inScope.has(c.superseded_by)) replacedBy.set(c.superseded_by, inScope.get(c.superseded_by)!);
     const left = { notFact: 0, replaced: 0, recalled: 0, noNumber: 0, fiscal: 0, units: new Map<string, number>(), grans: new Map<string, number>(), peers: new Map<string, number>() };
     const readings = new Map<string, Cand>();
+    /** Every figure kept for one subject, period and base. */
+    const ofPeriod = new Map<string, Cand[]>();
+    const valueInBase = (c: Cand) => c.value_num! * unitParts(c.unit).scale;
+    const differ = (a: Cand, b: Cand) => a.value_num !== null && b.value_num !== null
+      && Math.abs(valueInBase(a) - valueInBase(b)) > 1e-9 * Math.max(1, Math.abs(valueInBase(a)));
     const periods = new Map<string, Period | null>();
     const conflicted = new Set<string>();
     // a unit's noun that only repeats what is counted (用户 of 周活跃用户) or is a bare count noun (人, 个, 名) names no
@@ -1099,14 +1104,20 @@ async function computeWithin(
       }
       const d = dateOf(c);
       // one reading per subject, period and base: a figure in another currency is another measure, never the same one restated
-      const key = read.op === 'value' ? c.id : `${c.subject_id}|${baseOfC(c)}|${period ? `${period.gran}:${period.key}` : d ? isoWeek(d) : c.id}`;
+      const periodKey = `${c.subject_id}|${baseOfC(c)}|${period ? `${period.gran}:${period.key}` : d ? isoWeek(d) : c.id}`;
+      const key = read.op === 'value' ? c.id : periodKey;
+      (ofPeriod.get(periodKey) ?? ofPeriod.set(periodKey, []).get(periodKey)!).push(c);
       const prev = readings.get(key);
       // two figures of one subject, period and base, neither replacing the other, are two measures under one name
       // (宁德时代's revenue and its overseas revenue): neither is the figure, and the period is left out
-      if (prev && read.op !== 'value' && prev.value_num !== null && c.value_num !== null && Math.abs(prev.value_num - c.value_num) > 1e-9 * Math.max(1, Math.abs(prev.value_num))) conflicted.add(key);
+      if (prev && read.op !== 'value' && differ(prev, c)) conflicted.add(key);
       if (!prev || byDate(dateOf(prev), d) < 0) readings.set(key, c);
     }
-    for (const k of conflicted) readings.delete(k);
+    // a period whose figures disagree is no reading; what is computed must hold whichever figure is the period's
+    // (a restatement not recorded as one, or two measures under one name): a maximum the period cannot reach, a
+    // threshold every figure of it passes or fails — else nothing is computed, as for a value as of a day
+    const disputed = new Map<string, Cand[]>();
+    for (const k of conflicted) { disputed.set(k, ofPeriod.get(k) ?? []); readings.delete(k); }
     // the scope's own figure is the whole: when the organisations it names report one, its parts' figures (a
     // subsidiary's, a team's) are inside it and stay out
     let parts = 0;
@@ -1127,6 +1138,7 @@ async function computeWithin(
     const theUnit = unitsRanked[0]?.[0];
     for (const [k, c] of readings) if (unitOf(c) !== theUnit) { left.units.set(c.unit ?? '(none)', (left.units.get(c.unit ?? '(none)') ?? 0) + 1); readings.delete(k); }
     // one granularity for a figure over many readings: the commonest known one; a tie, or a sum over periods not all known, names none
+    let theGran: string | undefined;
     if (read.op !== 'value') {
       const byGran = new Map<string, number>();
       for (const c of readings.values()) { const g = periods.get(c.id)?.gran ?? 'unknown'; byGran.set(g, (byGran.get(g) ?? 0) + 1); }
@@ -1134,7 +1146,7 @@ async function computeWithin(
       if (known.length > 1 && known[0][1] === known[1][1]) return skip('two period lengths equally common');
       if (read.op === 'sum' && (byGran.has('unknown') || known.length !== 1)) return skip('a sum over periods not all of one length');
       if ((read.op === 'sum' || read.op === 'mean') && known[0]?.[0] === 'ytd') return skip('running totals (前三季度, year to date) add up to no figure');
-      const theGran = known[0]?.[0];
+      theGran = known[0]?.[0];
       if (theGran) for (const [k, c] of readings) if (periods.get(c.id)?.gran !== theGran) { left.grans.set(periods.get(c.id)?.gran ?? 'unknown', (left.grans.get(periods.get(c.id)?.gran ?? 'unknown') ?? 0) + 1); readings.delete(k); }
     }
     const leftOut = [
@@ -1150,6 +1162,9 @@ async function computeWithin(
       parts ? `${parts} of the scope's parts, inside its own figure` : '',
     ].filter(Boolean);
     if (readings.size === 0) return skip('no reading');
+    // the disputed periods of the measure computed: its unit and period length
+    for (const [k, cs] of disputed) if (unitOf(cs[0]) !== theUnit || (theGran && (periods.get(cs[0].id)?.gran ?? 'unknown') !== theGran)) disputed.delete(k);
+    const disputedNote = 'a period whose figures disagree (a restatement not recorded as one, or two measures under one name)';
     // figures compare in their base; they are shown in the commonest unit's scale
     const unitCount = new Map<string, number>();
     for (const c of readings.values()) unitCount.set(c.unit ?? '', (unitCount.get(c.unit ?? '') ?? 0) + 1);
@@ -1165,6 +1180,13 @@ async function computeWithin(
       if (!latest) return skip('no dated reading');
       const sameDay = dated.filter((c) => dateOf(c) === dateOf(latest));
       const pick = sameDay.find((c) => c.correction) ?? sameDay.find((c) => !c.superseded_by) ?? latest;
+      // the value of a period whose figures disagree is not the later one only
+      const pickPeriod = periods.get(pick.id);
+      if (pickPeriod && !pick.correction) {
+        const d0 = dateOf(pick);
+        const same = ofPeriod.get(`${pick.subject_id}|${baseOfC(pick)}|${pickPeriod.gran}:${pickPeriod.key}`) ?? [];
+        if (same.some((c) => differ(c, pick) && (!d0 || !dateOf(c) || dateOf(c)! <= d0))) return skip(disputedNote);
+      }
       const r = toRow(pick);
       answer = pick.value_num !== null ? fmt(pick.value_num) : pick.value_text ?? undefined;
       lines.push(`Value as of ${read.asOf}: ${r.value ?? r.statement} — stated ${label(r)}${pick.correction ? ', a correction' : ''}: ${pick.statement}`);
@@ -1184,8 +1206,19 @@ async function computeWithin(
           const v = scaled ? inBase(c) : shown(c);
           return cmp === '<' ? v < target : cmp === '<=' ? v <= target : cmp === '>' ? v > target : v >= target;
         });
+        const passes = (c: Cand) => {
+          const v = scaled ? inBase(c) : shown(c);
+          return cmp === '<' ? v < target : cmp === '<=' ? v <= target : cmp === '>' ? v > target : v >= target;
+        };
+        for (const [k, cs] of [...disputed]) {
+          const n = cs.filter(passes).length;
+          if (n !== 0 && n !== cs.length) return skip(`${disputedNote}, on both sides of the threshold`);
+          // every figure past it: the period is counted once, under its latest figure
+          if (n === cs.length && read.op !== 'max' && read.op !== 'min') list.push(cs.reduce((a, b) => (byDate(dateOf(a), dateOf(b)) >= 0 ? a : b)));
+          disputed.delete(k);
+        }
         if (list.length === 0) return skip('no reading past the threshold');
-      }
+      } else if (disputed.size && read.op !== 'max' && read.op !== 'min') return skip(disputedNote);
       items = list.length;
       let groups = new Map<string, Cand[]>();
       for (const c of list) {
@@ -1226,6 +1259,11 @@ async function computeWithin(
             lines.push(`${key === 'all' ? '' : `${key}: `}${read.op} of ${attr} over ${vs.length} readings${from || to ? ` (${from ?? ''}..${to ?? ''})` : ''} = ${fmt(v)}${unit} (3 decimals: ${v.toFixed(3)})${covered}`);
           } else {
             const best = cs.reduce((b, c) => ((read.op === 'max' ? inBase(c) > inBase(b) : inBase(c) < inBase(b)) ? c : b));
+            // a disputed period of this group that may hold the maximum leaves it unknown
+            for (const ds of disputed.values()) {
+              const dk = read.groupBy.length && groups.size > 1 ? read.groupBy.map((g) => groupLabel(g, ds[0])).join(' · ') : 'all';
+              if (dk === key && ds.some((c) => (read.op === 'max' ? inBase(c) >= inBase(best) : inBase(c) <= inBase(best)))) return skip(`${disputedNote}, which may hold the ${read.op}`);
+            }
             const r = toRow(best);
             if (groups.size === 1) answer = fmt(best.value_num!);
             lines.push(`${key === 'all' ? '' : `${key}: `}${read.op} ${attr} = ${r.value} — ${label(r)} (of ${vs.length} readings)`);
