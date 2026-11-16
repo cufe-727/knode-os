@@ -1,0 +1,92 @@
+[
+ {
+  "id": "f000000000000001",
+  "question": "What is the batting hand of each of the first two picks in the 1998 Example draft?",
+  "answer": {
+   "Pat Burrell": "Right",
+   "Mark Mulder": "Left"
+  },
+  "categories": [
+   "Sports"
+  ],
+  "decomposition": [
+   {
+    "id": "d1",
+    "question": "Who were the first two picks?",
+    "answer": [
+     "Pat Burrell",
+     "Mark Mulder"
+    ],
+    "depends_on": [],
+    "evidence": {
+     "pageid": 1101,
+     "revid": 101,
+     "title": "1998 Example draft"
+    },
+    "decomposition": []
+   },
+   {
+    "id": "d2",
+    "question": "Burrell bats?",
+    "answer": "Right",
+    "depends_on": [
+     "d1"
+    ],
+    "evidence": {
+     "pageid": 1102,
+     "revid": 102,
+     "title": "Pat Burrell"
+    },
+    "decomposition": []
+   },
+   {
+    "id": "d3",
+    "question": "Mulder bats?",
+    "answer": "Left",
+    "depends_on": [
+     "d1"
+    ],
+    "evidence": {
+     "pageid": 1103,
+     "revid": 103,
+     "title": "Mark Mulder"
+    },
+    "decomposition": []
+   }
+  ]
+ },
+ {
+  "id": "f000000000000002",
+  "question": "How many of the first two picks bat right-handed?",
+  "answer": 1,
+  "categories": [
+   "Sports"
+  ],
+  "decomposition": [
+   {
+    "id": "d4",
+    "question": "Burrell bats?",
+    "answer": "Right",
+    "depends_on": [],
+    "evidence": {
+     "pageid": 1102,
+     "revid": 102,
+     "title": "Pat Burrell"
+    },
+    "decomposition": []
+   },
+   {
+    "id": "d5",
+    "question": "Mulder bats?",
+    "answer": "Left",
+    "depends_on": [],
+    "evidence": {
+     "pageid": 1103,
+     "revid": 103,
+     "title": "Mark Mulder"
+    },
+    "decomposition": []
+   }
+  ]
+ }
+]

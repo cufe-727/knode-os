@@ -10,6 +10,7 @@ import { formatGrepability, grepability } from './grepability.js';
 import { formatLint, lintBeforeRun, lintPack } from './lint.js';
 import { loadPack, packsDir, validatePack } from './pack.js';
 import { listRecipes, recipe } from './packs/index.js';
+import { measurePack, writeMeasure } from './packs/measure.js';
 import { extendPack } from './packs/extend.js';
 import './packs/recipes.js';
 import { buildScaleData, renderScale, writeReport } from './report.js';
@@ -218,6 +219,17 @@ export function registerEvalCommands(program: Command): void {
       const results = dirs.map((d) => grepability(loadPack(resolvePack(d)), Number(opts.share)));
       console.log(formatGrepability(results));
       if (opts.json) fs.writeFileSync(opts.json, JSON.stringify(results, null, 1) + '\n');
+    });
+
+  pack
+    .command('measure <dir>')
+    .description('how far a pack can be answered by lookup, without a model: question terms in gold documents, single-document share, corpus size and shape, hops; plus the two cheapest lint checks')
+    .option('--write', 'keep the result as measure.json beside the pack')
+    .action((dir: string, opts: { write?: boolean }) => {
+      const p = loadPack(resolvePack(dir));
+      const m = opts.write ? writeMeasure(p) : measurePack(p);
+      console.log(JSON.stringify(m, null, 2));
+      if (m.lint.answerInFileName.length || m.lint.duplicateQuestionDifferentGold.length) process.exitCode = 1;
     });
 
   const systems = evalCmd.command('systems').description('systems under test');

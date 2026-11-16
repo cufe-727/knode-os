@@ -1,0 +1,3 @@
+	Prompt	Answer	wikipedia_link_1	wikipedia_link_2	wikipedia_link_3	wikipedia_link_11+	reasoning_types	wiki_links
+0	If my future wife has the first name of Harriet Lane's mother and the surname of the second assassinated president's mother, what is her name?	Jane Ballou	https://en.wikipedia.org/wiki/Harriet_Lane	https://en.wikipedia.org/wiki/James_A._Garfield			Multiple constraints	[]
+1	A question whose article was not fetched?	x	https://en.wikipedia.org/wiki/Missing				Temporal reasoning	[]
