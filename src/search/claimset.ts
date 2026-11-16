@@ -434,44 +434,81 @@ async function spellingsOf(store: Store, survivors: string[]): Promise<string[]>
   return [...all];
 }
 
+/** Relations that make one organisation a part of another. */
+const PART_OF = ['part_of', 'subsidiary_of', 'belongs_to', 'member_of'];
+/** Levels of parts read under a scope, and of holders over a named organisation. */
+const PART_DEPTH = 3;
+
+/** The organisations holding each of `ids` (`part_of` and the like), one level up: child → parent. */
+async function parentsOf(store: Store, ids: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  if (ids.length === 0) return out;
+  const rows = await store.query<{ child: string; parent: string }>(
+    `SELECT DISTINCT ON (r.source_id) r.source_id AS child, COALESCE(b.canonical_id, b.id) AS parent
+     FROM relations r JOIN entities b ON b.id = r.target_id AND b.type = 'organization'
+     WHERE r.source_id = ANY($1::text[]) AND r.type = ANY($2::text[]) AND r.tx_to IS NULL AND r.source_id <> r.target_id
+     ORDER BY r.source_id, r.weight DESC, r.target_id`,
+    [ids, PART_OF],
+  );
+  for (const r of rows) out.set(r.child, r.parent);
+  return out;
+}
+
 /**
  * The organisations a question's named entities scope it to, each with its
- * members: the named organisations, less one that holds another named one
- * (a division named beside its team scopes to the team), and their members —
- * organisations `part_of` them, or named as them and more ("第一事业部平台组"
- * under "第一事业部"), two levels down.
+ * members: the named organisations, less one that holds another named one (a
+ * division named beside its team scopes to the team), and the organisations
+ * recorded as their parts (`part_of`, `subsidiary_of`, …), `PART_DEPTH`
+ * levels down. Only recorded relations: a name that merely begins with the
+ * scope's ("中信建投" under "中信") is no part of it. All of it in SQL over the
+ * relations of the named organisations, never over every organisation.
  */
 async function scopeOf(store: Store, named: string[]): Promise<{ roots: { id: string; name: string }[]; members: Map<string, string>; parent: Map<string, string> }> {
   const members = new Map<string, string>();
   const parent = new Map<string, string>();
-  const orgs = named.length
-    ? await store.query<{ id: string; name: string }>(
-      `SELECT id, name FROM entities WHERE id = ANY($1::text[]) AND type = 'organization' AND tx_to IS NULL AND canonical_id IS NULL`,
-      [named],
-    )
-    : [];
-  const all = await store.query<{ id: string; name: string }>(`SELECT id, name FROM entities WHERE type = 'organization' AND tx_to IS NULL AND canonical_id IS NULL`);
-  const partOf = await store.query<{ child: string; parent: string }>(
-    `SELECT DISTINCT r.source_id AS child, r.target_id AS parent FROM relations r
-     JOIN entities a ON a.id = r.source_id AND a.type = 'organization' JOIN entities b ON b.id = r.target_id AND b.type = 'organization'
-     WHERE r.tx_to IS NULL AND r.type IN ('part_of', 'subsidiary_of', 'belongs_to', 'member_of') AND r.source_id <> r.target_id`,
+  if (named.length === 0) return { roots: [], members, parent };
+  const orgs = await store.query<{ id: string; name: string }>(
+    `SELECT id, name FROM entities WHERE id = ANY($1::text[]) AND type = 'organization' AND tx_to IS NULL AND canonical_id IS NULL`,
+    [named],
   );
-  for (const r of partOf) parent.set(r.child, r.parent);
-  // a longer name that begins with an organisation's name is one of its parts
-  const byName = [...all].sort((a, b) => b.name.length - a.name.length);
-  for (const e of all) {
-    if (parent.has(e.id)) continue;
-    const holder = byName.find((o) => o.id !== e.id && o.name.length >= 2 && o.name.length < e.name.length && e.name.startsWith(o.name));
-    if (holder) parent.set(e.id, holder.id);
-  }
+  if (orgs.length === 0) return { roots: [], members, parent };
+  const ids = orgs.map((o) => o.id);
+  // the holders of the named ones (to tell a team from its division) and the parts under them
+  const links = await store.query<{ child: string; parent: string }>(
+    `WITH RECURSIVE up(child, parent, depth) AS (
+       SELECT r.source_id, r.target_id, 1 FROM relations r
+       WHERE r.source_id = ANY($1::text[]) AND r.type = ANY($2::text[]) AND r.tx_to IS NULL AND r.source_id <> r.target_id
+       UNION
+       SELECT r.source_id, r.target_id, up.depth + 1 FROM relations r JOIN up ON r.source_id = up.parent
+       WHERE r.type = ANY($2::text[]) AND r.tx_to IS NULL AND r.source_id <> r.target_id AND up.depth < $3
+     ), down(child, parent, depth) AS (
+       SELECT r.source_id, r.target_id, 1 FROM relations r
+       WHERE r.target_id = ANY($1::text[]) AND r.type = ANY($2::text[]) AND r.tx_to IS NULL AND r.source_id <> r.target_id
+       UNION
+       SELECT r.source_id, r.target_id, down.depth + 1 FROM relations r JOIN down ON r.target_id = down.child
+       WHERE r.type = ANY($2::text[]) AND r.tx_to IS NULL AND r.source_id <> r.target_id AND down.depth < $3
+     )
+     SELECT l.child, l.parent FROM (SELECT child, parent FROM up UNION SELECT child, parent FROM down) l
+     JOIN entities a ON a.id = l.child AND a.type = 'organization' AND a.canonical_id IS NULL
+     JOIN entities b ON b.id = l.parent AND b.type = 'organization' AND b.canonical_id IS NULL`,
+    [ids, PART_OF, PART_DEPTH],
+  );
+  for (const r of links) if (!parent.has(r.child)) parent.set(r.child, r.parent);
   const holds = (outer: string, inner: string) => {
-    for (let at: string | undefined = inner, i = 0; at && i < 4; at = parent.get(at), i++) if (parent.get(at) === outer) return true;
+    for (let at: string | undefined = inner, i = 0; at && i <= PART_DEPTH * 2; at = parent.get(at), i++) if (parent.get(at) === outer) return true;
     return false;
   };
   const roots = orgs.filter((o) => !orgs.some((x) => x.id !== o.id && holds(o.id, x.id)));
+  const children = new Map<string, string[]>();
+  for (const [c, p] of parent) (children.get(p) ?? children.set(p, []).get(p)!).push(c);
   for (const r of roots) {
     members.set(r.id, r.id);
-    for (const e of all) if (holds(r.id, e.id)) members.set(e.id, r.id);
+    const open = [r.id];
+    for (let depth = 0; depth < PART_DEPTH && open.length; depth++) {
+      const next: string[] = [];
+      for (const at of open) for (const c of children.get(at) ?? []) if (!members.has(c)) { members.set(c, r.id); next.push(c); }
+      open.splice(0, open.length, ...next);
+    }
   }
   return { roots, members, parent };
 }
@@ -752,6 +789,10 @@ export async function computeClaimSet(
     };
   };
   const label = (r: SetRow) => `${r.date ?? '?'}${r.title ? ` 《${r.title}》` : ''}`;
+  if (read.groupBy.includes('parent') || read.groupBy.includes('member')) {
+    const homes = [...new Set([...docs.values()].map((d) => d.home).filter((h): h is string => Boolean(h) && !parent.has(h!)))];
+    for (const [c, p] of await parentsOf(store, homes)) parent.set(c, p);
+  }
   const orgName = new Map<string, string>();
   for (const r of await store.query<{ id: string; name: string }>(`SELECT id, name FROM entities WHERE id = ANY($1::text[])`, [[...new Set([...[...docs.values()].map((d) => d.home).filter((h): h is string => Boolean(h)), ...parent.values(), ...parent.keys()])]])) orgName.set(r.id, r.name);
   // a claim's organisation in scope: its sources' own one, the one nearest a root

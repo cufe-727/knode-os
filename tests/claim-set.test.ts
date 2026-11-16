@@ -70,7 +70,7 @@ beforeAll(async () => {
   store = await Store.open(tmp, 4);
   await store.indexing;
   await addEntity('northwind', 'Northwind', 'organization');
-  await addEntity('platform', 'Northwind Platform', 'organization'); // a part of Northwind by its name
+  await addEntity('platform', 'Northwind Platform', 'organization'); // a part of Northwind by a relation, not by its name
   await addEntity('payments', 'Payments Team', 'organization'); // a part of Northwind by a relation
   await addEntity('southwind', 'Southwind', 'organization');
   await addEntity('alice', 'Alice Chen', 'person');
@@ -78,6 +78,7 @@ beforeAll(async () => {
   for (const inc of ['INC-1', 'INC-2', 'INC-3', 'INC-7', 'INC-8', 'INC-9']) await addEntity(inc.toLowerCase(), inc, 'event');
   await addEntity('pool-1', 'POOL-1', 'component');
   await store.query(`INSERT INTO relations (id, source_id, target_id, type, description, weight) VALUES ('r-pay', 'payments', 'northwind', 'part_of', 'Payments Team is part of Northwind', 1)`);
+  await store.query(`INSERT INTO relations (id, source_id, target_id, type, description, weight) VALUES ('r-plat', 'platform', 'northwind', 'part_of', 'Northwind Platform is part of Northwind', 1)`);
 
   for (const [week, value] of AVAILABILITY) {
     const doc = `plat-w${week}`;
@@ -156,7 +157,7 @@ describe('computing the set from the claims', () => {
     expect(s!.lines.join('\n')).toMatch(/INC-1[\s\S]*INC-2[\s\S]*INC-3/);
   });
 
-  it('lists a division\'s items of a value it names, its teams by name and by relation, no other division', async () => {
+  it('lists a division\'s items of a value it names, its teams by relation, no other division', async () => {
     const s = await set('Which P1 incidents did Northwind have?', ['northwind']);
     const listed = s!.lines.filter((l) => l.startsWith('- ')).map((l) => /INC-\d+/.exec(l)![0]);
     expect(listed.sort()).toEqual(['INC-1', 'INC-3', 'INC-7']);

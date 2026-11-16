@@ -102,6 +102,19 @@ beforeAll(async () => {
   // a customer only rumoured
   await addEntity('nio', '蔚来', 'organization');
   await addClaim('r5', 'nio', '蔚来或将成为宁德时代的客户', { object: 'catl', at: d('2026-01-05'), kind: 'rumor', status: 'suspected' });
+  // 中信, its recorded subsidiary 中信证券, and 中信建投, whose name merely begins with 中信
+  await addEntity('citic', '中信', 'organization');
+  await addEntity('citics', '中信证券', 'organization');
+  await addEntity('csc', '中信建投', 'organization');
+  await store.query(`INSERT INTO relations (id, source_id, target_id, type, description, weight) VALUES ('r-citics', 'citics', 'citic', 'subsidiary_of', '中信证券是中信的子公司', 1)`);
+  await addDoc('c1', '中信证券周报', d('2025-06-01'), '中信证券的客户。', ['citics']);
+  await addDoc('c2', '中信建投周报', d('2025-06-01'), '中信建投的客户。', ['csc']);
+  for (let i = 0; i < 4; i++) {
+    await addClaim('c1', 'citics', `中信证券第${i}项业务进展顺利`, { at: d('2025-06-01') });
+    await addClaim('c2', 'csc', `中信建投第${i}项业务进展顺利`, { at: d('2025-06-01') });
+  }
+  await addClaim('c1', 'bmw', '宝马是中信证券的客户', { object: 'citics', at: d('2025-06-01') });
+  await addClaim('c2', 'tesla', '特斯拉是中信建投的客户', { object: 'csc', at: d('2025-06-01') });
   // a weekly series: each week's reading superseded by the next week's, as supersession marks a series
   const weeks = [['2025-03-03', '2025-03-07', 12.1], ['2025-03-10', '2025-03-14', 13.4], ['2025-03-17', '2025-03-21', 12.8]] as const;
   let next: string | undefined;
@@ -234,6 +247,15 @@ describe('periods read from today and the question\'s own year; an empty set is 
 
   it('computes nothing when no item of the kind asked for is found', async () => {
     expect(await set('宁德时代的客户有哪些人负责？', ['catl'])).toBeNull();
+  });
+});
+
+describe('a scope\'s members come from recorded relations, not names (review item 7)', () => {
+  it('takes a subsidiary for a member, and a look-alike name for none', async () => {
+    const s = await set('中信有哪些客户？', ['citic']);
+    expect(s!.scope).toBe('中信 (with 1 member organisations)');
+    const items = s!.lines.filter((l) => l.startsWith('- ')).map((l) => l.slice(2).split(' ')[0]);
+    expect(items).toEqual(['宝马']);
   });
 });
 
