@@ -298,3 +298,12 @@ describe('a name earlier in the sentence than the fix', () => {
     expect(sources.map((r) => r.source_id)).toEqual(['方杰']);
   });
 });
+
+describe('负责 before a word that begins with 人 or 方', () => {
+  it('is the verb; only 负责人 / 负责方 as words are not', () => {
+    expect(statementObject('张三负责人工智能业务', '负责人', ['比亚迪'], '张三')).toBe('人工智能业务');
+    expect(statementObject('张三负责方向盘业务', '负责人', ['比亚迪'], '张三')).toBe('方向盘业务');
+    // 负责人 as a word: no thing after a verb
+    expect(statementObject('张三负责人', '负责人', ['比亚迪'], '张三')).toBe('');
+  });
+});

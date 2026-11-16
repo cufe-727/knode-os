@@ -167,7 +167,7 @@ const BRACKETED = /\([^()]*\)|\[[^\[\]]*\]|【[^【】]*】/gu;
 const LEAD_PHRASE = /^(?:(?:自|从|于)[^起]{0,16}?(?:起|开始)|经(?:过)?[\p{Script=Han}A-Za-z]{0,8}?(?:评审|审议|审批|批准|决定|决议|讨论|研究|协商|确认|同意|评估|复核|会议)(?:后|通过)?)/u;
 
 /** Verbs an owner takes a thing on with, written after the owner: "张三负责云业务", "李四接手电池业务". */
-const OWNER_VERB = /^(?:\s*(?:、|和|与|及)\s*[\p{Script=Han}A-Za-z·]{2,4}?)*\s*(?:将|已|仍|现|也|继续|正式|开始|改为|转为|共同|一起|联合){0,2}\s*(?:负责|主导|牵头|跟进|接手|接管|分管|主管)(?![人方])/u;
+const OWNER_VERB = /^(?:\s*(?:、|和|与|及)\s*[\p{Script=Han}A-Za-z·]{2,4}?)*\s*(?:将|已|仍|现|也|继续|正式|开始|改为|转为|共同|一起|联合){0,2}\s*(?:负责|主导|牵头|跟进|接手|接管|分管|主管)(?!(?:人|方)(?:[为是:：，,。；;、\s]|$))/u;
 
 /** In the active voice, the clause after the owner's verb with its "…的工作" tail dropped; null when the owner is not written so. */
 function activeOwnerObject(text: string, valueText: string | null | undefined): string | null {
