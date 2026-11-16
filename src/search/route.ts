@@ -35,9 +35,15 @@ export interface QuestionRoute {
   by: string;
 }
 
+/*
+ * Every open-ended gap in these patterns is bounded ({0,120}, not *): a
+ * question is classified on every Ask, and an unbounded gap between two
+ * repeated words backtracks over the whole text (a 57,000-character paste
+ * took seconds). The router also reads at most `routedText` of a question.
+ */
 const TIMELINE = [
   /时间线|时间轴|从早到晚|从晚到早|按时间(顺序)?|先后顺序|历次|演变|变迁|历程|沿革|最早.{0,30}最后|首次.{0,30}(?:最后|最终)/,
-  /\bfirst\b[^?]*\b(?:last|finally)\b[^?]*\b(?:when|which week|who)\b|\bwhen\b[^?]*\bfirst\b[^?]*\b(?:last|finally)\b|\btimeline\b|\bchronolog|\bhistory of\b|\bin (chronological )?order\b|\bover time\b|\bevolv(e|ed|ing)\b|\bhow has .+ changed\b|\bsequence of\b/i,
+  /\bfirst\b[^?]{0,120}?\b(?:last|finally)\b[^?]{0,120}?\b(?:when|which week|who)\b|\bwhen\b[^?]{0,120}?\bfirst\b[^?]{0,120}?\b(?:last|finally)\b|\btimeline\b|\bchronolog|\bhistory of\b|\bin (chronological )?order\b|\bover time\b|\bevolv(e|ed|ing)\b|\bhow has [^?.]{1,80}? changed\b|\bsequence of\b/i,
 ];
 
 const AGGREGATE = [
@@ -54,7 +60,7 @@ const AGGREGATE = [
  */
 const MULTIHOP = [
   /\b(?:the|a|an)\s+(?:[\w-]+\s+){0,3}?(?:that|which|who|whose)\s+(?!is\b|are\b|was\b|were\b)\w+/i,
-  /\bof the\b[^?]*\bof (?:the\b|[A-Z])/,
+  /\bof the\b[^?]{0,80}?\bof (?:the\b|[A-Z])/,
   /'s\s+[\w-]+(?:\s+[\w-]+)?'s\b/,
   /\b(?:where|when) (?:was|did|is) the\s+[\w-]+\s+(?:that|which|who)\b/i,
   /的[^，。？?、\s]{1,12}的[^，。？?、\s]{1,12}(是谁|是什么|是哪|在哪|叫什么|有哪些|有多少)/,
@@ -244,8 +250,9 @@ function parse(token: string, text: string): QuestionRoute['range'] {
   }
 }
 
-/** The kind of a question by its wording alone. */
-export function classifyQuestion(question: string): QuestionRoute {
+/** The kind of a question by its wording alone (its head and tail when it is a long paste: `routedText`). */
+export function classifyQuestion(full: string): QuestionRoute {
+  const question = routedText(full);
   const range = questionRange(question);
   if (TIMELINE.some((re) => re.test(question))) return { kind: 'timeline', range, by: 'rule:timeline' };
   // before the counts and lists: what those would enumerate is the thing the question has yet to find
@@ -278,7 +285,7 @@ export async function routeQuestion(question: string, opts: { classifier?: 'rule
   try {
     const r = await opts.llm.completeJson<{ kind?: string }>([
       { role: 'system', content: CLASSIFY_PROMPT },
-      { role: 'user', content: question },
+      { role: 'user', content: routedText(question) },
     ], { maxTokens: 30 });
     const kind = String(r?.kind ?? '').toLowerCase() as QuestionKind;
     return KINDS.includes(kind) ? { kind, range: ruled.range, by: 'model' } : ruled;

@@ -82,3 +82,32 @@ describe('chained questions', () => {
     expect(classifyQuestion('平台组今年出了几起事故？').kind).toBe('aggregate');
   });
 });
+
+describe('routing a long paste', () => {
+  // a question is classified on every Ask; a pasted report once took 7.5 s in TIMELINE (review of 2026-11-16)
+  const en = 'The first quarter was strong for the company, and the last quarter was weak; of the regions, the north grew. '.repeat(520);
+  const zh = '最早的季度表现很好，他负责的那个项目，谁也没想到，最后一个季度下滑。'.repeat(1500);
+  const timed = (q: string) => {
+    const t = performance.now();
+    classifyQuestion(q);
+    isChainQuestion(q);
+    return performance.now() - t;
+  };
+
+  it('reads only the head and the tail of a long paste, in milliseconds', () => {
+    expect(en.length).toBeGreaterThan(55_000);
+    expect(timed(en)).toBeLessThan(50);
+    expect(timed(zh)).toBeLessThan(50);
+    // the question at the end of a paste still routes
+    expect(classifyQuestion(`${en}\n\nHow many quarters were weak?`).kind).toBe('aggregate');
+    expect(classifyQuestion(`下面这段周报最可能是谁写的？\n\n${zh}`).kind).not.toBe('multihop');
+  });
+
+  it('has no pattern that backtracks over the text it reads', () => {
+    // 600 characters, the most the router reads, of the shapes the open-ended patterns once crossed
+    for (const unit of ['first and last of the ', 'how has the ', 'of the a ', '最早 ', 'the one that ', "Acme's Beta's "]) {
+      const q = unit.repeat(Math.ceil(600 / unit.length)).slice(0, 600);
+      expect(timed(q), unit).toBeLessThan(20);
+    }
+  });
+});
