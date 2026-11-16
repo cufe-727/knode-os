@@ -34,8 +34,10 @@ import { nameCode } from './resolve.js';
  * people the claim names are linked to it (related_to, as an id'd fix line
  * links its fixer). None, or two candidates, link nothing.
  *
- * Each link is a scope of kind 'backref', keyed by the claim (reversible, its
- * reason in the scope's meta). A run reads only the claims of documents
+ * Each link is a scope of kind 'backref', keyed by the claim, a child of the
+ * scope that carries the claim in its document: disposed with that document
+ * (removed, replaced, re-extracted), with its trust and acl, its document and
+ * passage as the relation's source. A run reads only the claims of documents
  * applied since the last run and of the report after each of them (cursor in
  * meta 'backrefs'), and disposes the links among those that no longer hold.
  */
@@ -321,11 +323,14 @@ export async function linkBackReferences(
       shaOf(w),
       {
         actor: 'backref',
-        meta: { claimId, incident: w.incident, people: w.people, document: w.ref.docPath, previous: w.previous, term: w.ref.term, reason },
+        parentId: w.ref.scopeId,
+        trust: w.ref.trust,
+        acl: w.ref.acl,
+        meta: { documentId: w.ref.docId, claimId, incident: w.incident, people: w.people, document: w.ref.docPath, previous: w.previous, term: w.ref.term, reason },
         log: false,
       },
       async (wr) => {
-        for (const p of w.people) await wr.relation(p, w.incident, { type: 'related_to', description: w.ref.statement, extractor: 'backref', weight: 0.5 });
+        for (const p of w.people) await wr.relation(p, w.incident, { type: 'related_to', description: `修复上一期报告的${w.ref.term}`, extractor: 'backref', weight: 0.5, segmentId: w.ref.segmentId });
       },
     );
     stats.linked += w.people.length;

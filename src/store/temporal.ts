@@ -102,7 +102,8 @@ export interface ScopeDocument {
  * no source, so it is left out with merges, research and a person's edits —
  * the scope kinds entity pages fall back to (src/wiki/pages.ts).
  */
-export const SOURCE_SCOPE_KINDS = ['doc', 'tier1'] as const;
+/** Scopes that read a document: its own, its tier-1 extraction, and a back-reference link made from one of its claims (meta.documentId). */
+export const SOURCE_SCOPE_KINDS = ['doc', 'tier1', 'backref'] as const;
 
 export async function scopeDocuments(q: Queryable, scopeIds: Iterable<string>): Promise<Map<string, ScopeDocument>> {
   const ids = [...new Set(scopeIds)];

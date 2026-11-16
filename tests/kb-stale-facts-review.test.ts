@@ -323,4 +323,28 @@ describe('back-references outside periodic reports', () => {
     expect(isSeries(weekly.map((w, i) => ({ ...w, title: ['航空周观察', '新能源车周观察', '半导体周观察', '银行周观察', '地产周观察'][i] })))).toBe(false);
     expect(isSeries(weekly.map((w, i) => ({ ...w, date: ['2025-03-03', '2025-03-04', '2025-03-20', '2025-03-21', '2025-04-30'][i] })))).toBe(false);
   });
+
+  it('gives a link its fix sentence\'s document, passage, trust and acl, and disposes it with that document', async () => {
+    const { linkBackReferences } = await import('../src/graph/backrefs.js');
+    const report = (date: string, body: string, entities: string) => dated('平台组周报', date, `entities:\n${entities}`).replace(/\n平台组周报\n$/, `\n${body}\n`);
+    const ctx = await workspace('attributed', {
+      'raw/docs/周报/平台组/w05.md': report('2025-02-03', 'INC-001-T1（P1）缓存击穿', '  - { name: INC-001-T1, type: event }\nclaims:\n  - { subject: INC-001-T1, statement: INC-001-T1为P1级缓存击穿事故, type: event }\n'),
+      'raw/docs/周报/平台组/w06.md': report('2025-02-10', '上周那起缓存击穿已由方杰修复', '  - { name: 方杰, type: person }\nclaims:\n  - { subject: 方杰, statement: 上周那起缓存击穿已由方杰修复, type: event }\n'),
+    });
+    const config = { review: { ...ctx.config.review, backReferences: { periodic: ['raw/docs/周报'] } } };
+    expect((await linkBackReferences(ctx.store, { config })).linked).toBe(1);
+    const [link] = await ctx.store.query<{ document_id: string | null; description: string; path: string }>(
+      `SELECT r.document_id, r.description, d.path FROM relations r LEFT JOIN documents d ON d.id = r.document_id WHERE r.tx_to IS NULL AND r.target_id = 'inc-001-t1'`,
+    );
+    expect(link).toMatchObject({ path: 'raw/docs/周报/平台组/w06.md', description: '修复上一期报告的缓存击穿' });
+    const [scope] = await ctx.store.query<{ trust: string; acl: unknown; parent_trust: string; parent_acl: unknown; parent_key: string }>(
+      `SELECT s.trust, s.acl, p.trust AS parent_trust, p.acl AS parent_acl, p.key AS parent_key FROM scopes s JOIN scopes p ON p.id = s.parent_id WHERE s.kind = 'backref' AND s.status = 'active'`,
+    );
+    expect(scope).toMatchObject({ parent_key: 'raw/docs/周报/平台组/w06.md', trust: scope.parent_trust, acl: scope.parent_acl });
+    // the fix report removed: the link goes with it, no refine needed
+    fs.rmSync(path.join(ctx.dataDir, 'raw/docs/周报/平台组/w06.md'));
+    await sync(ctx, { llmGraph: false });
+    expect(await ctx.store.query(`SELECT 1 FROM relations WHERE tx_to IS NULL AND target_id = 'inc-001-t1'`)).toEqual([]);
+    expect(await ctx.store.query(`SELECT 1 FROM scopes WHERE kind = 'backref' AND status = 'active'`)).toEqual([]);
+  });
 });
