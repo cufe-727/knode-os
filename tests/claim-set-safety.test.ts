@@ -11,7 +11,7 @@ import { entityKeyKinds } from '../src/graph/normalize.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
 import type { ChatMessage, LlmClient } from '../src/llm/client.js';
 import { ask } from '../src/search/ask.js';
-import { computeClaimSet, documentOwners, readSetQuestion, SET_BLOCK_CHARS, todayIso } from '../src/search/claimset.js';
+import { computeClaimSet, documentOwners, periodOf, readPeriod, readSetQuestion, SET_BLOCK_CHARS, todayIso } from '../src/search/claimset.js';
 import { classifyQuestion } from '../src/search/route.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
 
@@ -547,7 +547,30 @@ describe('round three (C1-C7)', () => {
     await addClaim('us1', 'usx', '美联公司2025年一季度营业额280亿美元', { attribute: '营业额', num: 28e9, unit: 'USD', at: d('2025-04-20'), ...quarter(1) });
     await addClaim('us1', 'usx', '美联公司2025年二季度营业额30 billion', { attribute: '营业额', num: 30, unit: 'USD billion', at: d('2025-07-20'), ...quarter(2) });
     await addClaim('us1', 'usx', '美联公司2025年三季度营业额31 billion', { attribute: '营业额', num: 31, unit: 'USD billion', at: d('2025-10-20'), ...quarter(3) });
+    // a running total (前三季度) beside the single quarters
+    await addEntity('qtx', '青藤科技', 'organization');
+    await addDoc('qt1', '青藤科技季报', d('2025-10-30'), '青藤科技营收。', ['qtx']);
+    await addClaim('qt1', 'qtx', '青藤科技2025年一季度营收100亿元', { attribute: '营收', num: 100, unit: '亿元', at: d('2025-04-20'), ...quarter(1) });
+    await addClaim('qt1', 'qtx', '青藤科技2025年二季度营收110亿元', { attribute: '营收', num: 110, unit: '亿元', at: d('2025-07-20'), ...quarter(2) });
+    await addClaim('qt1', 'qtx', '青藤科技2025年前三季度营收330亿元', { attribute: '营收', num: 330, unit: '亿元', at: d('2025-10-20') });
+    await addClaim('qt1', 'qtx', '青藤科技2025年Q3 YTD营收330亿元', { attribute: '营收', num: 330, unit: '亿元', at: d('2025-10-21'), from: d('2025-01-01'), to: d('2025-09-30') });
+    // a fiscal year that is not the calendar year: its quarters are no calendar quarters
+    await addEntity('yfx', '远帆公司', 'organization');
+    await addDoc('yf1', '远帆公司季报', d('2025-07-30'), '远帆公司营收。', ['yfx']);
+    await addClaim('yf1', 'yfx', '远帆公司2025年一季度营收45亿元', { attribute: '营收', num: 45, unit: '亿元', at: d('2025-04-20'), ...quarter(1) });
+    await addClaim('yf1', 'yfx', '远帆公司2025年二季度营收50亿元', { attribute: '营收', num: 50, unit: '亿元', at: d('2025-07-20'), ...quarter(2) });
+    await addClaim('yf1', 'yfx', '远帆公司2025财年第一季度营收40亿元', { attribute: '营收', num: 40, unit: '亿元', at: d('2025-02-10') });
+    await addClaim('yf1', 'yfx', '远帆公司2025财年第二季度营收42亿元', { attribute: '营收', num: 42, unit: '亿元', at: d('2025-05-10') });
     await tier0Known(store, { force: true });
+  });
+
+  it('C4: reads 前三季度 and a year-to-date window as a running total, not the third quarter', async () => {
+    expect(periodOf({ statement: '青藤科技2025年前三季度营收330亿元' })).toMatchObject({ gran: 'ytd', key: '2025-09' });
+    expect(periodOf({ statement: 'x', valid_from: '2025-01-01', valid_to: '2025-09-30' })).toMatchObject({ gran: 'ytd', key: '2025-09' });
+    expect(readPeriod('青藤科技前三季度营收是多少？', '2025-11-07').period).toMatchObject({ from: '2025-01-01', to: '2025-09-30' });
+    const best = await set('青藤科技2025年单季度最高营收是多少？', ['qtx']);
+    expect(best).toMatchObject({ op: 'max', answer: '110' });
+    expect(best!.lines.join('\n')).toMatch(/of another period length \(ytd\)/);
   });
 
   it('C2: reads a scale written after the currency', async () => {

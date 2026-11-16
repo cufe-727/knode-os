@@ -193,7 +193,8 @@ export function readPeriod(q: string, now: string, groupBy: SetGroup[] = []): { 
   const perQuarter = groupBy.includes('quarter') && /每个?季度|各季度|按季度|\bper quarter\b|\beach quarter\b/i.test(q) && !/第[一二三四1-4]季度/.test(q);
   if (qm && !perQuarter) {
     const n = numOf(qm[1] ?? qm[2]);
-    const cumulative = through.test(q.slice(Math.max(0, qm.index - 4), qm.index));
+    // "截至三季度", "前三季度", "Q3 YTD": from the year's start
+    const cumulative = through.test(q.slice(Math.max(0, qm.index - 4), qm.index)) || /前\s*$/.test(q.slice(0, qm.index)) || /^\s*YTD\b/i.test(q.slice(qm.index + qm[0].length));
     return { period: span(year, cumulative ? 1 : (n - 1) * 3 + 1, n * 3, qm[0]) };
   }
   if (/上半年|\bfirst half\b|\bH1\b/i.test(q)) return { period: span(year, 1, 6, '上半年') };
@@ -340,8 +341,11 @@ export function unitParts(unit: string | null): { scale: number; base: string } 
 /** A claim stated as fact: no forecast, opinion or rumour, nothing suspected or disputed. */
 const isFact = (c: { kind: string | null; status: string | null }) => (c.kind ?? 'fact') === 'fact' && (c.status ?? 'fact') === 'fact';
 
-export type Granularity = 'week' | 'month' | 'quarter' | 'half' | 'year';
-/** The period a reading is of: its granularity and which one ("quarter", "2025-Q1"). */
+export type Granularity = 'week' | 'month' | 'quarter' | 'half' | 'year' | 'ytd';
+/**
+ * The period a reading is of: its granularity and which one ("quarter", "2025-Q1"). A running total from the
+ * year's start ("前三季度", "1-9月", "Q3 YTD") is `ytd`, keyed by its last month ("2025-09"): no quarter's figure.
+ */
 export interface Period { gran: Granularity; key: string }
 
 /** The days a period covers (YYYY-MM-DD, both ends included). */
@@ -359,7 +363,22 @@ export function periodSpan(p: Period): { from: string; to: string } {
     case 'quarter': { const q = Number(p.key.slice(6)); return { from: day(new Date(Date.UTC(y, (q - 1) * 3, 1))), to: day(new Date(Date.UTC(y, q * 3, 0))) }; }
     case 'half': { const h = Number(p.key.slice(6)); return { from: day(new Date(Date.UTC(y, (h - 1) * 6, 1))), to: day(new Date(Date.UTC(y, h * 6, 0))) }; }
     case 'year': return { from: `${y}-01-01`, to: `${y}-12-31` };
+    case 'ytd': { const m = Number(p.key.slice(5, 7)); return { from: `${y}-01-01`, to: day(new Date(Date.UTC(y, m, 0))) }; }
   }
+}
+
+/** A running total from the year's start: "前三季度", "前8个月", "1-9月", "截至三季度末", "Q3 YTD", "9M"; the months it covers. */
+function runningMonths(st: string): number | null {
+  let m = /前\s*([一二两三1-3])\s*(?:个)?季度|\bQ([1-3])\s*YTD\b|截[至止]\s*第?([一二三1-3])\s*季度末?/i.exec(st);
+  if (m) return numOf(m[1] ?? m[2] ?? m[3]) * 3;
+  m = /前\s*([\d一二两三四五六七八九十]{1,3})\s*个月|(?<!\d)(?:1|一)\s*(?:-|－|—|~|～|至|到)\s*(\d{1,2}|[二三四五六七八九十]{1,3})\s*月|截[至止]\s*(\d{1,2})\s*月(?:末|底)|\b(\d{1,2})M\b|\bfirst (\w+) months\b/i.exec(st);
+  if (m) {
+    const words: Record<string, number> = { two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, eleven: 11 };
+    const n = m[5] ? words[m[5].toLowerCase()] ?? 0 : numOf(m[1] ?? m[2] ?? m[3] ?? m[4]);
+    return n >= 2 && n <= 11 ? n : null;
+  }
+  if (/\bfirst (?:three|3) quarters\b|\bnine months\b/i.test(st)) return 9;
+  return null;
 }
 
 /**
@@ -374,6 +393,8 @@ export function periodOf(c: { statement: string; valid_from?: string | Date | nu
     const days = (Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000 + 1;
     const y = from.slice(0, 4);
     const m = Number(from.slice(5, 7));
+    // from the year's start through a month other than June or December: a running total
+    if (from.slice(5) === '01-01' && days > 92 && days < 365 && to.slice(5, 7) !== '06') return { gran: 'ytd', key: to.slice(0, 7) };
     if (days <= 8) return { gran: 'week', key: isoWeek(from) };
     if (days <= 31) return { gran: 'month', key: from.slice(0, 7) };
     if (days <= 92) return { gran: 'quarter', key: `${y}-Q${Math.floor((m - 1) / 3) + 1}` };
@@ -385,6 +406,8 @@ export function periodOf(c: { statement: string; valid_from?: string | Date | nu
   const eff = toDateString(c.eff ?? null);
   const year = /(\d{4})\s*(?:年|财年)/.exec(st)?.[1] ?? /\b(?:FY\s?)?((?:19|20)\d{2})\b/.exec(st)?.[1] ?? eff?.slice(0, 4);
   if (!year) return null;
+  const running = runningMonths(st);
+  if (running) return { gran: 'ytd', key: `${year}-${pad(running)}` };
   let m = /第?([一二三四1-4])\s*季度|\bQ([1-4])\b/i.exec(st);
   if (m) return { gran: 'quarter', key: `${year}-Q${numOf(m[1] ?? m[2])}` };
   if (/上半年|\bH1\b|\bfirst half\b/i.test(st)) return { gran: 'half', key: `${year}-H1` };
@@ -1101,6 +1124,7 @@ async function computeWithin(
       const known = [...byGran].filter(([g]) => g !== 'unknown').sort((a, b) => b[1] - a[1]);
       if (known.length > 1 && known[0][1] === known[1][1]) return skip('two period lengths equally common');
       if (read.op === 'sum' && (byGran.has('unknown') || known.length !== 1)) return skip('a sum over periods not all of one length');
+      if ((read.op === 'sum' || read.op === 'mean') && known[0]?.[0] === 'ytd') return skip('running totals (前三季度, year to date) add up to no figure');
       const theGran = known[0]?.[0];
       if (theGran) for (const [k, c] of readings) if (periods.get(c.id)?.gran !== theGran) { left.grans.set(periods.get(c.id)?.gran ?? 'unknown', (left.grans.get(periods.get(c.id)?.gran ?? 'unknown') ?? 0) + 1); readings.delete(k); }
     }
