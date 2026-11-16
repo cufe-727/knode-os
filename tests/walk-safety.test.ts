@@ -290,6 +290,8 @@ describe('the passage that states a hop', () => {
     }
     const walk = await walkRelations(store, '镜湖基金投资了哪些公司？它们的负责人是谁', ['jh'], { maxHops: 1 });
     expect(walk.steps.map((s) => s.target).sort()).toEqual(['云帆物流', '青石建材']);
+    // nor is the page the source its fact cites
+    expect(stepsAsFacts(walk.steps).map((f) => f.path)).toEqual([null, null]);
     for (const name of ['云帆物流', '青石建材']) {
       const passage = walk.bridges.find((b) => b.trace?.bridgeEntities?.includes(name));
       // a page knode wrote is no source: the passage is shown only as a co-mention, and says so

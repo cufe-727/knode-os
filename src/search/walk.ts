@@ -91,12 +91,13 @@ const WALK_BUDGET_MS = 1500;
 /**
  * The live relations of the given entities: the heaviest `$2` of each, and of each the `$2` whose descriptions
  * hold the most of the question's terms (`$3`, as LIKE patterns; the heaviest among equals), so an entity with more
- * heavy relations than are read cannot hide the light one the question asks about. With their ends, their source and its path.
+ * heavy relations than are read cannot hide the light one the question asks about. With their ends, their source and its path
+ * (a source scope's: a page knode wrote is none).
  */
 const RELATIONS_OF = `SELECT f.id AS near_id, r.id, r.source_id, r.target_id, se.name AS source, te.name AS target, se.type AS source_type, te.type AS target_type,
          r.type, r.description, r.weight, r.valid_from, r.valid_to, r.document_id, r.chunk_id,
          COALESCE((SELECT d.path FROM documents d WHERE d.id = r.document_id),
-                  (SELECT s.key FROM evidence ev JOIN scopes s ON s.id = ev.scope_id
+                  (SELECT s.key FROM evidence ev JOIN scopes s ON s.id = ev.scope_id AND s.kind IN (${SOURCE_SCOPE_KINDS.map((k) => `'${k}'`).join(', ')})
                    WHERE ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL ORDER BY ev.tx_from, s.key LIMIT 1)) AS path
   FROM unnest($1::text[]) AS f(id)
   CROSS JOIN LATERAL (
