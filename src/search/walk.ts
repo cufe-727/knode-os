@@ -75,6 +75,8 @@ export interface Walk {
   bridges: SearchResult[];
   /** The question's ordering ("第二起", "the latest"), the hop it ordered, and each branch's pick or why there was none. */
   ordering?: { asked: string; hop: number | null; picks: string[] };
+  /** The walk's time budget was spent: what it stopped before, after how long. What it had walked is returned. */
+  spent?: { budgetMs: number; ms: number; before: string };
 }
 
 /** Relations kept per hop beside each branch's own best (and on the first hop, in all). */
@@ -83,6 +85,8 @@ const FRONTIER = 5;
 const READ_PER_ENTITY = 150;
 /** Relations of one entity ordered at most: more, and the walk makes no pick and says the set was too large. */
 const ORDER_MAX = 2000;
+/** The walk's time budget by default: past it, no further hop or ordering starts, and the walk returns what it has. */
+const WALK_BUDGET_MS = 1500;
 
 /**
  * The live relations of the given entities: the heaviest `$2` of each, and of each the `$2` whose descriptions
@@ -341,6 +345,8 @@ export async function walkRelations(
     model?: string;
     /** The day a relative period ("今年") is read from (YYYY-MM-DD), as `ask`'s `now`; default the clock's. */
     now?: string;
+    /** Milliseconds the walk may take before it stops starting hops and orderings (default `WALK_BUDGET_MS`). */
+    budgetMs?: number;
   } = {},
 ): Promise<Walk> {
   const maxHops = Math.min(Math.max(opts.maxHops ?? 4, 1), 4);
@@ -367,7 +373,17 @@ export async function walkRelations(
   const used = new Set<string>();
   let frontier = [...named];
 
+  const started = Date.now();
+  const budgetMs = opts.budgetMs ?? WALK_BUDGET_MS;
+  const over = (before: string) => {
+    const ms = Date.now() - started;
+    if (ms < budgetMs || out.spent) return !!out.spent;
+    out.spent = { budgetMs, ms, before };
+    return true;
+  };
   for (let hop = 1; hop <= maxHops && frontier.length > 0; hop++) {
+    // the first hop always runs: a walk that returns nothing for want of time would say less than a short one
+    if (hop > 1 && over(`hop ${hop}`)) break;
     const rows = await store.query<RelRow & { near_id: string }>(RELATIONS_OF, [frontier, READ_PER_ENTITY, patterns]);
     const toCandidate = (r: RelRow & { near_id: string }): Candidate => {
       const nearId = r.near_id;
@@ -423,7 +439,8 @@ export async function walkRelations(
     if (ordinal && orderKey && orderedHop === null) {
       const spellings = terms.filter((t) => t.key === orderKey).map((t) => t.text);
       const ofKind = (c: Candidate) => spellings.some((w) => termCount(c.text, w) > 0);
-      const nears = [...new Set(candidates.filter(ofKind).map((c) => c.nearId))];
+      const nears = over(`ordering at hop ${hop}`) ? [] : [...new Set(candidates.filter(ofKind).map((c) => c.nearId))];
+      if (out.spent && out.spent.before === `ordering at hop ${hop}`) picks.push(`not ordered: ${ordinal.text}: the walk's time budget (${budgetMs} ms) was spent before it could order`);
       // every relation of those entities, not the heaviest READ_PER_ENTITY: the year's first incident may be a light one
       const full = nears.length === 0 ? [] : await store.query<RelRow & { near_id: string }>(RELATIONS_OF, [nears, ORDER_MAX + 1, patterns]);
       const pools = new Map<string, Candidate[]>();
@@ -451,7 +468,7 @@ export async function walkRelations(
         for (const [nearId, pool] of ordered) {
           const nearName = pool[0].r.source_id === nearId ? pool[0].r.source : pool[0].r.target;
           if ((counts.get(nearId) ?? 0) > ORDER_MAX) {
-            picks.push(`${nearName}: not ordered: ${ordinal.text} would order more than ${ORDER_MAX} relations of ${nearName}`);
+            picks.push(`${nearName}: not ordered: ${ordinal.text} would order more than ${ORDER_MAX} relations of ${nearName}; its candidates are walked unordered`);
             continue;
           }
           const byFar = new Map(pool.map((c) => [c.farId, c]));

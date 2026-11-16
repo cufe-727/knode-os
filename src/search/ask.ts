@@ -41,6 +41,8 @@ export interface AskRoute {
     hops: number; relations: number; reached: number; bridges: number;
     /** What the question ordered ("第二起"), the hop it ordered, and each branch's pick or why there was none. */
     ordering?: { asked: string; hop: number | null; picks: string[] };
+    /** The walk's time budget was spent before it finished: what it stopped before, after how long. */
+    spent?: { budgetMs: number; ms: number; before: string };
   };
   /** For a question asking for a set, a count or a value as of a date: what the claims gave (docs/design/34 §1). */
   computed?: { op: string; scope: string; matched: number; items: number; rows: number; ms: number };
@@ -382,11 +384,20 @@ async function multihopAnswer(env: RouteEnv): Promise<AskResult> {
     statement: `Ordered by the walk from the dates the sources state (no source states this order): ${walk.ordering!.asked} — ${pick}`,
     startDate: null, endDate: null, eventDate: null, path: null, chunkId: null,
   }));
+  // a walk cut short by its time budget says where it stopped: what lies past it was not looked for, not absent
+  if (walk.spent) {
+    ordering.push({
+      id: 'walk:spent', subject: '', object: null, type: 'walk', status: 'computed', kind: 'fact',
+      statement: `The relation walk stopped before ${walk.spent.before}: its time budget (${walk.spent.budgetMs} ms) was spent after ${walk.spent.ms} ms; relations past that point were not looked for`,
+      startDate: null, endDate: null, eventDate: null, path: null, chunkId: null,
+    });
+  }
   const facts: PromptFact[] = [...ordering, ...steps, ...ranked.filter((f) => !stepIds.has(f.id))];
   return compose({ ...env, computed }, contexts, [...facts, ...currentFacts(contexts, facts)], '', routeOf(env.routed, {
     walked: {
       hops: walk.steps.reduce((n, s) => Math.max(n, s.hop), 0), relations: walk.steps.length, reached: walk.reached.length, bridges: walk.bridges.length,
       ...(walk.ordering ? { ordering: walk.ordering } : {}),
+      ...(walk.spent ? { spent: walk.spent } : {}),
     },
   }));
 }

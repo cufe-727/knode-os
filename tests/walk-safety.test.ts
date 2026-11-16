@@ -325,3 +325,33 @@ describe('the walk\'s vocabulary', () => {
     expect(walkTerms('他后来调到了哪个团队').budget.has('type:organization')).toBe(true);
   });
 });
+
+describe('the walk\'s cost', () => {
+  /** The store, with every statement it is asked recorded. */
+  const recording = () => {
+    const sqls: string[] = [];
+    const q0 = store.query.bind(store);
+    const spy = Object.assign(Object.create(Object.getPrototypeOf(store)), store, {
+      query: async (sql: string, params?: unknown[]) => {
+        sqls.push(sql);
+        return q0(sql, params as never[]);
+      },
+    }) as Store;
+    return { spy, sqls };
+  };
+
+  it('reads no document dates for candidates whose own claims date them', async () => {
+    const { spy, sqls } = recording();
+    const walk = await walkRelations(spy, '风控平台组今年第一起事故是谁修复的？', ['risk'], { maxHops: 1, now: '2026-06-01' });
+    expect(walk.steps.find((s) => s.order)?.source).toBe('EVT-150');
+    expect(sqls.filter((q) => q.includes("date_trunc('day'"))).toEqual([]);
+    expect(sqls.filter((q) => q.includes('FROM entity_mentions WHERE entity_id = ANY'))).toEqual([]);
+  });
+
+  it('returns what it has when its time budget is spent, and says so', async () => {
+    const walk = await walkRelations(store, '二部平台组的事故是谁修复的？他还修复过哪些事故', ['plat'], { maxHops: 3, budgetMs: 0 });
+    expect(walk.steps.length).toBeGreaterThan(0);
+    expect(walk.steps.every((s) => s.hop === 1)).toBe(true);
+    expect(walk.spent).toMatchObject({ budgetMs: 0, before: 'hop 2' });
+  });
+});
