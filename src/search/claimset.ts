@@ -73,8 +73,29 @@ export const SET_SCAN_CAP = 20000;
 export const SET_BUDGET_MS = 1000;
 /** People read from the mentions of a set's claims at most. */
 const PEOPLE_CAP = 2000;
-/** Rows a computed set hands the model at most. */
-export const SET_ROWS = 240;
+/** Rows a computed set hands the model at most (the facts it joins are capped at the enumerate limit). */
+export const SET_ROWS = 100;
+/** Characters of computed lines the prompt is given at most; past them, item lines are cut and the block says how many. */
+export const SET_BLOCK_CHARS = 6000;
+
+/**
+ * The lines within `SET_BLOCK_CHARS`: every line that is no item ("12 distinct …", "Q1: 3", "Left out: …") is
+ * kept, item lines ("- …") in order while there is room, and a last line says how many were cut — the counts
+ * cover them.
+ */
+export function boundLines(lines: string[], budget = SET_BLOCK_CHARS): string[] {
+  const total = lines.reduce((n, l) => n + l.length + 1, 0);
+  if (total <= budget) return lines;
+  let room = budget - lines.filter((l) => !l.startsWith('- ')).reduce((n, l) => n + l.length + 1, 0);
+  let cut = 0;
+  const out: string[] = [];
+  for (const l of lines) {
+    if (!l.startsWith('- ')) { out.push(l); continue; }
+    if (room - (l.length + 1) >= 0) { out.push(l); room -= l.length + 1; } else cut++;
+  }
+  if (cut) out.push(`… ${cut} more lines not shown (the counts above cover them; the rows listed are a sample).`);
+  return out;
+}
 /** Rows of one item listed at most (its first and its latest are always among them). */
 const ROWS_PER_ITEM = 4;
 
@@ -1097,7 +1118,7 @@ export async function computeClaimSet(
   return {
     op: read.op, question: read, scope: scopeText,
     matchedBy: [...[...matchedAttrs].map((a) => `attribute:${a}`), ...terms.map((t) => `term:${t}`), ...(namedValue ? [`value:${namedValue}`] : [])],
-    matched: matched.length, capped, items, lines, answer, rows: dedupeRows(rows).slice(0, SET_ROWS), ms: Date.now() - started,
+    matched: matched.length, capped, items, lines: boundLines(lines), answer, rows: dedupeRows(rows).slice(0, SET_ROWS), ms: Date.now() - started,
   };
 }
 

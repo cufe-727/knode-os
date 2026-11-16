@@ -3,11 +3,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { defaultConfig, KnodeConfig } from '../src/config.js';
+import { tier0Known } from '../src/graph/concepts.js';
 import { entityKeyKinds } from '../src/graph/normalize.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
 import type { ChatMessage, LlmClient } from '../src/llm/client.js';
 import { ask } from '../src/search/ask.js';
-import { computeClaimSet } from '../src/search/claimset.js';
+import { computeClaimSet, SET_BLOCK_CHARS } from '../src/search/claimset.js';
 import { classifyQuestion } from '../src/search/route.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
 
@@ -291,6 +292,35 @@ describe('bounded work: SQL over indexes and a time budget (review item 5)', () 
   it('computes nothing once its time budget is spent', async () => {
     const q = '宁德时代有哪些客户？';
     expect(await computeClaimSet(store, q, classifyQuestion(q), ['catl'], { budgetMs: 0 })).toBeNull();
+  });
+});
+
+describe('a bounded block (review item 6)', () => {
+  beforeAll(async () => {
+    // an organisation with a thousand customers
+    await addEntity('big', '远航集团', 'organization');
+    await addDoc('big-1', '远航集团客户名录', d('2025-06-01'), '远航集团客户名录。', ['big']);
+    await store.query(`INSERT INTO entities (id, name, type, mention_count, aliases, description) SELECT 'cust-' || i, '客户公司' || i || '有限责任公司', 'organization', 1, '[]'::jsonb, '' FROM generate_series(1, 1000) i`);
+    await store.query(
+      `INSERT INTO claims (id, subject_id, object_id, type, statement, status, kind, chunk_id, primary_scope_id, evidence_count, tx_from, effective_at, correction)
+       SELECT 'cc-' || i, 'cust-' || i, 'big', 'other', '客户公司' || i || '有限责任公司是远航集团的客户', 'fact', 'fact', 'c-big-1', 's-big-1', 1, now(), '2025-06-01T00:00:00Z', false FROM generate_series(1, 1000) i`,
+    );
+    await store.query(`INSERT INTO evidence (kind, target_id, scope_id, weight, extractor, tx_from) SELECT 'claim', 'cc-' || i, 's-big-1', 1, 'fixture', now() FROM generate_series(1, 1000) i`);
+    // the names a question is matched against are cached: an entity added after the first ask is known only after a refresh
+    await tier0Known(store, { force: true });
+  });
+
+  it('cuts the computed block at its character budget, says so, and lists no more facts than the limit', async () => {
+    const { llm, prompts } = recordingLlm();
+    // its own budget is tested apart: a loaded machine may spend the default one here
+    const res = await ask(store, withRouter({ computedBudgetMs: 60_000 }), embedder, llm, '远航集团有哪些客户？', { computed: true });
+    const p = prompts[0];
+    const block = p.slice(p.indexOf('# Computed from the claims'), p.indexOf('# Question'));
+    expect(res.computed!.items).toBe(1000);
+    expect(block.length).toBeLessThanOrEqual(SET_BLOCK_CHARS + 400);
+    expect(block).toMatch(/1000 distinct organization/);
+    expect(block).toMatch(/\d+ more lines not shown/);
+    expect(res.facts.length).toBeLessThanOrEqual(defaultConfig().retrieval.router!.enumerateLimit);
   });
 });
 

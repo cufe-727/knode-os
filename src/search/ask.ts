@@ -359,7 +359,8 @@ async function compose(env: RouteEnv, firstContexts: SearchResult[], firstRanked
   // the computed set's rows lead the facts; what else was ranked follows, without repeating them
   const setRows = computed ? computedFacts(computed) : [];
   const inSet = new Set(setRows.map((f) => f.id));
-  const facts = [...setRows, ...ranked.filter((f) => !inSet.has(f.id))];
+  // a computed set's rows count toward the enumerate limit: the facts listed stay within it
+  const facts = [...setRows, ...ranked.filter((f) => !inSet.has(f.id))].slice(0, computed ? Math.max(env.router.enumerateLimit, setRows.length) : undefined);
   const extra = `${counts}${computed ? renderComputed(computed) : ''}`;
   const route: AskRoute = computed
     ? { ...routed, computed: { op: computed.op, scope: computed.scope, matched: computed.matched, items: computed.items, rows: setRows.length, ms: computed.ms } }
