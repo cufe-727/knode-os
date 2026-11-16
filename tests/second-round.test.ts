@@ -7,7 +7,7 @@ import { entityKeyKinds } from '../src/graph/normalize.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
 import type { LlmClient } from '../src/llm/client.js';
 import { ask } from '../src/search/ask.js';
-import { missingTerms, SECOND_CHUNKS, secondRound } from '../src/search/second.js';
+import { missingTerms, questionWords, SECOND_CHUNKS, secondRound } from '../src/search/second.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
 
 /**
@@ -116,6 +116,9 @@ describe('the missing words', () => {
     expect(missingTerms('曾毓群是哪家公司的董事长？', ['曾毓群'], '曾毓群任宁德时代董事长')).toEqual([]);
     expect(missingTerms('CATL的海外工厂在哪里？', ['CATL'], 'CATL的海外工厂位于匈牙利')).toEqual([]);
     expect(missingTerms('Who raised risk R-07, and where is that person now?', ['R-07'], 'Li Wei raised risk R-07')).toEqual([]);
+    // counting words, dates and numbers are not what is asked about
+    expect(questionWords('宁德时代一共有几个客户？')).toEqual(['宁德', '时代', '客户']);
+    expect(questionWords('宁德时代2025年三季度毛利率是多少？')).toEqual(['宁德', '时代', '毛利率']);
   });
 });
 
@@ -162,6 +165,16 @@ describe('the second round', () => {
     const worded = await secondRound(store, 'What did Helios decide about the battery recall?', { named: ['helios'], contexts: [], facts: [], chain: false });
     expect(worded!.chunks[0].path).toBe('raw/docs/helios-zz-recall.md');
     expect(worded!.chunks.length).toBeLessThanOrEqual(SECOND_CHUNKS);
+  });
+
+  it('reads a lookup further only from what it names, and only what holds the word it missed', async () => {
+    // Orion is covered; "budget" is in nothing: the round may only bring Orion's passages or facts holding it — there are none
+    const r = await secondRound(store, 'What was the budget of Orion?', {
+      named: ['orion'], contexts: [result('orion-2', 'Orion launched in week 32.')], facts: [], chain: false,
+    });
+    expect(r?.reason.from ?? []).toEqual(['Orion']);
+    expect(r?.chunks ?? []).toEqual([]);
+    expect(r?.facts ?? []).toEqual([]);
   });
 
   it('gives an ordinary lookup whose passages hold its words no round, however its words split into pairs', async () => {

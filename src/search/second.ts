@@ -61,12 +61,13 @@ const UNKNOWN_RUN_MAX = 6;
 /** Words that ask, or point back or at now, rather than name what is asked about. */
 const ASKING = new Set([
   '哪里', '哪儿', '哪个', '哪家', '哪位', '哪些', '哪一', '什么', '怎么', '怎样', '如何', '为什么', '为何', '多少', '几个', '是否', '现在', '目前', '当前', '如今', '后来', '此人', '这个', '那个', '情况',
+  '一共', '共有', '一共有', '总共', '合计', '总计', '分别', '各自', '最近', '近期',
   'who', 'whom', 'whose', 'what', 'where', 'when', 'which', 'why', 'how', 'now', 'currently', 'today', 'person', 'people', 'one', 'that', 'this', 'they', 'them', 'their',
 ]);
 /** An interrogative whose next word is the kind of answer asked for ("哪家公司", "which team"), not a word the passages must hold. */
 const ASKS_FOR = /^(?:哪|哪家|哪个|哪位|哪些|哪一|什么|啥|which|what)$/i;
 /** Characters of grammar: they break a run of characters the segmenter cut one by one, and a word made only of them is no word ("到了", "的人"). */
-const GRAMMAR = /^[的了过是在有和与及那这它他她其被由把将又也都还就人个位些此该吗呢么到着得地对从向给于为等之所以而且但或并]+$/;
+const GRAMMAR = /^[的了过是在有和与及那这它他她其被由把将又也都还就人个位些此该吗呢么到着得地对从向给于为等之所以而且但或并年月日号周季度一二三四五六七八九十百千万亿两第]+$/;
 /** Measure characters between an interrogative and what it asks for ("哪|家|公司", "几|个|人"). */
 const MEASURE = /^[家个位名种条项些起件只台座次]$/;
 
@@ -80,6 +81,8 @@ export function questionWords(question: string): string[] {
     if (skipNext) { skipNext = false; return; }
     if (ASKING.has(lower) || CJK_QUERY_STOP.has(lower) || LATIN_QUERY_STOP.has(lower) || GRAMMAR.test(lower)) return;
     if (/^[a-z0-9-]+$/i.test(w) ? w.length < 3 : w.length < 2) return;
+    // a number or a year is a period or a figure, not a word the passages must hold
+    if (/^\d+$/.test(w)) return;
     out.push(lower);
   };
   for (const m of question.matchAll(/[一-鿿㐀-䶿]+|[A-Za-z][A-Za-z0-9-]*|\d+/g)) {
@@ -220,8 +223,17 @@ export async function secondRound(
     );
     for (const h of hubs) common.add(h.id);
   }
-  const from = [...uncoveredIds, ...bridges.map((b) => b.id)];
+  // a lookup looks further only from what it names: the passages of a named entity holding the words it missed
+  // ("宁德时代的董事长" reads 宁德时代's passages that hold 董事); a chain from the entities its first round reached as
+  // well — never a lookup from whatever its passages happen to mention
+  const namedIds = [...new Set(namedRows.map((r) => r.id))];
+  const from = opts.chain
+    ? [...uncoveredIds, ...bridges.map((b) => b.id)]
+    : uncoveredIds.length ? uncoveredIds : missing.length ? namedIds : [];
   if (from.length === 0) return null;
+  // a lookup reading a named entity it already covers takes only what holds a word it missed
+  const wordsOnly = !opts.chain && uncoveredIds.length === 0;
+  if (wordsOnly) for (const id of namedIds) common.add(id);
 
   // the passages that mention them, most of them first, then nearness, then the missing words. A hub's mentions are
   // more than any pool: its passages nearest the question (the vector index) and those holding a missing word (the
@@ -286,10 +298,11 @@ export async function secondRound(
   const known = new Set(facts.map((f) => `${f.subject}|${f.statement}`));
   const more = (await factsForQuestion(store, question, chunks, { named: from, limit: SECOND_FACTS + facts.length, queryVector: opts.queryVector, model: opts.model }))
     .filter((f) => !known.has(`${f.subject}|${f.statement}`))
+    .filter((f) => !wordsOnly || missing.some((t) => `${f.subject} ${f.statement} ${f.object ?? ''}`.toLowerCase().includes(t)))
     .slice(0, SECOND_FACTS);
   statements += 1; // factsForQuestion: one statement (its list routes are not asked for)
   return {
-    reason: { uncoveredNamed: uncovered.map((r) => r.name), missingTerms: missing, from: [...uncovered.map((r) => r.name), ...bridges.map((b) => b.name)] },
+    reason: { uncoveredNamed: uncovered.map((r) => r.name), missingTerms: missing, from: opts.chain || uncovered.length ? [...uncovered.map((r) => r.name), ...(opts.chain ? bridges.map((b) => b.name) : [])] : [...groups.values()].map((g) => (g.find((r) => r.id === r.root) ?? g[0]).name) },
     chunks, facts: more, statements, ms: Date.now() - started,
   };
 }
