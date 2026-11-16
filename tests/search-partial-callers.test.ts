@@ -9,7 +9,7 @@ import { AppContext, createContext } from '../src/context.js';
 import { registerKnodeTools } from '../src/mcp/tools.js';
 import { MCP_SERVER_INFO } from '../src/mcp/server.js';
 import { search } from '../src/search/search.js';
-import { createApp, SEARCH_PARTIAL_HEADER } from '../src/server/app.js';
+import { createApp, SEARCH_PARTIAL_HEADER, SEARCH_ROUTE_K_MAX } from '../src/server/app.js';
 import { WorkspaceContextRegistry } from '../src/server/workspaces.js';
 import { VECTOR_TYPE } from '../src/store/db.js';
 import { resolveScopeFilter } from '../src/store/resolver.js';
@@ -168,5 +168,23 @@ describe('GET /api/search with a k that is not a number of results', () => {
       expect(await search(ctx.store, ctx.embedder, 'ledger entry', { k, mode: 'keyword', track: false }), String(k)).toHaveLength(8);
     }
     expect(await search(ctx.store, ctx.embedder, 'ledger entry', { k: 2.9, mode: 'keyword', track: false })).toHaveLength(2);
+  });
+});
+
+describe('GET /api/search with a k larger than any caller needs', () => {
+  it('returns a hundred results at the most, as a walk does: not the workspace', async () => {
+    expect(SEARCH_ROUTE_K_MAX).toBe(100);
+    const count = async (k: string) => {
+      const res = await app.request(`/api/search?q=${encodeURIComponent('ledger entry')}&mode=keyword&k=${k}`, { headers });
+      expect(res.status, `k=${k}`).toBe(200);
+      return (await res.json() as unknown[]).length;
+    };
+    // 3,100 chunks hold the words: `k=1e9` returned every one of them, with its content
+    expect(await count('1e9')).toBe(100);
+    expect(await count('101')).toBe(100);
+    expect(await count('100')).toBe(100);
+    // what the callers there are ask for is untouched: the embed's 24, the desktop app's 12, the CLI's 8
+    expect(await count('24')).toBe(24);
+    expect(await count('12')).toBe(12);
   });
 });
