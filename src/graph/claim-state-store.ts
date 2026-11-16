@@ -106,21 +106,24 @@ export async function refreshAttributeKeys(store: Store, opts: { subjects?: stri
   );
   const spellings = new Map<string, string[]>();
   for (const [root, list] of groupBy(names, (r) => r.root)) spellings.set(root, list.flatMap((r) => subjectSpellingsOf(r.name, r.aliases ?? [])));
+  const current = await store.query<{ subject_id: string; attribute: string; canonical: string }>(
+    `SELECT subject_id, attribute, canonical FROM claim_attribute_keys${opts.subjects ? ' WHERE subject_id = ANY($1::text[])' : ''}`,
+    only,
+  );
+  // the names groups are stored under, so that a tie keeps its name
+  const storedBySubject = groupBy(current, (r) => r.subject_id);
   const desired = new Map<string, { subject: string; attribute: string; canonical: string; reason: string }>();
   for (const [root, list] of groupBy(uses, (u) => u.root)) {
     const keys = [...groupBy(list, (u) => u.attribute).entries()].map(([attribute, rows]) => ({
       attribute, count: rows.reduce((n, r) => n + r.n, 0), units: [...new Set(rows.flatMap((r) => r.units))],
     }));
-    const map = unifyAttributeKeys(keys, spellings.get(root) ?? []);
+    const stored = new Set([...new Set(list.map((u) => u.subject_id))].flatMap((id) => (storedBySubject.get(id) ?? []).map((r) => r.canonical)));
+    const map = unifyAttributeKeys(keys, spellings.get(root) ?? [], stored);
     for (const u of list) {
       const m = map.get(u.attribute);
       if (m) desired.set(`${u.subject_id}\u0000${u.attribute}`, { subject: u.subject_id, attribute: u.attribute, ...m });
     }
   }
-  const current = await store.query<{ subject_id: string; attribute: string; canonical: string }>(
-    `SELECT subject_id, attribute, canonical FROM claim_attribute_keys${opts.subjects ? ' WHERE subject_id = ANY($1::text[])' : ''}`,
-    only,
-  );
   const have = new Map(current.map((r) => [`${r.subject_id}\u0000${r.attribute}`, r.canonical]));
   const stale = current.filter((r) => !desired.has(`${r.subject_id}\u0000${r.attribute}`));
   if (stale.length > 0) {

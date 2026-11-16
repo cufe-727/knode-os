@@ -59,8 +59,8 @@ describe('reading a claim as attribute + value', () => {
       { attribute: '在岗人数', count: 5, units: ['人'] },
       { attribute: '活跃度', count: 2, units: ['%'] },
     ]);
-    // named by rule: the whole key, not one a neutral word cuts short
-    expect(m.get('周活跃用户')?.canonical).toBe('周活跃用户数');
+    // named by the most used key, as stored mappings were named before
+    expect(m.get('周活跃用户数')?.canonical).toBe('周活跃用户');
     expect(m.has('在岗人数')).toBe(false);
     expect(m.has('活跃度')).toBe(false);
   });
@@ -80,7 +80,7 @@ describe('reading a claim as attribute + value', () => {
       { attribute: '营收指引', count: 3, units: ['亿元'] },
     ], ['贵州茅台']);
     // only the two spellings of one week-on-week change are one key; a target is not the price, guidance not revenue
-    expect([...m.entries()].map(([k, v]) => `${k}→${v.canonical}`)).toEqual(['支付成功率环比变化→支付成功率环比']);
+    expect([...m.entries()].map(([k, v]) => `${k}→${v.canonical}`)).toEqual(['支付成功率环比→支付成功率环比变化']);
   });
 
   it('makes the keys that name a setting itself one key, and its first value another', () => {
@@ -444,9 +444,9 @@ describe('a fixture build of weekly reports', () => {
     );
     // "在岗人数为7人" is said in weeks 1-4 and 9-12: one claim, dated by week 12, not week 1
     expect(headcount).toEqual([{ value_num: 7, effective_at: new Date(`${week(PAY_WEEKS - 1)}T00:00:00.000Z`), effective_source_path: `raw/docs/周报/支付组/${week(PAY_WEEKS - 1)}.md`, date_source: 'document' }]);
-    // 周活跃用户 and 周活跃用户数 are one key of the subject, named by the whole key
+    // 周活跃用户 and 周活跃用户数 are one key of the subject
     const wau = await ctx.store.query<{ attribute: string; n: number }>(`SELECT attribute, count(*)::int AS n FROM v_claims WHERE subject_id = '支付组' AND attribute LIKE '周活跃%' GROUP BY 1`);
-    expect(wau).toEqual([{ attribute: '周活跃用户数', n: PAY_WEEKS }]);
+    expect(wau).toEqual([{ attribute: '周活跃用户', n: PAY_WEEKS }]);
 
     // the page
     await ensureEntityStubs(ctx, { minMentions: 1 });
@@ -459,7 +459,7 @@ describe('a fixture build of weekly reports', () => {
     const team = page('支付组');
     expect(team).toContain(`- **在岗人数**: 7人 \`as of ${week(PAY_WEEKS - 1)}\``);
     expect(team).toContain(`  - history: 8人 (${week(7)})`);
-    expect(team).toMatch(/- \*\*周活跃用户数\*\*: 151万/);
+    expect(team).toMatch(/- \*\*周活跃用户\*\*: 151万/);
     // the renamed project's page holds what was said under its old name
     const orion = page('orion');
     expect(orion).toMatch(/- \*\*进度\*\*: 72%/);

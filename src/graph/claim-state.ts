@@ -505,14 +505,17 @@ function dice(a: string, b: string): number {
  * a week-on-week change and the week's value, a setting's first value and its
  * current one, 环比涨幅 and 同比涨幅. Keys are taken most used first (ties:
  * code-point order) and each joins the first group it is one with, as before.
- * A group's canonical key is chosen by rule, not by count: its synonym head
- * (负责人, 状态, 级别), else the subject's own name, else the shortest key that
- * no other member only extends by a neutral word (用户数, not 用户). A key alone
- * is mapped to its synonym head too, so stored keys of an older reading
+ * A group's canonical key is its most used key, as before, so that an
+ * upgrade rewrites as few stored mappings as it can: ties go to a name the
+ * group is already stored under (`stored`, the canonical keys in
+ * claim_attribute_keys), then to code-point order. One exception: a group
+ * with a key of a synonym group goes by that group's head (负责人, 状态,
+ * 级别), a key alone included: owner and state series are read on the head
+ * (审批状态 joined with 状态 is a state), and stored keys of an older reading
  * (跟进人) move with the mapping, without re-reading their claims.
  * Returns key → canonical key, with the reason, for keys that change.
  */
-export function unifyAttributeKeys(uses: AttributeUse[], spellings: readonly string[] = []): Map<string, { canonical: string; reason: string }> {
+export function unifyAttributeKeys(uses: AttributeUse[], spellings: readonly string[] = [], stored: ReadonlySet<string> = new Set()): Map<string, { canonical: string; reason: string }> {
   const sorted = [...uses].sort((a, b) => b.count - a.count || (a.attribute < b.attribute ? -1 : a.attribute > b.attribute ? 1 : 0));
   const unitOf = (u: AttributeUse) => [...new Set(u.units.map((x) => x || '∅'))].sort().join('|');
   type Key = { use: AttributeUse; unit: string; qualifiers: string; synonym: string | null; neutral: string; self: boolean; why: string };
@@ -539,16 +542,12 @@ export function unifyAttributeKeys(uses: AttributeUse[], spellings: readonly str
     }
     if (!joined) groups.push([k]);
   }
-  const own = spellings.map((s) => fold(s));
-  const extends_ = (a: string, b: string) => b.length > a.length && b.startsWith(a) && /^(?:数量|数|水平)$/u.test(b.slice(a.length));
   const out = new Map<string, { canonical: string; reason: string }>();
   for (const keys of groups) {
     const head = keys.find((k) => k.synonym)?.synonym;
-    const named = keys.find((k) => own.includes(fold(k.use.attribute)))?.use.attribute;
-    const names = keys.map((k) => k.use.attribute);
-    const whole = names.filter((n) => !names.some((o) => extends_(n, o)));
-    const shortest = [...whole].sort((a, b) => a.length - b.length || (a < b ? -1 : 1))[0];
-    const canonical = head ?? named ?? shortest;
+    // keys are in count order: the most used, a tie going to the name already stored, then code point
+    const top = keys.filter((k) => k.use.count === keys[0].use.count);
+    const canonical = head ?? (top.find((k) => stored.has(k.use.attribute)) ?? top[0]).use.attribute;
     for (const k of keys) {
       if (k.use.attribute === canonical) continue;
       out.set(k.use.attribute, { canonical, reason: `与"${canonical}"${k.why}（${k.use.count} 条断言）` });

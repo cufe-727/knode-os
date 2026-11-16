@@ -115,3 +115,26 @@ describe('an owner written in the active voice', () => {
     expect(await currentStatements(ctx)).toEqual(['云业务改由李四负责']);
   });
 });
+
+describe('the name a group of keys goes by', () => {
+  it('is the most used key, as stored keys were named before, ties by the name stored', async () => {
+    const { unifyAttributeKeys } = await import('../src/graph/claim-state.js');
+    const use = (attribute: string, count: number) => ({ attribute, count, units: ['亿元'] });
+    expect(unifyAttributeKeys([use('归母净利润', 5), use('净利润', 2)]).get('净利润')?.canonical).toBe('归母净利润');
+    expect(unifyAttributeKeys([use('归母净利润', 2), use('净利润', 5)]).get('归母净利润')?.canonical).toBe('净利润');
+    // a tie keeps the name the group already had
+    expect(unifyAttributeKeys([use('归母净利润', 3), use('净利润', 3)], [], new Set(['归母净利润'])).get('净利润')?.canonical).toBe('归母净利润');
+    expect(unifyAttributeKeys([use('归母净利润', 3), use('净利润', 3)], [], new Set(['净利润'])).get('归母净利润')?.canonical).toBe('净利润');
+  });
+
+  it('is not rewritten by a refresh when the counts tie', async () => {
+    const { refreshAttributeKeys } = await import('../src/graph/claim-state-store.js');
+    const ctx = await twoDocs('key-name', '比亚迪', [['比亚迪归母净利润为100亿元', '归母净利润', '100']], [['比亚迪净利润为120亿元', '净利润', '120']]);
+    await ctx.store.query(`UPDATE claims SET value_text = NULL, value_num = 100, unit = '亿元' WHERE attribute = '归母净利润'`);
+    await ctx.store.query(`UPDATE claims SET value_text = NULL, value_num = 120, unit = '亿元' WHERE attribute = '净利润'`);
+    await ctx.store.query(`DELETE FROM claim_attribute_keys`);
+    await ctx.store.query(`INSERT INTO claim_attribute_keys (subject_id, attribute, canonical, reason, updated_at) VALUES ('比亚迪', '净利润', '归母净利润', 'stored', now())`);
+    expect(await refreshAttributeKeys(ctx.store)).toEqual({ mapped: 0, dropped: 0 });
+    expect(await ctx.store.query(`SELECT attribute, canonical FROM claim_attribute_keys`)).toEqual([{ attribute: '净利润', canonical: '归母净利润' }]);
+  });
+});
