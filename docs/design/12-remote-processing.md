@@ -200,7 +200,17 @@ processing is started, as embedding does now.
   them. Carried on for each side, it made a search three to five times slower on a copy of the finance index
   (562,563 chunks, an eighth of them generated pages, seldom among the nearest): 192 to 272 ms at the median with
   nothing in memory, against 76 to 81 before any of this and 48 to 56 now. No server setting is involved, and
-  none needs changing. That scan exists from pgvector 0.8.0. What decides is the **library** the
+  none needs changing.
+
+  A search its caller narrowed to kinds or places (`kinds`, `sources`) is costed for itself (since 2026‑11‑16;
+  `scopedRows`): the side is the caller's choice and may lie anywhere from the question, so the 2,000 rows a search
+  of everything spends on a side are not its bound. A side of up to √(8 · k · chunks) chunks is ranked by reading
+  its vectors (10,400 on the finance index for the 24 a search of 8 asks for), a larger one by walking the index on
+  for as many rows, and a side that walk found nothing of is read after all, as far as four times that, in a
+  second statement: a narrowed search whose filter matches chunks with vectors does not come back empty. The 2,000
+  had bounded these too, and a folder of 2,500 chunks away from the question returned nothing.
+
+  That scan exists from pgvector 0.8.0. What decides is the **library** the
   server has loaded, not `pg_extension.extversion`: knode-os asks whether the setting exists
   (`current_setting('hnsw.iterative_scan', true)`), once per store, and `serve` logs one line per workspace it opens
   saying which behaviour is in effect and why (`describeVectorScan`). knode-os never alters the extension. What an
@@ -208,8 +218,9 @@ processing is started, as embedding does now.
 
   - *The log says "one walk of the index per search".* The library is older than 0.8.0. Install pgvector 0.8.0 or
     later on the database server (the package, or `make install` of the release), restart PostgreSQL, then in each
-    database that has the extension: `ALTER EXTENSION vector UPDATE;`. Until then a filtered search, and the sources'
-    side of a search, get what the nearest 40 rows hold, as before this change.
+    database that has the extension: `ALTER EXTENSION vector UPDATE;`. Until then the sources' side of a search
+    gets what the nearest 40 rows hold, as before this change, and a narrowed search whose side those rows hold
+    nothing of reads the side (the second statement above) every time.
   - *The log says "the catalog is behind the library".* The library was upgraded and `ALTER EXTENSION vector UPDATE`
     was not run. Search already uses the iterative scan; run the statement, as the extension's owner, to bring the
     catalog (and the SQL objects of later versions) in line.
