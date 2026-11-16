@@ -555,6 +555,13 @@ describe('round three (C1-C7)', () => {
     expect(await set('美联公司的最高营业额是多少？', ['usx'])).toMatchObject({ op: 'max', answer: '31' });
   });
 
+  it('C3: compares a threshold in its own unit', async () => {
+    // 销售额 (item 4): 847, 942 and 1041 亿元 a quarter: none is above 1万亿元
+    expect(await set('宁德时代销售额超过1万亿元的季度有哪些？', ['catl'])).toBeNull();
+    const above = await set('宁德时代销售额超过900亿元的季度有哪些？', ['catl']);
+    expect(above!.lines.filter((l) => l.startsWith('- ')).length).toBe(2);
+  });
+
   it('C1: reads 合计 as a sum, and lists no peer organisation\'s own figures as the scope\'s items', async () => {
     expect(readSetQuestion('宁德时代2025年营收合计多少？', classifyQuestion('宁德时代2025年营收合计多少？'), '2026-11-16')).toMatchObject({ op: 'sum' });
     // 比亚迪's 毛利率 and 市值, stated in 宁德时代's reports, are 比亚迪's: no item of 宁德时代's

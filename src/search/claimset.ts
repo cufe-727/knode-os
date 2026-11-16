@@ -41,8 +41,8 @@ export type SetGroup = 'member' | 'parent' | 'quarter' | 'month' | 'week';
 export interface SetQuestion {
   op: SetOp;
   groupBy: SetGroup[];
-  /** Readings compared with a figure the question gives. */
-  threshold?: { cmp: '<' | '<=' | '>' | '>='; value: number };
+  /** Readings compared with a figure the question gives, in the unit it gives it in ("1万亿元"), when it gives one. */
+  threshold?: { cmp: '<' | '<=' | '>' | '>='; value: number; unit?: string };
   /** Items related to at least this many others ("修复过两起及以上事故的人"). */
   atLeast?: number;
   /** The date a value is asked as of (YYYY-MM-DD). */
@@ -242,10 +242,13 @@ export function readSetQuestion(question: string, routed: Pick<QuestionRoute, 'k
   }
 
   let threshold: SetQuestion['threshold'];
-  const below = /(低于|小于|少于|不足|不到|\bbelow\b|\bunder\b|\bless than\b|\blower than\b)\s*([\d.]+)/i.exec(q);
-  const above = /(不低于|高于|大于|超过|多于|\babove\b|\bover\b|\bmore than\b|\bgreater than\b|\bhigher than\b)\s*([\d.]+)/i.exec(q);
-  if (below) threshold = { cmp: '<', value: Number(below[2]) };
-  else if (above) threshold = { cmp: above[1] === '不低于' ? '>=' : '>', value: Number(above[2]) };
+  // the figure, and the unit written after it up to the next word of grammar ("1万亿元的季度" -> 万亿元)
+  const UNIT_AFTER = '\\s*([^\\s\\d，。？?、；;,.的之以（(]{0,8})';
+  const below = new RegExp(`(低于|小于|少于|不足|不到|\\bbelow\\b|\\bunder\\b|\\bless than\\b|\\blower than\\b)\\s*([\\d.]+)${UNIT_AFTER}`, 'i').exec(q);
+  const above = new RegExp(`(不低于|高于|大于|超过|多于|\\babove\\b|\\bover\\b|\\bmore than\\b|\\bgreater than\\b|\\bhigher than\\b)\\s*([\\d.]+)${UNIT_AFTER}`, 'i').exec(q);
+  const unitOfThreshold = (m: RegExpExecArray) => (m[3] && /^(?:万亿|千亿|百亿|十亿|亿|千万|百万|十万|万|%|[a-z$]+)/i.test(m[3]) ? { unit: m[3].replace(/(?:季度|月|周|年|天).*$/, '') } : {});
+  if (below) threshold = { cmp: '<', value: Number(below[2]), ...unitOfThreshold(below) };
+  else if (above) threshold = { cmp: above[1] === '不低于' ? '>=' : '>', value: Number(above[2]), ...unitOfThreshold(above) };
 
   let atLeast: number | undefined;
   const least = /([两二三四五六七八九十\d]+)\s*[起次个件项]?\s*(?:及以上|或以上|以上)|至少\s*([两二三四五六七八九十\d]+)|\bat least (\w+)|\b(\d+) or more\b/i.exec(q);
@@ -1139,9 +1142,13 @@ async function computeWithin(
     } else {
       if (read.threshold) {
         const { cmp, value } = read.threshold;
+        // a threshold with a scale ("1万亿元", "900亿元") is compared in the base; one without in the unit shown
+        const tu = read.threshold.unit ? unitParts(read.threshold.unit) : null;
+        const scaled = Boolean(tu && tu.scale !== 1);
+        const target = scaled ? value * tu!.scale : value;
         list = list.filter((c) => {
-          const v = shown(c);
-          return cmp === '<' ? v < value : cmp === '<=' ? v <= value : cmp === '>' ? v > value : v >= value;
+          const v = scaled ? inBase(c) : shown(c);
+          return cmp === '<' ? v < target : cmp === '<=' ? v <= target : cmp === '>' ? v > target : v >= target;
         });
         if (list.length === 0) return skip('no reading past the threshold');
       }
