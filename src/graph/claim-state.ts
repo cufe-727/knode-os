@@ -93,7 +93,7 @@ export function seriesObject(attribute: string | null | undefined, object: Serie
 const KIND_WORDS = /^(?:风险|事故|故障|项目|公司|集团|系统|平台|团队|小组|部门|工程|方案|计划|risk|incident|project|company|the)+|(?:风险|事故|故障|项目|公司|集团|系统|平台|团队|小组|部门)+$/giu;
 
 /** Where an owner or a state is said, what stands before it is what the owner or state is of. */
-const OWNER_AT = /(?:由|归)\s*[\p{Script=Han}A-Za-z·]{2,12}?\s*(?:负责|牵头|主导|跟进)|(?:的)?(?:负责人|牵头人|责任人|跟进人)\s*(?:为|是|：|:)|\b(?:is )?(?:led|owned|run) by\b|\b(?:lead|owner)\s+(?:is|was|:)/iu;
+const OWNER_AT = /(?:改为|转为|仍然|依然|统一|继续|暂时|正式|后续|今后|改|现|交|转|仍|已|将|拟|均|暂){0,2}\s*(?:由|归)\s*[\p{Script=Han}A-Za-z·]{2,12}?\s*(?:负责|牵头|主导|跟进)|(?:的)?(?:负责人|牵头人|责任人|跟进人)\s*(?:为|是|：|:)|\b(?:is )?(?:led|owned|run) by\b|\b(?:lead|owner)\s+(?:is|was|:)/iu;
 const STATE_AT = /(?:的)?(?:状态|阶段)\s*(?:为|是|：|:)|\b(?:status|stage|phase)\s+(?:is|was|:)/iu;
 
 /**
@@ -112,14 +112,39 @@ export function statementObject(statement: string, attribute: string | null | un
   const at = (STATE_KEYS.has(head) ? STATE_AT : OWNER_AT).exec(text);
   if (!at) return '';
   let before = (text.slice(0, at.index).split(/[，,;；。:：]/).pop() ?? '').trim();
-  for (const sp of [...spellings].map((x) => x.normalize('NFKC').trim()).filter((x) => x.length >= 2).sort((a, b) => b.length - a.length)) {
-    if (before.toLowerCase().includes(sp.toLowerCase())) before = before.split(new RegExp(sp.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')).join(' ');
+  // the subject written in the clause: what follows it is the thing ("比亚迪云业务由…"), what precedes it a lead
+  // phrase ("经评审R-03状态为…"); a gloss in brackets is the subject's ("R-03（支付超时）")
+  const named = lastSpelling(before, spellings);
+  if (named) {
+    const after = before.slice(named.end).replace(BRACKETED, '').trim();
+    const lead = before.slice(0, named.start).trim();
+    before = !after && /\bof$/i.test(lead) ? lead.replace(/\s*\bof$/i, '') : after;
   }
+  before = before.replace(BRACKETED, '').replace(LEAD_PHRASE, '');
   before = before.replace(DATE_WORDS, ' ').replace(/\s+/g, '').replace(LEADING_FUNCTION, '').replace(TRAILING_FUNCTION, '').replace(/^(?:的|之|其)+|(?:的|之)+$/u, '');
   // the kind word a name is written with ("风险R-54", "项目Orion") is not another thing
   before = before.replace(KIND_WORDS, '');
   if (/^(?:the|its|their)$/i.test(before)) return '';
   return before.length >= 2 ? fold(before) : '';
+}
+
+/** A bracketed gloss: "R-03（支付超时）", "云业务(含海外)". */
+const BRACKETED = /\([^()]*\)|\[[^\[\]]*\]|【[^【】]*】/gu;
+/**
+ * A phrase that opens a sentence and says when or by whose decision, not what:
+ * "自2025年3月起", "从下周开始", "经评审", "经董事会决定后".
+ */
+const LEAD_PHRASE = /^(?:(?:自|从|于)[^起]{0,16}?(?:起|开始)|经(?:过)?[\p{Script=Han}A-Za-z]{0,8}?(?:评审|审议|审批|批准|决定|决议|讨论|研究|协商|确认|同意|评估|复核|会议)(?:后|通过)?)/u;
+
+/** The last place in `text` a spelling of the subject is written, longest spelling first. */
+function lastSpelling(text: string, spellings: readonly string[]): { start: number; end: number } | null {
+  const lower = text.toLowerCase();
+  let best: { start: number; end: number } | null = null;
+  for (const sp of [...spellings].map((x) => x.normalize('NFKC').trim().toLowerCase()).filter((x) => x.length >= 2).sort((a, b) => b.length - a.length)) {
+    const i = lower.lastIndexOf(sp);
+    if (i >= 0 && (!best || i + sp.length > best.end)) best = { start: i, end: i + sp.length };
+  }
+  return best;
 }
 
 /** The head of a key's synonym group (跟进人 → 负责人), or the key. */
