@@ -3,7 +3,7 @@ import { KnodeConfig } from '../config.js';
 import { appendLog } from '../fs/datadir.js';
 import { linkBackReferences } from '../graph/backrefs.js';
 import { auditDuplicateClaims } from '../graph/claim-dedupe.js';
-import { backfillClaimState, refreshAttributeKeys, seriesSubjects, supersedeByAttribute } from '../graph/claim-state-store.js';
+import { backfillClaimState, refreshAttributeKeys, refreshClaimStateStep, seriesSubjects, supersedeByAttribute } from '../graph/claim-state-store.js';
 import { resolveEntityContext, splitEntities } from '../graph/entity-context.js';
 import { auditDuplicateEntities } from '../graph/dedupe.js';
 import { refreshRecommendations } from '../research/recommend.js';
@@ -138,9 +138,10 @@ export async function refineWiki(
   // claim state before the claim audits: the duplicate audit settles a series by its attribute
   try {
     const state = await backfillClaimState(store);
-    const keys = await refreshAttributeKeys(store);
+    // keys and supersession by attribute, a bounded slice of the subjects a run (refreshClaimStateStep)
+    const step = await refreshClaimStateStep(store);
     stats.claimStateRead = state;
-    if (state || keys.mapped || keys.dropped) progress(`claim state: ${state} claims read, ${keys.mapped} attribute keys unified, ${keys.dropped} dropped`);
+    if (state || step.keys || step.superseded) progress(`claim state: ${state} claims read; ${step.subjects} subjects (${step.claims} keyed claims): ${step.keys} attribute keys changed, ${step.superseded} supersession marks${step.passDone ? ', pass done' : ''}`);
   } catch (err) {
     progress(`claim state failed: ${err instanceof Error ? err.message : err}`);
   }
@@ -150,7 +151,7 @@ export async function refineWiki(
   } catch (err) {
     progress(`claim merge failed: ${err instanceof Error ? err.message : err}`);
   }
-  stats.claimIssues = await auditClaims(store, progress, { nearDuplicates: (config.review?.claimMerge ?? 'auto') === 'off' });
+  stats.claimIssues = await auditClaims(store, progress, { nearDuplicates: (config.review?.claimMerge ?? 'auto') === 'off', byAttribute: false });
   try {
     stats.claimReviews = (await reviewClaims({ store, llm, config }, { onProgress: progress })).suggested;
   } catch (err) {
@@ -202,10 +203,11 @@ export async function refineWiki(
  * those subjects: what a document pass runs for the subjects it wrote claims
  * of (`supersedeForClaims`).
  */
-export async function markSupersededClaims(store: Store, opts: { subjects?: string[] } = {}): Promise<number> {
+export async function markSupersededClaims(store: Store, opts: { subjects?: string[]; byAttribute?: boolean } = {}): Promise<number> {
   const { subjects } = opts;
   if (subjects && subjects.length === 0) return 0;
-  const byAttribute = await supersedeByAttribute(store, { subjects });
+  // refine runs supersession by attribute in bounded slices (refreshClaimStateStep) and asks only for the rest here
+  const byAttribute = opts.byAttribute === false ? 0 : await supersedeByAttribute(store, { subjects });
   // with a closed type list "same subject and type" is coarse, so only the
   // measure-like types take part (CLAIM_TYPES.supersedes: a later period of
   // earnings, a later holding of the same stock …) and the object is part of
@@ -366,8 +368,8 @@ async function nearDuplicateIssues(store: Store, room: number, pageSize: number)
  * it, statement and source path included: on finance (2026-11-13: 1,105,684
  * claims, 70,302 findings) 0.9 GB of heap, for twenty suggestions.
  */
-export async function auditClaims(store: Store, progress: (msg: string) => void, opts: { nearDuplicates: boolean; pageSize?: number }): Promise<number> {
-  const superseded = await markSupersededClaims(store);
+export async function auditClaims(store: Store, progress: (msg: string) => void, opts: { nearDuplicates: boolean; pageSize?: number; byAttribute?: boolean }): Promise<number> {
+  const superseded = await markSupersededClaims(store, { byAttribute: opts.byAttribute });
   if (superseded) progress(`claim audit: ${superseded} supersession marks updated`);
 
   const issues: AuditIssue[] = [];

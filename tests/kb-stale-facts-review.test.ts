@@ -478,3 +478,55 @@ describe('an identifier written without its tail', () => {
     expect(row.subject_id).toBe('inc-006-t1');
   });
 });
+
+describe('what refine does without anyone asking, in bounded steps', () => {
+  it('keeps keys and supersession current a slice of subjects at a time, ending where a whole run ends', async () => {
+    const { refreshClaimStateStep, refreshAttributeKeys, supersedeByAttribute } = await import('../src/graph/claim-state-store.js');
+    const docs: Record<string, string> = {};
+    for (const [k, date] of [[1, '2025-03-03'], [2, '2025-03-10']] as const) {
+      docs[`raw/docs/w${k}.md`] = dated(`周报${k}`, date, `entities:\n${['甲项目', '乙项目', '丙项目', '丁项目'].map((p) => `  - { name: ${p}, type: project }`).join('\n')}\nclaims:\n${['甲项目', '乙项目', '丙项目', '丁项目'].map((p, i) => `  - { subject: ${p}, statement: ${p}${k === 1 ? '完成度' : '进度'}为${10 * k + i}%, type: other }`).join('\n')}\n`);
+    }
+    const ctx = await workspace('step', docs);
+    const snapshot = async () => JSON.stringify([
+      (await ctx.store.query<{ s: string }>(`SELECT subject_id || ':' || attribute || '→' || canonical AS s FROM claim_attribute_keys`)).map((r) => r.s).sort(),
+      (await ctx.store.query<{ s: string }>(`SELECT statement || ':' || (superseded_by IS NULL)::text AS s FROM claims WHERE tx_to IS NULL`)).map((r) => r.s).sort(),
+    ]);
+    await refreshAttributeKeys(ctx.store);
+    await supersedeByAttribute(ctx.store);
+    const whole = await snapshot();
+    await ctx.store.query(`DELETE FROM claim_attribute_keys`);
+    await ctx.store.query(`UPDATE claims SET superseded_by = NULL`);
+    // two keyed claims a slice: one subject a run, four runs, the cursor kept between them
+    const runs = [];
+    for (let i = 0; i < 6; i++) {
+      const r = await refreshClaimStateStep(ctx.store, { budget: 2 });
+      runs.push(r.subjects);
+      if (r.passDone) break;
+    }
+    expect(runs).toEqual([1, 1, 1, 1]);
+    expect(await snapshot()).toBe(whole);
+  });
+
+  it('reads code-named entities for a carrier a bounded number a run, from a cursor', async () => {
+    const { splitEntities } = await import('../src/graph/entity-context.js');
+    const ctx = await workspace('code-step', {
+      'raw/docs/a.md': fm('a', ['A1-C1', 'A1-C2', 'A1-C3'].map((c) => `  - { name: ${c}, type: other }`).join('\n') + '\n'),
+      'raw/docs/b.md': fm('b', ['甲', '乙', '丙'].map((x) => `  - { name: 设置${x}, type: other }`).join('\n') + '\n'),
+    });
+    // as a workspace holds them when the code came first and the carrier learnt the code later: the code an alias of the carrier
+    const { nameKey } = await import('../src/graph/normalize.js');
+    for (const i of [0, 1, 2]) {
+      const id = `设置${'甲乙丙'[i]}`;
+      await ctx.store.query(`UPDATE entities SET aliases = jsonb_build_array($2::text) WHERE id = $1`, [id, `A1-C${i + 1}`]);
+      await ctx.store.query(`INSERT INTO entity_alias_keys (entity_id, alias_key, kind) VALUES ($1, $2, 'exact') ON CONFLICT DO NOTHING`, [id, nameKey(`A1-C${i + 1}`).key]);
+    }
+    const merged = async () => (await ctx.store.query(`SELECT 1 FROM entities WHERE canonical_id IS NOT NULL AND tx_to IS NULL`)).length;
+    const cursor = async () => (await ctx.store.getMeta<{ after?: string }>('code_merge_pass'))?.after ?? null;
+    await splitEntities(ctx.store, { config: ctx.config, codeMergeStep: 2 });
+    expect(await merged()).toBe(2);
+    expect(await cursor()).toBe('a1-c2');
+    await splitEntities(ctx.store, { config: ctx.config, codeMergeStep: 2 });
+    expect(await merged()).toBe(3);
+    expect(await cursor()).toBeNull();
+  });
+});

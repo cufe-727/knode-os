@@ -301,6 +301,55 @@ export async function seriesSubjects(store: Store, claims: string[]): Promise<st
   return rows.map((r) => r.id);
 }
 
+/** Keyed claims one refine re-reads keys and supersession for (refreshClaimStateStep). */
+export const CLAIM_STATE_STEP_CLAIMS = 200_000;
+const STEP_META = 'claim_state_pass';
+
+/**
+ * One bounded slice of what refine keeps current about claim state: the
+ * attribute keys (refreshAttributeKeys) and supersession by attribute
+ * (supersedeByAttribute) of the next subjects — whole merged groups, in
+ * code-point order of their canonical id after the cursor in meta
+ * 'claim_state_pass' — up to `budget` keyed claims. A pass over every subject
+ * takes as many refines as the workspace has budgets of keyed claims (finance:
+ * about six), then starts again. What an ingest pass touched is kept current
+ * at once, apart from this (supersedeForClaims). Returns what the slice did
+ * and whether it ended a pass.
+ */
+export async function refreshClaimStateStep(store: Store, opts: { budget?: number } = {}): Promise<{ subjects: number; claims: number; keys: number; superseded: number; passDone: boolean }> {
+  const budget = Math.max(1, opts.budget ?? CLAIM_STATE_STEP_CLAIMS);
+  const after = (await store.getMeta<{ after?: string }>(STEP_META))?.after;
+  const roots = await store.query<{ root: string; n: number }>(
+    `SELECT COALESCE(se.canonical_id, c.subject_id) AS root, count(*)::int AS n
+     FROM claims c JOIN entities se ON se.id = c.subject_id
+     WHERE c.tx_to IS NULL AND c.attribute IS NOT NULL${after ? ' AND COALESCE(se.canonical_id, c.subject_id) COLLATE "C" > $1 COLLATE "C"' : ''}
+     GROUP BY 1 ORDER BY COALESCE(se.canonical_id, c.subject_id) COLLATE "C"`,
+    after ? [after] : [],
+  );
+  const take: string[] = [];
+  let claims = 0;
+  for (const r of roots) {
+    if (take.length > 0 && claims + r.n > budget) break;
+    take.push(r.root);
+    claims += r.n;
+  }
+  const passDone = take.length === roots.length;
+  let keys = 0;
+  let superseded = 0;
+  if (take.length > 0) {
+    const members = await store.query<{ id: string }>(
+      `SELECT id FROM entities WHERE id = ANY($1::text[]) OR canonical_id = ANY($1::text[])`,
+      [take],
+    );
+    const subjects = [...new Set([...take, ...members.map((m) => m.id)])];
+    const k = await refreshAttributeKeys(store, { subjects });
+    keys = k.mapped + k.dropped;
+    superseded = await supersedeByAttribute(store, { subjects });
+  }
+  await store.setMeta(STEP_META, passDone ? {} : { after: take.at(-1) });
+  return { subjects: take.length, claims, keys, superseded, passDone };
+}
+
 /** Refine's claim-state step: read what is unread, unify keys, then mark supersession. */
 export async function refreshClaimState(store: Store, opts: { limit?: number } = {}): Promise<{ read: number; keys: number; superseded: number }> {
   const read = await backfillClaimState(store, opts);

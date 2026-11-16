@@ -1012,6 +1012,10 @@ async function splitCoded(store: Store, config: KnodeConfig | undefined, stats: 
   await applyPartings(store, config, partings, stats, progress, relink);
 }
 
+/** Code-named entities one refine looks at for a carrier (mergeCodesIntoCarriers), and its cursor. */
+export const CODE_MERGE_STEP = 5_000;
+const CODE_MERGE_META = 'code_merge_pass';
+
 /**
  * An entity whose name is nothing but a code ("T2-C2") into the one entity
  * that answers to that code: the entity a coded split labelled with it
@@ -1023,9 +1027,10 @@ async function splitCoded(store: Store, config: KnodeConfig | undefined, stats: 
  * refine, which sees both, makes the two orders end alike. Two carriers, a
  * carrier named by another code, or a type that does not fit: nothing. The
  * merge is reversible (`entities unmerge`); a merge a person undid is not
- * made again.
+ * made again. A run reads at most CODE_MERGE_STEP code-named entities, from a
+ * cursor in meta 'code_merge_pass' (finance: a pass in a handful of refines).
  */
-async function mergeCodesIntoCarriers(store: Store, stats: EntityContextStats, progress: (msg: string) => void): Promise<void> {
+async function mergeCodesIntoCarriers(store: Store, stats: EntityContextStats, progress: (msg: string) => void, step = CODE_MERGE_STEP): Promise<void> {
   const rules = await store.query<{ id: string; label: string }>(
     `SELECT n.id, n.label FROM entity_namesakes n JOIN entities e ON e.id = n.id AND e.tx_to IS NULL AND e.canonical_id IS NULL ORDER BY n.id COLLATE "C"`,
   );
@@ -1034,10 +1039,15 @@ async function mergeCodesIntoCarriers(store: Store, stats: EntityContextStats, p
     const c = codeOf(r.label);
     if (c) (byLabel.get(c.value) ?? byLabel.set(c.value, []).get(c.value)!).push(r.id);
   }
+  // a bounded slice a run, from the cursor on: a pass over every code-named entity takes as many refines as it has steps
+  const after = (await store.getMeta<{ after?: string }>(CODE_MERGE_META))?.after;
   const named = await store.query<{ id: string; name: string; type: string }>(
     `SELECT id, name, type FROM entities WHERE tx_to IS NULL AND canonical_id IS NULL AND name ~ '[0-9]'
-       AND NOT EXISTS (SELECT 1 FROM entity_namesakes n WHERE n.id = entities.id) ORDER BY id COLLATE "C"`,
+       AND NOT EXISTS (SELECT 1 FROM entity_namesakes n WHERE n.id = entities.id)${after ? ' AND id COLLATE "C" > $2 COLLATE "C"' : ''}
+     ORDER BY id COLLATE "C" LIMIT $1`,
+    after ? [step, after] : [step],
   );
+  await store.setMeta(CODE_MERGE_META, named.length < step ? {} : { after: named.at(-1)!.id });
   for (const e of named) {
     const c = codeOf(e.name);
     if (!c) continue;
@@ -1108,7 +1118,7 @@ export function namesakeChoice(rules: NamesakeRule[], documentEntities: Extracte
  * spellings of one organization the audit has just proposed to merge are one
  * roof here.
  */
-export async function splitEntities(store: Store, opts: { config?: KnodeConfig; onProgress?: (msg: string) => void } = {}): Promise<Pick<EntityContextStats, 'split' | 'replayed'>> {
+export async function splitEntities(store: Store, opts: { config?: KnodeConfig; onProgress?: (msg: string) => void; codeMergeStep?: number } = {}): Promise<Pick<EntityContextStats, 'split' | 'replayed'>> {
   const progress = opts.onProgress ?? (() => {});
   const stats: EntityContextStats = { merged: 0, suggested: 0, split: 0, replayed: 0 };
   const relink: string[] = [];
@@ -1117,7 +1127,7 @@ export async function splitEntities(store: Store, opts: { config?: KnodeConfig; 
   // parting an entity by its codes is something a workspace turns on (review.identity "context")
   if (opts.config?.review?.identity === 'context') await splitCoded(store, opts.config, stats, progress, relink, same);
   // in either mode: a code-named entity and the one entity that answers to its code end as one, whatever came first
-  await mergeCodesIntoCarriers(store, stats, progress);
+  await mergeCodesIntoCarriers(store, stats, progress, opts.codeMergeStep);
   if (relink.length > 0) {
     const { relinkTier0 } = await import('./concepts.js');
     await relinkTier0(store, { only: [...new Set(relink)] });
