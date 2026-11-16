@@ -47,7 +47,7 @@ const TIMELINE = [
 ];
 
 const AGGREGATE = [
-  /多少|(?<![那这第])几[次个家条篇份项位年月天起名人种类款]|总共|一共|合计|总数|总额|平均|最多|最少|最高|最低|最好|最差|最大|最小|最快|最慢|最强|最弱|最贵|最便宜|排名|占比|增长了?多少|频率/,
+  /多少|(?<![那这第])几[次个家条篇份项位年月天起名人种类款]|总共|一共|合计|总数|总额|平均|最多|最少|最高|最低|最好|最差|最大|最小|最快|最慢|最强|最弱|最贵|最便宜|排名|排第[一二三四五六七八九十几\d]|第[一二三四五六七八九十\d]+名|前[一二三四五六七八九十\d]+名|占比|增长了?多少|频率/,
   /\bhow (many|much|often)\b|\bcount\b|\bnumber of\b|\btotal\b|\bsum\b|\baverage\b|\bmean\b|\b(most|least|highest|lowest|largest|smallest|best|worst|biggest|fastest|cheapest)\b|\brank(ed|ing)?\b|\bpercentage\b/i,
 ];
 
@@ -97,6 +97,8 @@ const MULTIHOP = [
  *     found ("谁修复了INC-1？他今年修复过哪些事故？") it is a chain: the
  *     enumeration would have nothing named to enumerate.
  */
+/** What an English indefinite or back-reference can stand for. */
+const EN_NOUN = '(?:person|engineer|employee|colleague|analyst|executive|founder|investor|partner|lawyer|doctor|project|team|customer|client|supplier|vendor|incident|risk|company|firm|bank|fund|agency|owner|manager|product)';
 const ENTITY_NOUN = '(?:人|工程师|同事|员工|负责人|项目|客户|甲方|供应商|事故|故障|隐患|风险|公司|企业|产品|团队|小组|组|部门|合同|订单)';
 
 /** Introducers that may stand anywhere in an earlier clause; an explicit back-reference may follow any of them. */
@@ -106,8 +108,9 @@ const CHAIN_INTRO = [
   // a description: "提出R-03的人" (not 的人均 / 的人工智能 / 的人民币 …), "修复它的工程师", "升级的那起事故", "换了负责人"
   /的(?:人(?![均工民口才数员事气们类生物格性力体群权身脉选家心])|工程师|同事|员工|那位|那个|那起|那一起|那一家|那家)|换了?\S{0,3}负责人/,
   // an indefinite one of what the walk can find: "一起由客户升级的事故", "另一个组", "一个项目" (not "一个关于茅台的故事")
-  new RegExp(`[一另]\\s*[起个位名家项件]\\s*(?:[^，。？?；;、\\s]{0,12}?的)?${ENTITY_NOUN}`),
-  /\bwho(?:m|se)?\b(?!\s+(?:are|were)\b)|\bwhich\s+(?!\w+s\b)(?!(?:is|are|was|were|has|have|had|does|do|did|will|would|can|could|this|these|those|of|one|ones)\b)\w+|\b(?:a|an|another|some|one)\s+(?:[\w-]+\s+)?(?:person|engineer|employee|colleague|project|team|customer|client|supplier|vendor|incident|risk|company|owner|manager)\b|\bthe\s+(?:person|engineer|employee|one|team|customer|owner|company)\s+(?:who|that|which)\b/i,
+  // 一位 / 一名 / 一家 already say a person or an organisation, whatever the noun ("推荐了一位理疗师")
+  new RegExp(`(?<!第)[一另]\\s*(?:[位名家]|[起个项件]\\s*(?:[^，。？?；;、\\s]{0,12}?的)?${ENTITY_NOUN})`),
+  new RegExp(`\\bwho(?:m|se)?\\b(?!\\s+(?:are|were)\\b)|\\bwhich\\s+(?!\\w+s\\b)(?!(?:is|are|was|were|has|have|had|does|do|did|will|would|can|could|this|these|those|of|one|ones)\\b)\\w+|\\b(?:a|an|another|some|one)\\s+(?:[\\w-]+\\s+)?${EN_NOUN}\\b|\\bthe\\s+(?:one|${EN_NOUN})\\s+(?:who|that|which)\\b`, 'i'),
 ];
 
 /**
@@ -116,16 +119,16 @@ const CHAIN_INTRO = [
  * its answer.
  */
 const CHAIN_OPENING = [
-  new RegExp(`^\\s*(?:请问|那么|并且|而且|又|是|由)?\\s*(?:谁|哪(?:一)?[个位家名项件组](?!些)|有?[一另][个位名家起项件]\\s*(?:[^，。？?；;、\\s]{0,12}?的)?${ENTITY_NOUN})`),
+  new RegExp(`^\\s*(?:请问|那么|并且|而且|又|是|由)?\\s*(?:谁|哪(?:一)?[个位家名项件组](?!些)|有?(?<!第)[一另]\\s*(?:[位名家]|[起个项件]\\s*(?:[^，。？?；;、\\s]{0,12}?的)?${ENTITY_NOUN}))`),
   // "这家公司的创始人是谁，他…": the clause asks who or which one, at its end
   /是(?:谁|哪(?:一)?[个位家名])\s*[，,。？?；;：:—]?\s*$/,
-  /^\s*(?:and\s+|then\s+|so\s+)?(?:who(?:m)?\b(?!\s+(?:are|were)\b)|which\s+(?!\w+s\b)\w+|(?:a|an|another|one)\s+(?:[\w-]+\s+)?(?:person|engineer|employee|colleague|customer|client|supplier|vendor|company|owner|manager)\b)/i,
+  new RegExp(`^\\s*(?:and\\s+|then\\s+|so\\s+)?(?:who(?:m)?\\b(?!\\s+(?:are|were)\\b)|which\\s+(?!\\w+s\\b)\\w+|(?:a|an|another|one)\\s+(?:[\\w-]+\\s+)?${EN_NOUN}\\b)`, 'i'),
 ];
 
 /** A reference back that names what it refers to as one thing: needs an introducer in an earlier clause. */
 const CHAIN_BACK = [
   /此人|该人|这个人|那个人|这位|那位|对方|同一(?![周天日月年时期次类种样]|[个位家起名项件]?(?:问题|事))|那(?:一)?[个位家起项名件条组](?!些)|该(?:项目|组|客户|事故|风险|员工|工程师|同事|公司)|新(?:的)?负责人|前者|后者|其(?:位置|名下)/,
-  /\b(?:that|this|the same)\s+(?:person|engineer|employee|colleague|project|team|customer|client|supplier|vendor|incident|risk|company|owner|manager|one)\b|\bthe new (?:owner|lead|manager|assignee)\b|\bthe (?:former|latter)\b/i,
+  new RegExp(`\\b(?:that|this|the same)\\s+(?:one|${EN_NOUN})\\b|\\bthe new (?:owner|lead|manager|assignee)\\b|\\bthe (?:former|latter)\\b`, 'i'),
 ];
 
 /** A bare pronoun: stands for the answer of a clause that opened with the question word. */
