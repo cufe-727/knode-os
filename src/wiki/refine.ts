@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { KnodeConfig } from '../config.js';
 import { appendLog } from '../fs/datadir.js';
+import { linkBackReferences } from '../graph/backrefs.js';
 import { auditDuplicateClaims } from '../graph/claim-dedupe.js';
 import { backfillClaimState, refreshAttributeKeys, seriesSubjects, supersedeByAttribute } from '../graph/claim-state-store.js';
 import { resolveEntityContext, splitEntities } from '../graph/entity-context.js';
@@ -126,6 +127,13 @@ export async function refineWiki(
     stats.entitySplits = (await splitEntities(store, { config, onProgress: progress })).split;
   } catch (err) {
     progress(`entity splits failed: ${err instanceof Error ? err.message : err}`);
+  }
+  // a report's "上周那起X" names no id: linked to the one identified X of its series' previous report (backrefs.ts)
+  try {
+    const backrefs = await linkBackReferences(store, { onProgress: progress });
+    if (backrefs.resolved || backrefs.disposed) progress(`back-references: ${backrefs.resolved} of ${backrefs.references} resolved, ${backrefs.linked} links, ${backrefs.disposed} disposed`);
+  } catch (err) {
+    progress(`back-references failed: ${err instanceof Error ? err.message : err}`);
   }
   // claim state before the claim audits: the duplicate audit settles a series by its attribute
   try {

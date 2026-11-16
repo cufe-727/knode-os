@@ -1,7 +1,7 @@
 import { breather } from '../pool.js';
 import { Store } from '../store/db.js';
 import { EvidenceAtRow, foldClaimEvidence, groupBy, toDateString, toIso } from '../store/temporal.js';
-import { CLAIM_STATE_VERSION, sameValue, unifyAttributeKeys } from './claim-state.js';
+import { CLAIM_STATE_VERSION, sameValue, seriesObject, subjectSpellingsOf, unifyAttributeKeys } from './claim-state.js';
 import { packSubjectBatches } from './subject-batches.js';
 
 /**
@@ -82,24 +82,40 @@ export async function backfillClaimState(store: Store, opts: { limit?: number } 
 
 /**
  * Unify each subject's near-synonym attribute keys (claim-state.ts
- * unifyAttributeKeys) into claim_attribute_keys, which v_claims, supersession,
+ * unifyAttributeKeys), over the entities merged with it and with their
+ * spellings, into claim_attribute_keys, which v_claims, supersession,
  * the duplicate audit and the entity page read. Rewritten whole each run, or
  * for `subjects` alone (a subject's keys depend on no other subject):
  * returns the mappings added or changed, and those dropped.
  */
 export async function refreshAttributeKeys(store: Store, opts: { subjects?: string[] } = {}): Promise<{ mapped: number; dropped: number }> {
   const only = opts.subjects ? [opts.subjects] : [];
-  const uses = await store.query<{ subject_id: string; attribute: string; n: number; units: string[] }>(
-    `SELECT subject_id, attribute, count(*)::int AS n, array_agg(DISTINCT COALESCE(unit, '')) AS units
-     FROM claims WHERE tx_to IS NULL AND attribute IS NOT NULL${opts.subjects ? ' AND subject_id = ANY($1::text[])' : ''}
-     GROUP BY subject_id, attribute`,
+  // keys are unified over a merged group (its series spans the group), with the spellings of its entities
+  const uses = await store.query<{ subject_id: string; root: string; attribute: string; n: number; units: string[] }>(
+    `SELECT c.subject_id, COALESCE(se.canonical_id, c.subject_id) AS root, c.attribute, count(*)::int AS n, array_agg(DISTINCT COALESCE(c.unit, '')) AS units
+     FROM claims c JOIN entities se ON se.id = c.subject_id
+     WHERE c.tx_to IS NULL AND c.attribute IS NOT NULL${opts.subjects ? ' AND c.subject_id = ANY($1::text[])' : ''}
+     GROUP BY 1, 2, 3`,
     only,
   );
+  const roots = [...new Set(uses.map((u) => u.root))];
+  const names = roots.length === 0 ? [] : await store.query<{ root: string; name: string; aliases: string[] | null }>(
+    `SELECT COALESCE(canonical_id, id) AS root, name, aliases FROM entities
+     WHERE tx_to IS NULL AND (id = ANY($1::text[]) OR canonical_id = ANY($1::text[]))`,
+    [roots],
+  );
+  const spellings = new Map<string, string[]>();
+  for (const [root, list] of groupBy(names, (r) => r.root)) spellings.set(root, list.flatMap((r) => subjectSpellingsOf(r.name, r.aliases ?? [])));
   const desired = new Map<string, { subject: string; attribute: string; canonical: string; reason: string }>();
-  for (const [subject, list] of groupBy(uses, (u) => u.subject_id)) {
-    if (list.length < 2) continue;
-    for (const [attribute, m] of unifyAttributeKeys(list.map((u) => ({ attribute: u.attribute, count: u.n, units: u.units })))) {
-      desired.set(`${subject}\u0000${attribute}`, { subject, attribute, ...m });
+  for (const [root, list] of groupBy(uses, (u) => u.root)) {
+    const keys = [...groupBy(list, (u) => u.attribute).entries()].map(([attribute, rows]) => ({
+      attribute, count: rows.reduce((n, r) => n + r.n, 0), units: [...new Set(rows.flatMap((r) => r.units))],
+    }));
+    if (keys.length < 2) continue;
+    const map = unifyAttributeKeys(keys, spellings.get(root) ?? []);
+    for (const u of list) {
+      const m = map.get(u.attribute);
+      if (m) desired.set(`${u.subject_id}\u0000${u.attribute}`, { subject: u.subject_id, attribute: u.attribute, ...m });
     }
   }
   const current = await store.query<{ subject_id: string; attribute: string; canonical: string }>(
@@ -159,10 +175,15 @@ export function seriesSupersession(series: StateRow[]): Map<string, string | nul
     const older = sorted[i];
     const d = day(older);
     if (!d) continue;
-    const next = sorted.slice(i + 1).find((r) => day(r) > d);
-    if (!next) continue;
+    // a claim whose stated window still covers a later reading stands beside it; the first
+    // reading after its window replaces it. It used to look at the next reading only and,
+    // when the window covered that one, at none: a weekly reading (window to the Saturday)
+    // with a recap dated inside its week ("一个月前…" read as a day of that week) stayed
+    // current for ever (61 of 164 series with several current values on the 10× benchmark).
     const to = toDateString(older.valid_to);
-    if (to && to >= day(next)) continue;
+    const after = to && to > d ? to : d;
+    const next = sorted.slice(i + 1).find((r) => day(r) > after);
+    if (!next) continue;
     out.set(older.id, next.id);
   }
   for (const c of sorted.filter((r) => r.correction)) {
@@ -179,7 +200,8 @@ export function seriesSupersession(series: StateRow[]): Map<string, string | nul
 
 /**
  * Supersession by attribute, in every domain: the series of a subject's
- * attribute (its canonical key, per object, facts and forecasts apart) runs
+ * attribute (its canonical key, per object unless it is an owner or a state —
+ * seriesObject —, facts and forecasts apart) runs
  * by effective date, and only the newest is current (seriesSupersession).
  * Disputed, absent, opinion and rumour claims take no part. Returns the
  * claims whose mark changed.
@@ -218,7 +240,7 @@ export async function supersedeByAttribute(store: Store, opts: { claimsPerBatch?
     );
     const ids: string[] = [];
     const marks: (string | null)[] = [];
-    for (const series of groupBy(rows, (r) => `${r.subject}\u0000${r.attribute}\u0000${r.object_id ?? ''}\u0000${r.kind}`).values()) {
+    for (const series of groupBy(rows, (r) => `${r.subject}\u0000${r.attribute}\u0000${seriesObject(r.attribute, r.object_id)}\u0000${r.kind}`).values()) {
       await pause();
       const want = seriesSupersession(series);
       for (const r of series) {

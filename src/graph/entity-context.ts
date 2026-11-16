@@ -303,6 +303,18 @@ async function ownNamed(q: Queryable, names: string[]): Promise<(spelling: strin
   };
 }
 
+/**
+ * Types a renamed thing may carry under its two names: the same, or a project
+ * and a product — an extraction types "箕宿系统" a product and the "心宿方案" it
+ * became a project (1 of 25 stated renames on the 10× benchmark stayed two
+ * entities for that alone).
+ */
+export function renameTypes(a: string, b: string): boolean {
+  if (a === b) return true;
+  const pair = new Set([a, b]);
+  return pair.has('project') && pair.has('product');
+}
+
 /** The stop lists a rename's names are held against: `stop` with the corpus-frequent terms, `linkStop` the generic words alone (tier0Known). */
 export interface RenameStops {
   stop: ReadonlySet<string>;
@@ -325,7 +337,7 @@ export async function renameMergeFor(q: Queryable, claim: RenameClaim, stops: Re
   const first = (list: string[]) => list.map(named).find((found) => found.length > 0) ?? [];
   const olds = first(rename.old).filter((e) => !generic(e, stops.stop));
   const news = first(rename.renamed).filter((e) => !generic(e, stops.linkStop));
-  const pairs = olds.flatMap((from) => news.filter((to) => to.id !== from.id && to.type === from.type).map((to) => ({ from, to })));
+  const pairs = olds.flatMap((from) => news.filter((to) => to.id !== from.id && renameTypes(from.type, to.type)).map((to) => ({ from, to })));
   if (pairs.length !== 1) return null;
   const [{ from, to }] = pairs;
   const filedUnder = [claim.subject, claim.object];
@@ -999,6 +1011,51 @@ async function splitCoded(store: Store, config: KnodeConfig | undefined, stats: 
   await applyPartings(store, config, partings, stats, progress, relink);
 }
 
+/**
+ * An entity whose name is nothing but a code ("T2-C2") into the entity a
+ * coded split labelled with that very code ("对账批次间隔（第一事业部支付组 ·
+ * T2-C2）"). A report that names a setting by its code alone ("T2-C2调整为20
+ * 分钟") resolves to an entity of that name when it is applied before the
+ * report that introduces the code, and the split, which re-applies the
+ * documents of the name it parts, never sees it: the setting's change stood
+ * on an entity of its own (12 of 90 settings on the 10× benchmark). The label
+ * is the split's own identifier for the thing, so the two are one; the merge
+ * is reversible (`entities unmerge`) and a merge a person undid is not made
+ * again.
+ */
+async function mergeCodesIntoParts(store: Store, stats: EntityContextStats, progress: (msg: string) => void): Promise<void> {
+  const rules = await store.query<{ id: string; label: string }>(
+    `SELECT n.id, n.label FROM entity_namesakes n JOIN entities e ON e.id = n.id AND e.tx_to IS NULL AND e.canonical_id IS NULL`,
+  );
+  const byCode = new Map<string, string[]>();
+  for (const r of rules) {
+    const c = codeOf(r.label);
+    if (c) (byCode.get(c.value) ?? byCode.set(c.value, []).get(c.value)!).push(r.id);
+  }
+  if (byCode.size === 0) return;
+  const named = await store.query<{ id: string; name: string; type: string }>(
+    `SELECT id, name, type FROM entities WHERE tx_to IS NULL AND canonical_id IS NULL AND type = ANY($1::text[]) AND name ~ '[0-9]'
+       AND NOT EXISTS (SELECT 1 FROM entity_namesakes n WHERE n.id = entities.id)`,
+    [[...CODED_TYPES, 'concept']],
+  );
+  for (const e of named) {
+    const c = codeOf(e.name);
+    const into = c ? byCode.get(c.value) : undefined;
+    if (!into || into.length !== 1 || into[0] === e.id) continue;
+    if (await refusedByPerson(store, e.id, into[0])) continue;
+    const reason = `编号即拆分标签：${e.name} 是拆分出的实体 ${into[0]} 的编号`;
+    try {
+      const res = await applyMerge(store, { entityId: e.id, canonicalId: into[0], reason, actor: 'entity-context' });
+      if (res.outcome === 'merged') {
+        stats.merged++;
+        progress(`entities: merged ${e.name} into ${into[0]} — ${reason}`);
+      }
+    } catch (err) {
+      progress(`entities: code merge ${e.name} → ${into[0]} failed: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+}
+
 export type { NamesakeRule } from './identity.js';
 
 /** The namesake rules for these names: name (lower case) → its variants. */
@@ -1042,7 +1099,10 @@ export async function splitEntities(store: Store, opts: { config?: KnodeConfig; 
   const same = await pendingSame(store);
   await splitNamesakes(store, opts.config, stats, progress, relink, same);
   // parting an entity by its codes is something a workspace turns on (review.identity "context")
-  if (opts.config?.review?.identity === 'context') await splitCoded(store, opts.config, stats, progress, relink, same);
+  if (opts.config?.review?.identity === 'context') {
+    await splitCoded(store, opts.config, stats, progress, relink, same);
+    await mergeCodesIntoParts(store, stats, progress);
+  }
   if (relink.length > 0) {
     const { relinkTier0 } = await import('./concepts.js');
     await relinkTier0(store, { only: [...new Set(relink)] });

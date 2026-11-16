@@ -98,6 +98,9 @@ Rules:
 
 Claims — specific, informative assertions (facts, views, forecasts), at most ${EXTRACT_CAPS.claims}:
 - subject: one of the extracted entity names; object: the affected entity name, or null.
+- subject of a value: the thing the value belongs to. A setting, metric or project the text names by a code, a short name or a pronoun ("T2-C2", "保留期", "这个值", "它") is that thing — under its full name when the text or the known entities give one — not the team or document that reports it.
+- object of an event: the other party named — who fixed or owns it, the customer who escalated it.
+- kind of a change: a decision that takes effect now or from this period ("决定改回原来的30天", "自本周起改为45天", "定为15分钟") is a "fact" with the new value; "prediction" is for what is expected or planned later.
 - type: exactly one of
 ${claimTypeLines()}
 - kind: "fact" (happened or holds), "opinion" (a judgement: 认为, 看好), "prediction" (a forecast, plan or target: 预计, 计划), "rumor" (hearsay: 传闻, 据说).

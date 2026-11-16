@@ -7,7 +7,7 @@
 
 import type { TrustTier } from './trust.js';
 
-export type ScopeKind = 'doc' | 'wiki-human' | 'tier1' | 'page' | 'datasource' | 'dataset' | 'dream' | 'absence' | 'merge' | 'claim-merge' | 'lint';
+export type ScopeKind = 'doc' | 'wiki-human' | 'tier1' | 'page' | 'datasource' | 'dataset' | 'dream' | 'absence' | 'merge' | 'claim-merge' | 'lint' | 'backref';
 export type ScopeStatus = 'applying' | 'active' | 'disposed';
 export type DisposeReason = 'removed' | 'replaced' | 'archived' | 'purge';
 

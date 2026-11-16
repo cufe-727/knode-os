@@ -5,7 +5,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
 import { auditDuplicateClaims, seriesRelation } from '../src/graph/claim-dedupe.js';
-import { formatValue, normalizeAttribute, parseMeasure, unifyAttributeKeys } from '../src/graph/claim-state.js';
+import { formatValue, keyQualifiers, sameValue, namesSubject, normalizeAttribute, parseMeasure, seriesObject, subjectSpellingsOf, unifyAttributeKeys } from '../src/graph/claim-state.js';
 import { refreshClaimState, seriesSupersession, StateRow } from '../src/graph/claim-state-store.js';
 import { namesakeChoice, namesakeClusters, NamesakeDoc, renameIn, resolveEntityContext } from '../src/graph/entity-context.js';
 import { buildBatchExtractRequest, buildExtractRequest, RawExtractReply } from '../src/graph/llm-extract.js';
@@ -64,6 +64,63 @@ describe('reading a claim as attribute + value', () => {
     expect(m.has('活跃度')).toBe(false);
   });
 
+  it('keeps a change, a first value or a target apart from the measure itself', () => {
+    expect(keyQualifiers('支付成功率')).toBe('');
+    expect(keyQualifiers('支付成功率环比变化')).toBe(keyQualifiers('支付成功率环比'));
+    expect(keyQualifiers('初始间隔')).toBe('初始');
+    const m = unifyAttributeKeys([
+      { attribute: '支付成功率', count: 40, units: ['%'] },
+      { attribute: '支付成功率环比变化', count: 30, units: ['%'] },
+      { attribute: '支付成功率环比', count: 9, units: ['%'] },
+    ]);
+    expect(m.has('支付成功率环比变化')).toBe(false);
+    expect(m.get('支付成功率环比')?.canonical).toBe('支付成功率环比变化');
+  });
+
+  it('makes the keys that name a setting itself one key, and its first value another', () => {
+    const spellings = subjectSpellingsOf('对账批次间隔（第一事业部支付组 · T2-C2）', ['T2-C2', '批次间隔']);
+    expect(spellings).toEqual(expect.arrayContaining(['对账批次间隔', 'T2-C2', '批次间隔']));
+    expect(namesSubject('间隔', spellings)).toBe(true);
+    expect(namesSubject('配置值', spellings)).toBe(true);
+    expect(namesSubject('在岗人数', spellings)).toBe(false);
+    // the head of a name is its end: 增长 does not name 增长组
+    expect(namesSubject('增长', ['增长组'])).toBe(false);
+    // the same head as a name that is a measure: 连接上限 is the value of 订单库连接池上限
+    expect(namesSubject('连接上限', ['订单库连接池上限'])).toBe(true);
+    expect(namesSubject('支付成功率', ['第一事业部支付组'])).toBe(false);
+    expect(namesSubject('在岗人数', ['第一事业部平台组'])).toBe(false);
+    const m = unifyAttributeKeys([
+      { attribute: '初始间隔', count: 14, units: ['分钟'] },
+      { attribute: '间隔', count: 9, units: ['分钟'] },
+      { attribute: '配置值', count: 1, units: ['分钟'] },
+      { attribute: '批次间隔', count: 1, units: ['分钟'] },
+      { attribute: '初始对账批次间隔', count: 3, units: ['分钟'] },
+    ], spellings);
+    expect(m.get('配置值')?.canonical).toBe('间隔');
+    expect(m.get('批次间隔')?.canonical).toBe('间隔');
+    expect(m.has('间隔')).toBe(false);
+    expect(m.get('初始对账批次间隔')?.canonical).toBe('初始间隔');
+  });
+
+  it('reads a severity as one key however it is called', () => {
+    expect(normalizeAttribute('事故等级')).toBe('级别');
+    const m = unifyAttributeKeys([
+      { attribute: '事故级别', count: 3, units: [''] },
+      { attribute: '事故等级', count: 2, units: [''] },
+    ]);
+    expect(m.get('事故等级')?.canonical).toBe('事故级别');
+  });
+
+  it('reads one week however a value spells it', () => {
+    const v = (valueNum: number | null, valueText: string | null, unit: string | null = null) => ({ valueNum, valueText, unit });
+    expect(sameValue(v(null, '2025-W25'), v(null, '2025年第25周'))).toBe(true);
+    expect(sameValue(v(null, '第21周'), v(21, null, '周'))).toBe(true);
+    expect(sameValue(v(null, '2025-W21'), v(null, '第21周'))).toBe(true);
+    expect(sameValue(v(null, '2025-W21'), v(null, '2024-W21'))).toBe(false);
+    expect(sameValue(v(null, '第32周'), v(null, '第34周'))).toBe(false);
+    expect(sameValue(v(21, null, '周'), v(21, null, '人'))).toBe(false);
+  });
+
   it('reads ISO weeks and relative weeks against the document date', () => {
     expect(normalizeDateExpr('2025-W35')).toMatchObject({ from: '2025-08-25T00:00:00.000Z', to: '2025-08-31T23:59:59.999Z', precision: 'week' });
     expect(normalizeDateExpr('2025年第35周')).toMatchObject({ from: '2025-08-25T00:00:00.000Z' });
@@ -92,6 +149,30 @@ describe('a series of one attribute', () => {
     expect(marks.get('fix')).toBeNull();
     // w3 has no later day; the correction took w3b (the newest other value up to its day)
     expect(marks.get('w3')).toBeNull();
+  });
+
+  it('lets a claim whose window covers the next reading be replaced by the first reading after its window', () => {
+    const marks = seriesSupersession([
+      // a weekly reading (Monday to Saturday) and a recap dated inside its week
+      row('w20', '2025-05-12', 29, { valid_to: '2025-05-17T23:59:59.999Z' }),
+      row('recap', '2025-05-16', 31, { valid_to: '2025-05-21T23:59:59.999Z' }),
+      row('w21', '2025-05-19', 33, { valid_to: '2025-05-24T23:59:59.999Z' }),
+      row('w30', '2025-07-21', 60, { valid_to: '2025-07-26T23:59:59.999Z' }),
+    ]);
+    // the recap does not replace the reading whose week it falls in; the next week's does
+    expect(marks.get('w20')).toBe('w21');
+    expect(marks.get('recap')).toBe('w30');
+    expect(marks.get('w21')).toBe('w30');
+    expect(marks.get('w30')).toBeNull();
+  });
+
+  it('keeps one owner and one state per subject whatever object a claim names, and a measure toward an object apart', () => {
+    expect(seriesObject('状态', '赖艳')).toBe('');
+    expect(seriesObject('负责人', '廖欣')).toBe(seriesObject('负责人', '孙欣'));
+    expect(normalizeAttribute('跟进人')).toBe('负责人');
+    expect(seriesObject('持股比例', 'company-a')).not.toBe(seriesObject('持股比例', 'company-b'));
+    const base = { subject: 'r-03', kind: 'fact', attribute: '状态', unit: null, value_num: null };
+    expect(seriesRelation({ ...base, object: '赖艳', value_text: '跟进中', eff: '2025-06-16' }, { ...base, object: null, value_text: '已关闭', eff: '2025-07-18' })).toBe('different_time');
   });
 
   it('settles pairs of one series without a model: other days are history, one day and one value are one claim', () => {
