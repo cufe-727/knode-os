@@ -155,6 +155,8 @@ export interface SearchResult {
     seedChunkId?: string;
     /** Entity bridge chain followed to reach this chunk. */
     bridgeEntities?: string[];
+    /** A walked hop's passage that only mentions both ends: the relation has no recorded source to show. */
+    coMention?: boolean;
     /** Terms of the seed passages this chunk was reached by (search/bridge.ts); absent when none was. */
     bridgeTerms?: string[];
   };

@@ -1,10 +1,10 @@
 import { builtinOntology } from '../graph/ontology.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
-import { toDateString } from '../store/temporal.js';
+import { SOURCE_SCOPE_KINDS, toDateString } from '../store/temporal.js';
 import { ClaimItem, SearchResult } from '../types.js';
 import { keywordTerms, termCount } from './search.js';
 import { asOfDate } from './claimset.js';
-import { documentDates, OrdinalAsk, ordinalInQuestion, pickByOrder, placeEntities, presentOf } from './walk-order.js';
+import { latestSourceDate, OrdinalAsk, ordinalInQuestion, pickByOrder, placeEntities, presentOf } from './walk-order.js';
 
 /**
  * The multi-hop route of `ask` (docs/design/30 §3): resolve → relations →
@@ -75,6 +75,8 @@ export interface Walk {
   bridges: SearchResult[];
   /** The question's ordering ("第二起", "the latest"), the hop it ordered, and each branch's pick or why there was none. */
   ordering?: { asked: string; hop: number | null; picks: string[] };
+  /** The walk's time budget was spent: what it stopped before, after how long. What it had walked is returned. */
+  spent?: { budgetMs: number; ms: number; before: string };
 }
 
 /** Relations kept per hop beside each branch's own best (and on the first hop, in all). */
@@ -83,16 +85,19 @@ const FRONTIER = 5;
 const READ_PER_ENTITY = 150;
 /** Relations of one entity ordered at most: more, and the walk makes no pick and says the set was too large. */
 const ORDER_MAX = 2000;
+/** The walk's time budget by default: past it, no further hop or ordering starts, and the walk returns what it has. */
+const WALK_BUDGET_MS = 1500;
 
 /**
  * The live relations of the given entities: the heaviest `$2` of each, and of each the `$2` whose descriptions
  * hold the most of the question's terms (`$3`, as LIKE patterns; the heaviest among equals), so an entity with more
- * heavy relations than are read cannot hide the light one the question asks about. With their ends, their source and its path.
+ * heavy relations than are read cannot hide the light one the question asks about. With their ends, their source and its path
+ * (a source scope's: a page knode wrote is none).
  */
 const RELATIONS_OF = `SELECT f.id AS near_id, r.id, r.source_id, r.target_id, se.name AS source, te.name AS target, se.type AS source_type, te.type AS target_type,
          r.type, r.description, r.weight, r.valid_from, r.valid_to, r.document_id, r.chunk_id,
          COALESCE((SELECT d.path FROM documents d WHERE d.id = r.document_id),
-                  (SELECT s.key FROM evidence ev JOIN scopes s ON s.id = ev.scope_id
+                  (SELECT s.key FROM evidence ev JOIN scopes s ON s.id = ev.scope_id AND s.kind IN (${SOURCE_SCOPE_KINDS.map((k) => `'${k}'`).join(', ')})
                    WHERE ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL ORDER BY ev.tx_from, s.key LIMIT 1)) AS path
   FROM unnest($1::text[]) AS f(id)
   CROSS JOIN LATERAL (
@@ -339,6 +344,10 @@ export async function walkRelations(
     /** The question's embedding and its model: far ends are then also preferred by meaning among their siblings. */
     queryVector?: number[];
     model?: string;
+    /** The day a relative period ("今年") is read from (YYYY-MM-DD), as `ask`'s `now`; default the clock's. */
+    now?: string;
+    /** Milliseconds the walk may take before it stops starting hops and orderings (default `WALK_BUDGET_MS`). */
+    budgetMs?: number;
   } = {},
 ): Promise<Walk> {
   const maxHops = Math.min(Math.max(opts.maxHops ?? 4, 1), 4);
@@ -353,7 +362,8 @@ export async function walkRelations(
   const orderKey = ordinal ? orderedNoun(question, ordinal, terms) : null;
   let orderedHop: number | null = null;
   const picks: string[] = [];
-  let present: Awaited<ReturnType<typeof presentOf>> | null = null;
+  let present: ReturnType<typeof presentOf> | null = null;
+  let latest: string | null | undefined;
   // per entity reached: the named entities its branch descends from (a branch is not anchored by its own start),
   // and the term keys the relations on its way have used
   const origins = new Map<string, Set<string>>(named.map((id) => [id, new Set([id])]));
@@ -364,7 +374,17 @@ export async function walkRelations(
   const used = new Set<string>();
   let frontier = [...named];
 
+  const started = Date.now();
+  const budgetMs = opts.budgetMs ?? WALK_BUDGET_MS;
+  const over = (before: string) => {
+    const ms = Date.now() - started;
+    if (ms < budgetMs || out.spent) return !!out.spent;
+    out.spent = { budgetMs, ms, before };
+    return true;
+  };
   for (let hop = 1; hop <= maxHops && frontier.length > 0; hop++) {
+    // the first hop always runs: a walk that returns nothing for want of time would say less than a short one
+    if (hop > 1 && over(`hop ${hop}`)) break;
     const rows = await store.query<RelRow & { near_id: string }>(RELATIONS_OF, [frontier, READ_PER_ENTITY, patterns]);
     const toCandidate = (r: RelRow & { near_id: string }): Candidate => {
       const nearId = r.near_id;
@@ -420,7 +440,8 @@ export async function walkRelations(
     if (ordinal && orderKey && orderedHop === null) {
       const spellings = terms.filter((t) => t.key === orderKey).map((t) => t.text);
       const ofKind = (c: Candidate) => spellings.some((w) => termCount(c.text, w) > 0);
-      const nears = [...new Set(candidates.filter(ofKind).map((c) => c.nearId))];
+      const nears = over(`ordering at hop ${hop}`) ? [] : [...new Set(candidates.filter(ofKind).map((c) => c.nearId))];
+      if (out.spent && out.spent.before === `ordering at hop ${hop}`) picks.push(`not ordered: ${ordinal.text}: the walk's time budget (${budgetMs} ms) was spent before it could order`);
       // every relation of those entities, not the heaviest READ_PER_ENTITY: the year's first incident may be a light one
       const full = nears.length === 0 ? [] : await store.query<RelRow & { near_id: string }>(RELATIONS_OF, [nears, ORDER_MAX + 1, patterns]);
       const pools = new Map<string, Candidate[]>();
@@ -440,7 +461,7 @@ export async function walkRelations(
       const ordered = [...pools.entries()].filter(([, pool]) => new Set(pool.map((c) => c.farId)).size >= 2);
       if (ordered.length > 0) {
         orderedHop = hop;
-        if (ordinal.period && ordinal.period.year === null && !present) present = await presentOf(store, asOfDate(question) ?? null);
+        if (ordinal.period && ordinal.period.year === null && !present) present = presentOf(asOfDate(question) ?? null, opts.now ?? null);
         // an entity with more relations than can be ordered makes no pick: its candidates are not placed
         const orderable = ordered.filter(([nearId]) => (counts.get(nearId) ?? 0) <= ORDER_MAX);
         const placed = await placeEntities(store, [...new Set(orderable.flatMap(([, pool]) => pool.map((c) => c.farId)))], { spellings, latest: ordinal.kind !== 'nth' });
@@ -448,13 +469,20 @@ export async function walkRelations(
         for (const [nearId, pool] of ordered) {
           const nearName = pool[0].r.source_id === nearId ? pool[0].r.source : pool[0].r.target;
           if ((counts.get(nearId) ?? 0) > ORDER_MAX) {
-            picks.push(`${nearName}: not ordered: ${ordinal.text} would order more than ${ORDER_MAX} relations of ${nearName}`);
+            picks.push(`${nearName}: not ordered: ${ordinal.text} would order more than ${ORDER_MAX} relations of ${nearName}; its candidates are walked unordered`);
             continue;
           }
           const byFar = new Map(pool.map((c) => [c.farId, c]));
           const pick = pickByOrder(ordinal, [...byFar.keys()].map((id) => placed.get(id)!), present);
           if (!pick.picked) {
-            picks.push(`${nearName}: ${pick.note}`);
+            // a relative period that holds nothing: say whether the knowledge base has any source in it at all
+            let why = '';
+            if (pick.dated === 0 && present && ordinal.period?.year === null) {
+              if (latest === undefined) latest = await latestSourceDate(store, present.date);
+              const start = ordinal.period.unit === 'year' ? `${present.date.slice(0, 4)}-01-01` : `${present.date.slice(0, 7)}-01`;
+              if (!latest || latest < start) why = `; the knowledge base has no source dated in ${ordinal.period.unit === 'year' ? present.date.slice(0, 4) : present.date.slice(0, 7)} (its latest: ${latest ?? 'none'})`;
+            }
+            picks.push(`${nearName}: ${pick.note}${why}`);
             continue;
           }
           picks.push(`${nearName}: ${placed.get(pick.picked)?.name ?? pick.picked} — ${pick.note}`);
@@ -556,89 +584,44 @@ export function chainOrder(steps: WalkStep[]): number[] {
   return out;
 }
 
-/** A relation's evidence documents read at most when choosing the passage that states it. */
-const EVIDENCE_READ = 20;
-/** Chunks mentioning both ends read at most per step, from the end mentioned less. */
-const COMENTION_READ = 200;
-/** How long before its first source a report of the same two entities may be the one that states the hop. */
-const LEAD_DAYS = 45;
-
 /**
- * For each step, the passage that states it, near the relation's own sources: the document it was read from and
- * those its evidence names (at most `EVIDENCE_READ`); the earliest of them dates it. Of the chunks that mention both ends
- * (at most `COMENTION_READ`, read from the end mentioned less), the one in the earliest document dated within
- * `LEAD_DAYS` before that source is taken: the report of the week it happened, which a monthly summary the
- * relation was read from restates. A co-mention long before the relation's first source, on a knowledge base
- * that has mentioned both for years, is not. Else a chunk of that earliest source mentioning both ends, or either;
- * else the chunk the relation was read from. A document's date is its own, or the day its claims state most often.
- * Every read is bounded per step. The best chain's first.
+ * For each step, the passage that states it: the chunk the relation was read from (relations record it since v20);
+ * else a passage of its source document (the one it was read from, or else the first its evidence names in a
+ * source scope: a page knode wrote is no source, `SOURCE_SCOPE_KINDS`) that
+ * mentions both ends, or either. Only a relation with no recorded source falls back to a chunk that merely
+ * mentions both ends, and that passage says so: on a knowledge base where two names appear together daily, a
+ * co-mention is no statement of the relation. One bounded read per step; no document needs a date.
  */
 async function bridgePassages(store: Store, steps: WalkStep[]): Promise<SearchResult[]> {
   if (steps.length === 0) return [];
-  const [sources, together] = await Promise.all([
-    store.query<{ i: number; document_id: string }>(
-      `SELECT pair.i, x.document_id FROM unnest($1::text[]) WITH ORDINALITY AS pair(rid, i)
-       CROSS JOIN LATERAL (
-         (SELECT r.document_id FROM relations r WHERE r.id = pair.rid AND r.document_id IS NOT NULL)
-         UNION
-         (SELECT d.id FROM evidence ev JOIN scopes s ON s.id = ev.scope_id JOIN documents d ON d.path = s.key
-          WHERE ev.kind = 'relation' AND ev.target_id = pair.rid AND ev.tx_to IS NULL LIMIT $2)) x`,
-      [steps.map((s) => s.relationId), EVIDENCE_READ],
-    ),
-    store.query<{ i: number; chunk_id: string; document_id: string }>(
-      `SELECT pair.i, x.chunk_id, x.document_id FROM unnest($1::text[], $2::text[]) WITH ORDINALITY AS pair(a, b, i)
-       CROSS JOIN LATERAL (
-         SELECT CASE WHEN (SELECT count(*) FROM (SELECT 1 FROM entity_mentions WHERE entity_id = pair.a LIMIT 5000) ca)
-                       <= (SELECT count(*) FROM (SELECT 1 FROM entity_mentions WHERE entity_id = pair.b LIMIT 5000) cb)
-                     THEN pair.a ELSE pair.b END AS rare,
-                CASE WHEN (SELECT count(*) FROM (SELECT 1 FROM entity_mentions WHERE entity_id = pair.a LIMIT 5000) ca)
-                       <= (SELECT count(*) FROM (SELECT 1 FROM entity_mentions WHERE entity_id = pair.b LIMIT 5000) cb)
-                     THEN pair.b ELSE pair.a END AS other) e
-       CROSS JOIN LATERAL (
-         SELECT m1.chunk_id, m1.document_id FROM entity_mentions m1
-         JOIN entity_mentions m2 ON m2.chunk_id = m1.chunk_id AND m2.entity_id = e.other
-         WHERE m1.entity_id = e.rare LIMIT $3) x`,
-      [steps.map((s) => s.sourceId), steps.map((s) => s.targetId), COMENTION_READ],
-    ),
-  ]);
-  const dates = await documentDates(store, [...new Set([...sources.map((r) => r.document_id), ...together.map((r) => r.document_id)])]);
-  const dayOf = (d: string) => Date.parse(`${d}T00:00:00Z`) / 86_400_000;
-  const choice = new Map<number, { doc: string | null; chunk: string | null }>();
-  for (let i = 0; i < steps.length; i++) {
-    const mine = sources.filter((r) => Number(r.i) === i + 1).map((r) => r.document_id);
-    const first = mine.sort((x, y) => {
-      const dx = dates.get(x) ?? null;
-      const dy = dates.get(y) ?? null;
-      return dx === dy ? (x < y ? -1 : 1) : dx === null ? 1 : dy === null ? -1 : dx < dy ? -1 : 1;
-    })[0] ?? null;
-    const since = first && dates.get(first) ? dayOf(dates.get(first)!) - LEAD_DAYS : null;
-    const near = together
-      .filter((r) => Number(r.i) === i + 1)
-      .map((r) => ({ ...r, at: dates.get(r.document_id) ?? null }))
-      .filter((r) => r.at && since !== null && dayOf(r.at) >= since && r.at <= dates.get(first!)!)
-      .sort((x, y) => (x.at! < y.at! ? -1 : x.at! > y.at! ? 1 : x.chunk_id < y.chunk_id ? -1 : 1))[0];
-    choice.set(i, near ? { doc: null, chunk: near.chunk_id } : { doc: first, chunk: null });
-  }
-  const rows = await store.query<{ i: number; chunk_id: string; document_id: string; path: string; title: string | null; content: string; doc_date: string | Date | null }>(
-    `SELECT pair.i, c.id AS chunk_id, c.document_id, d.path, d.title, c.content, d.doc_date
-     FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[]) WITH ORDINALITY AS pair(a, b, doc, pick, own, i)
+  const rows = await store.query<{ i: number; rank: number; chunk_id: string; document_id: string; path: string; title: string | null; content: string; doc_date: string | Date | null }>(
+    `SELECT pair.i, x.rank, c.id AS chunk_id, c.document_id, d.path, d.title, c.content, d.doc_date
+     FROM unnest($1::text[], $2::text[], $3::text[]) WITH ORDINALITY AS pair(rid, a, b, i)
+     JOIN relations r ON r.id = pair.rid
      CROSS JOIN LATERAL (
-       SELECT y.chunk_id FROM (
-         (SELECT ch.id AS chunk_id, 0 AS rank FROM chunks ch WHERE ch.id = NULLIF(pair.pick, ''))
+       SELECT COALESCE(r.document_id, (
+         SELECT dd.id FROM evidence ev JOIN scopes s ON s.id = ev.scope_id AND s.kind = ANY($4::text[]) JOIN documents dd ON dd.path = s.key
+         WHERE ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL ORDER BY ev.tx_from, dd.id LIMIT 1)) AS doc
+     ) src
+     CROSS JOIN LATERAL (
+       SELECT y.chunk_id, y.rank FROM (
+         (SELECT ch.id AS chunk_id, 0 AS rank FROM chunks ch WHERE ch.id = r.chunk_id)
          UNION ALL
          (SELECT m1.chunk_id, 1 FROM entity_mentions m1
           JOIN entity_mentions m2 ON m2.chunk_id = m1.chunk_id AND m2.entity_id = pair.b
-          WHERE m1.document_id = NULLIF(pair.doc, '') AND m1.entity_id = pair.a ORDER BY m1.chunk_id LIMIT 1)
+          WHERE m1.document_id = src.doc AND m1.entity_id = pair.a ORDER BY m1.chunk_id LIMIT 1)
          UNION ALL
-         (SELECT m.chunk_id, 2 FROM entity_mentions m
-          WHERE m.document_id = NULLIF(pair.doc, '') AND m.entity_id IN (pair.a, pair.b) ORDER BY m.chunk_id LIMIT 1)
+         (SELECT m.chunk_id, 2 FROM entity_mentions m WHERE m.document_id = src.doc AND m.entity_id IN (pair.a, pair.b)
+          ORDER BY m.chunk_id LIMIT 1)
          UNION ALL
-         (SELECT ch.id, 3 FROM chunks ch WHERE ch.id = NULLIF(pair.own, ''))
+         (SELECT m1.chunk_id, 3 FROM entity_mentions m1
+          JOIN entity_mentions m2 ON m2.chunk_id = m1.chunk_id AND m2.entity_id = pair.b
+          WHERE m1.entity_id = pair.a AND src.doc IS NULL LIMIT 1)
        ) y ORDER BY y.rank LIMIT 1
      ) x
      JOIN chunks c ON c.id = x.chunk_id
      JOIN documents d ON d.id = c.document_id`,
-    [steps.map((s) => s.sourceId), steps.map((s) => s.targetId), steps.map((_, i) => choice.get(i)?.doc ?? ''), steps.map((_, i) => choice.get(i)?.chunk ?? ''), steps.map((s) => s.chunkId ?? '')],
+    [steps.map((s) => s.relationId), steps.map((s) => s.sourceId), steps.map((s) => s.targetId), [...SOURCE_SCOPE_KINDS]],
   );
   const byStep = new Map(rows.map((r) => [Number(r.i) - 1, r]));
   const seen = new Set<string>();
@@ -648,10 +631,12 @@ async function bridgePassages(store: Store, steps: WalkStep[]): Promise<SearchRe
     if (!r || seen.has(r.chunk_id)) continue;
     seen.add(r.chunk_id);
     const step = steps[i];
+    const coMention = Number(r.rank) === 3;
     out.push({
-      chunkId: r.chunk_id, documentId: r.document_id, path: r.path, title: r.title, content: r.content,
+      chunkId: r.chunk_id, documentId: r.document_id, path: r.path, title: r.title,
+      content: coMention ? `(mentions ${step.source} and ${step.target}; not the source of "${step.source} ${step.type.replace(/_/g, ' ')} ${step.target}") ${r.content}` : r.content,
       docDate: toDateString(r.doc_date), score: 0, signals: { structural: step.hop },
-      trace: { route: 'sag', hop: step.hop, bridgeEntities: [step.source, step.target] },
+      trace: { route: 'sag', hop: step.hop, bridgeEntities: [step.source, step.target], ...(coMention ? { coMention: true } : {}) },
     });
   }
   return out;

@@ -469,18 +469,19 @@ describe('ordering and meaning in the walk', () => {
     expect(placed.get('i2')).toMatchObject({ date: '2025-03-10', level: 2 });
     expect(placed.get('i5')).toMatchObject({ date: null, level: 1 });
     const ask = ordinalInQuestion('今年第三起最严重一档的故障')!;
-    const pick = pickByOrder(ask, [...(await placeEntities(ws, ['i1', 'i2', 'i3', 'i4', 'i5'])).values()], { date: '2025-12-31', by: 'knowledge base' });
+    const pick = pickByOrder(ask, [...(await placeEntities(ws, ['i1', 'i2', 'i3', 'i4', 'i5'])).values()], { date: '2025-12-31', by: 'caller' });
     expect(pick.picked).toBeNull();
-    expect(pick.note).toMatch(/^not ordered: 第三起 asks for the 3rd, 2 P1 candidates are dated in 2025 \(this year: the knowledge base's latest date, 2025-12-31\) \(1 have no date\); in order: INC-001-D2T1 \(2025-02-03, first seen\), INC-003-D2T1 \(2025-04-28, first seen\)$/);
+    expect(pick.note).toMatch(/^not ordered: 第三起 asks for the 3rd, 2 P1 candidates are dated in 2025 \(this year: the caller's now, 2025-12-31\) \(1 have no date\); in order: INC-001-D2T1 \(2025-02-03, first seen\), INC-003-D2T1 \(2025-04-28, first seen\)$/);
   });
 
   it('takes the Nth of the group the question describes, by date, and walks on from it', async () => {
     const q = '第二事业部管基础设施的那个组今年第二起最严重一档的故障，是谁处理好的？';
-    const walk = await walkRelations(ws, q, ['d2'], { maxHops: 3, queryVector: [1, 0, 0, 0], model: MODEL });
+    // the fixture's year is 2025: asked as of its end, as an evaluation of a past corpus sets its own now
+    const walk = await walkRelations(ws, q, ['d2'], { maxHops: 3, queryVector: [1, 0, 0, 0], model: MODEL, now: '2025-12-31' });
     const hop2 = walk.steps.filter((s) => s.hop === 2);
     // of the platform group's 2025 P1 incidents (INC-001, INC-003; INC-002 was P2 in its week, INC-099 is of 2024, INC-005 undated), the second
     const picked = hop2.find((s) => s.source === 'INC-003-D2T1')!;
-    expect(picked.order).toMatch(/^the 2nd of 2 P1 dated in 2025 \(this year: the knowledge base's latest date, 2025-\d\d-\d\d\), by date \(2025-04-28\); 1 without a date left out/);
+    expect(picked.order).toMatch(/^the 2nd of 2 P1 dated in 2025 \(this year: the caller's now, 2025-12-31\), by date \(2025-04-28\); 1 without a date left out/);
     expect(hop2.map((s) => s.source)).not.toContain('INC-001-D2T1');
     expect(hop2.map((s) => s.source)).toContain('INC-011-D2T2');
     expect(walk.ordering?.picks).toHaveLength(2);
@@ -490,9 +491,10 @@ describe('ordering and meaning in the walk', () => {
     expect(walk.ordering?.picks.some((p) => p.startsWith('二部平台组: INC-003-D2T1 — the 2nd of 2 P1'))).toBe(true);
     // the group the question describes leads: its chain's passages come first
     expect(walk.bridges[0].trace?.bridgeEntities).toContain('二部平台组');
-    // the fix's passage is the report of its week, not the summary the relation was read from 25 days later
+    // the fix's passage is the one the relation was read from (here a later summary), not another chunk naming both
     const fix = walk.bridges.find((b) => b.trace?.bridgeEntities?.includes('钱勇'))!;
-    expect(fix.content).toBe('本周钱勇修复了INC-003-D2T1。');
+    expect(fix.content).toBe('季度回顾：钱勇修复INC-003-D2T1');
+    expect(fix.trace?.coMention).toBeUndefined();
   });
 
   it('owes the described group to the question\'s meaning: none without a vector, another with another vector', async () => {
@@ -501,7 +503,7 @@ describe('ordering and meaning in the walk', () => {
     expect((await walkRelations(ws, q, ['d2'], { maxHops: 3 })).steps).toEqual([]);
     expect((await walkRelations(ws, q, ['d2'], { maxHops: 3, queryVector: [1, 0, 0, 0], model: 'another-model' })).steps).toEqual([]);
     // a vector nearest the payments group: its chain leads
-    const pay = await walkRelations(ws, q, ['d2'], { maxHops: 3, queryVector: [0, 1, 0, 0], model: MODEL });
+    const pay = await walkRelations(ws, q, ['d2'], { maxHops: 3, queryVector: [0, 1, 0, 0], model: MODEL, now: '2025-12-31' });
     expect(pay.bridges[0].trace?.bridgeEntities).toContain('二部支付组');
     expect(pay.steps.find((s) => s.order && s.source === 'INC-011-D2T2')).toBeDefined();
   });

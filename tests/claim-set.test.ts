@@ -263,6 +263,17 @@ describe('ask with a computed set', () => {
     expect(prompts[0]).toContain('# Computed from the claims\nScope: Northwind Platform.');
   });
 
+  it('computes no set over what a chain names before it finds the entity the set is of', async () => {
+    // Alice Chen fixed INC-1 and INC-7; the platform reported three incidents. The set the question asks for is the
+    // person's, which the walk has not found here: no set rather than the platform's three
+    const q = 'Who fixed INC-1 of Northwind Platform? How many incidents did that person fix?';
+    const { llm, prompts } = recordingLlm();
+    const res = await ask(store, config, embedder, llm, q, { route: 'multihop', computed: true });
+    expect(res.route.kind).toBe('multihop');
+    expect(res.route.computed).toBeUndefined();
+    expect(prompts[0]).not.toContain('# Computed from the claims');
+  });
+
   it('computes nothing for a question that asks for no set', async () => {
     const { llm, prompts } = recordingLlm();
     const res = await ask(store, config, embedder, llm, 'What is Northwind Platform?', { computed: true });

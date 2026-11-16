@@ -103,19 +103,32 @@ export function ordinalInQuestion(question: string): OrdinalAsk | null {
 }
 
 /**
- * The present a relative period ("今年", "this month") is read against: the
- * day the question says it is asked as of ("截至2025年5月21日", "as of
- * 2025-05-21"), else the date of the knowledge base's latest source up to
- * today. A source's date is its own, or else the earliest date its claims
- * state: the week a report covers, not the launch it plans for next year (the
- * earliest, not the most stated, so one scan serves every document). On a
- * knowledge base kept current that is this year; on one whose sources stop in
- * an earlier year it is that year, and the note says so.
+ * The present a relative period ("今年", "this month") is read against: the day the question says it is asked as of
+ * ("截至2025年5月21日", "as of 2025-05-21"), else the day its caller gives (`ask`'s `now`: an evaluation of a past
+ * corpus sets its own), else the clock's. A knowledge base behind the clock is not read as current: its "今年" holds
+ * nothing, and the note says what its latest source is (`latestSourceDate`).
  */
-export async function presentOf(store: Store, asOf: string | null, today = new Date()): Promise<{ date: string; by: 'question' | 'knowledge base' | 'clock' }> {
-  const clock = today.toISOString().slice(0, 10);
+export function presentOf(asOf: string | null, now: string | null = null, today = new Date()): { date: string; by: 'question' | 'caller' | 'clock' } {
   if (asOf) return { date: asOf.slice(0, 10), by: 'question' };
-  const bound = `${clock}T23:59:59Z`;
+  if (now) return { date: now.slice(0, 10), by: 'caller' };
+  return { date: localDate(today), by: 'clock' };
+}
+
+/**
+ * A day in the local time zone (YYYY-MM-DD), read as the computed sets read today (claimset.ts `todayIso`): a
+ * question asked at 00:30 on 1 January in Shanghai is asked in the new year, not on 31 December (UTC).
+ */
+export function localDate(at = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())}`;
+}
+
+/**
+ * The date of the knowledge base's latest source up to `upTo`: a source's date is its own, or else the earliest its
+ * claims state (the week a report covers, not the launch it plans). Read only to say why a period holds nothing.
+ */
+export async function latestSourceDate(store: Store, upTo: string): Promise<string | null> {
+  const bound = `${upTo.slice(0, 10)}T23:59:59Z`;
   let [row] = await store.query<{ at: string | Date | null }>(`SELECT max(doc_date) AS at FROM documents WHERE doc_date <= $1::timestamptz`, [bound]);
   if (!row?.at) {
     [row] = await store.query<{ at: string | Date | null }>(
@@ -126,8 +139,7 @@ export async function presentOf(store: Store, asOf: string | null, today = new D
       [bound],
     );
   }
-  const kb = toDateString(row?.at ?? null);
-  return kb ? { date: kb, by: 'knowledge base' } : { date: clock, by: 'clock' };
+  return toDateString(row?.at ?? null);
 }
 
 export interface Placed {
@@ -159,30 +171,36 @@ export async function placeEntities(store: Store, ids: string[], event: { spelli
   const out = new Map<string, Placed>(ids.map((id) => [id, { id, date: null, level: null }]));
   if (ids.length === 0) return out;
   for (const r of await store.query<{ id: string; name: string }>(`SELECT id, name FROM entities WHERE id = ANY($1::text[])`, [ids])) out.get(r.id)!.name = r.name;
-  // a claim's own date, and its document's for a level stated undated
+  // a claim's own date, and the document it is in, dated only where an undated claim states a level or the event
   const claims = await store.query<{ id: string; at: string | Date | null; document_id: string | null; statement: string }>(
     `SELECT c.subject_id AS id, COALESCE(c.event_at, c.valid_from) AS at, c.statement, ch.document_id
      FROM claims c LEFT JOIN chunks ch ON ch.id = c.chunk_id
      WHERE c.subject_id = ANY($1::text[]) AND c.tx_to IS NULL`,
     [ids],
   );
-  const mentioned = await store.query<{ id: string; document_id: string }>(
-    `SELECT DISTINCT entity_id AS id, document_id FROM entity_mentions WHERE entity_id = ANY($1::text[])`,
-    [ids],
-  );
-  const docDates = await documentDates(store, [...new Set([...claims.map((c) => c.document_id), ...mentioned.map((m) => m.document_id)].filter((d): d is string => Boolean(d)))]);
   const rels = await store.query<{ id: string; at: string | Date | null; description: string }>(
     `SELECT e.id, r.valid_from AS at, r.description FROM unnest($1::text[]) AS e(id)
      JOIN relations r ON (r.source_id = e.id OR r.target_id = e.id) AND r.tx_to IS NULL AND r.valid_from IS NOT NULL`,
     [ids],
   );
+  const LEVEL = /\b(?:P|SEV|S)\s?([0-5])(?![\d.])/i;
+  const states = (text: string) => !!event && event.spellings.some((w) => text.toLowerCase().includes(w));
+  // the candidates nothing of their own dates: only these are looked for in the documents that mention them
+  const ownDated = new Set([...claims.filter((c) => c.at).map((c) => c.id), ...rels.map((r) => r.id)]);
+  const undatedIds = ids.filter((id) => !ownDated.has(id));
+  const mentioned = undatedIds.length === 0 ? [] : await store.query<{ id: string; document_id: string }>(
+    `SELECT DISTINCT entity_id AS id, document_id FROM entity_mentions WHERE entity_id = ANY($1::text[])`,
+    [undatedIds],
+  );
+  const needed = new Set<string>(mentioned.map((m) => m.document_id));
+  for (const c of claims) if (!c.at && c.document_id && (LEVEL.test(c.statement) || states(c.statement))) needed.add(c.document_id);
+  const docDates = await documentDates(store, [...needed]);
   const relDate = new Map<string, string>();
   for (const r of rels) {
     const d = toDateString(r.at);
     if (d && (!relDate.has(r.id) || d < relDate.get(r.id)!)) relDate.set(r.id, d);
   }
   // the event asked about, where a claim or a relation states it
-  const states = (text: string) => !!event && event.spellings.some((w) => text.toLowerCase().includes(w));
   const events = new Map<string, string[]>();
   if (event) {
     for (const c of claims) {
@@ -286,8 +304,8 @@ export function pickByOrder(ask: OrdinalAsk, candidates: Placed[], present: { da
   let scope = dated;
   let period = '';
   if (ask.period) {
-    const now = present?.date ?? new Date().toISOString().slice(0, 10);
-    const relative = ask.period.year === null && present && present.by !== 'question' ? ` (this ${ask.period.unit}: the ${present.by === 'clock' ? 'clock' : "knowledge base's latest date"}, ${present.date})` : '';
+    const now = present?.date ?? localDate();
+    const relative = ask.period.year === null && present && present.by !== 'question' ? ` (this ${ask.period.unit}: the ${present.by === 'clock' ? 'clock' : "caller's now"}, ${present.date})` : '';
     if (ask.period.unit === 'year') {
       const y = ask.period.year ?? Number(now.slice(0, 4));
       scope = dated.filter((c) => Number(c.date!.slice(0, 4)) === y);

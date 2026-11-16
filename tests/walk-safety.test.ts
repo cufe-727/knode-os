@@ -1,14 +1,14 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { defaultConfig } from '../src/config.js';
 import { entityKeyKinds } from '../src/graph/normalize.js';
 import type { EmbeddingProvider } from '../src/ingest/embeddings.js';
-import type { LlmClient } from '../src/llm/client.js';
+import type { ChatMessage, LlmClient } from '../src/llm/client.js';
 import { ask } from '../src/search/ask.js';
 import { stepsAsFacts, walkRelations, walkTerms } from '../src/search/walk.js';
-import { ordinalInQuestion } from '../src/search/walk-order.js';
+import { ordinalInQuestion, pickByOrder, presentOf } from '../src/search/walk-order.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
 
 /**
@@ -143,6 +143,15 @@ beforeAll(async () => {
     await entity(id, `双子${id}组`, 'organization', [...v]);
     await relate(id, 'duo', '该组隶属于双子事业部。', await doc('组织架构', [id, 'duo']), 10, 'part_of');
   }
+  // an acquisition announced in its own report, the two companies named together in a market recap three weeks before,
+  // and a relation the store holds no source for
+  await entity('hc', '海川资本');
+  await entity('yh', '远航科技');
+  await doc('市场回顾：本周海川资本与远航科技股价均上涨。', ['hc', 'yh'], '2026-05-01');
+  await relate('hc', 'yh', '海川资本收购了远航科技。', await doc('公告：海川资本宣布收购远航科技全部股权。', ['hc', 'yh'], '2026-05-22'), 1, 'acquired');
+  await entity('nosrc', '无源合作方');
+  await doc('行业会议上，海川资本与无源合作方同台。', ['hc', 'nosrc'], '2026-04-01');
+  await store.query(`INSERT INTO relations (id, source_id, target_id, type, description, weight) VALUES ('r-nosrc', 'hc', 'nosrc', 'partner_of', '海川资本与无源合作方合作。', 1)`);
 });
 
 afterAll(async () => {
@@ -182,7 +191,7 @@ describe('the ordering step', () => {
     const walk = await walkRelations(store, '风控平台组今年第一起事故是谁修复的？', ['risk'], { maxHops: 1 });
     const picked = walk.steps.find((s) => s.order);
     expect(picked?.source).toBe('EVT-150');
-    expect(picked?.order).toMatch(/^the 1st of 200 dated in 2026 \(this year: the knowledge base's latest date, 2026-\d\d-\d\d\), by date \(2026-01-01\)/);
+    expect(picked?.order).toMatch(/^the 1st of 200 dated in 2026 \(this year: the clock, 2026-\d\d-\d\d\), by date \(2026-01-01\)/);
   });
 
   it('reads 今年 as the present year, not the latest year the candidates are dated in', async () => {
@@ -192,6 +201,34 @@ describe('the ordering step', () => {
     // a year the question names for the ordering is that year
     const named = await walkRelations(store, '清算组2025年第一起事故是谁修复的？', ['clear'], { maxHops: 1 });
     expect(named.steps.find((s) => s.order)?.source).toBe('INC-OLD-olda');
+  });
+
+  it('reads 今年 by the clock, or by the now its caller gives, and picks nothing from a year the knowledge base has no source in', async () => {
+    // the knowledge base's latest sources are of 2026; asked in 2027 its 今年 holds nothing
+    const later = await walkRelations(store, '风控平台组今年第一起事故是谁修复的？', ['risk'], { maxHops: 1, now: '2027-03-01' });
+    expect(later.steps.find((s) => s.order)).toBeUndefined();
+    expect(later.ordering?.picks[0]).toMatch(/not ordered: .*0 candidates are dated in 2027 \(this year: the caller's now, 2027-03-01\).*no source dated in 2027 \(its latest: 2026-/);
+    // an evaluation of a past corpus gives its own now, and its 今年 is that year
+    const past = await walkRelations(store, '清算组今年第一起事故是谁修复的？', ['clear'], { maxHops: 1, now: '2025-12-31' });
+    expect(past.steps.find((s) => s.order)?.source).toBe('INC-OLD-olda');
+    expect(past.ordering?.picks[0]).toMatch(/dated in 2025 \(this year: the caller's now, 2025-12-31\)/);
+  });
+
+  it('reads the clock\'s today in the local time zone, as the computed sets do', () => {
+    const tz = process.env.TZ;
+    process.env.TZ = 'Asia/Shanghai';
+    vi.useFakeTimers({ now: new Date('2026-12-31T16:30:00Z') }); // 2027-01-01 00:30 in Shanghai
+    try {
+      expect(presentOf(null, null, new Date('2027-01-01T00:30:00+08:00'))).toEqual({ date: '2027-01-01', by: 'clock' });
+      expect(presentOf(null)).toEqual({ date: '2027-01-01', by: 'clock' });
+      // with no present given, the ordering's 今年 is the local year too
+      const ask = ordinalInQuestion('清算组今年第一起事故是谁修复的？')!;
+      const pick = pickByOrder(ask, [{ id: 'a', name: 'INC-A', date: '2027-01-01', level: null, datedBy: 'event' }, { id: 'b', name: 'INC-B', date: '2026-12-30', level: null, datedBy: 'event' }]);
+      expect(pick.picked).toBe('a');
+    } finally {
+      vi.useRealTimers();
+      if (tz === undefined) delete process.env.TZ; else process.env.TZ = tz;
+    }
   });
 
   it('takes a year named elsewhere in the question as no period of the ordering', () => {
@@ -218,10 +255,51 @@ describe('the ordering step', () => {
 });
 
 describe('the passage that states a hop', () => {
+  it('is the relation\'s own recorded passage, not a recap that names both ends weeks before', async () => {
+    const walk = await walkRelations(store, '海川资本收购了哪家公司？那家公司的创始人是谁', ['hc'], { maxHops: 1 });
+    const step = walk.steps.findIndex((s) => s.target === '远航科技');
+    expect(step).toBeGreaterThanOrEqual(0);
+    const passage = walk.bridges.find((b) => b.trace?.bridgeEntities?.includes('远航科技'))!;
+    expect(passage.content).toBe('公告：海川资本宣布收购远航科技全部股权。');
+  });
+
+  it('says so when it can only show a passage that mentions both ends, for a relation with no recorded source', async () => {
+    const walk = await walkRelations(store, '海川资本和谁合作？合作方的负责人是谁', ['hc'], { maxHops: 1 });
+    const passage = walk.bridges.find((b) => b.trace?.bridgeEntities?.includes('无源合作方'))!;
+    expect(passage.trace?.coMention).toBe(true);
+    expect(passage.content).toMatch(/^\(mentions 海川资本 and 无源合作方; not the source of "海川资本 partner of 无源合作方"\) /);
+  });
+
   it('is read from the relation\'s own source, not from an old note that mentions both ends', async () => {
     const walk = await walkRelations(store, '安娜负责的项目是什么？那个项目的负责人还负责什么', ['ann'], { maxHops: 1 });
     expect(walk.steps.map((s) => s.target)).toEqual(['轨道计划']);
     expect(walk.bridges[0].content).toBe('2024年第12周：安娜开始负责轨道计划。');
+  });
+
+  it('takes no generated page for the source of a relation whose only evidence is that page', async () => {
+    await entity('jh', '镜湖基金');
+    for (const [id, name, kind] of [['yf', '云帆物流', 'wiki-human'], ['qs', '青石建材', 'page']] as const) {
+      await entity(id, name);
+      const page = `wiki/entities/${id}.md`;
+      await store.query(`INSERT INTO documents (id, path, root, title, sha256, bytes, status) VALUES ($1, $2, 'wiki', $1, $1, 10, 'indexed')`, [`d-${id}`, page]);
+      await store.query(`INSERT INTO chunks (id, document_id, seq, content, token_count) VALUES ($1, $2, 0, $3, 3)`, [`c-${id}`, `d-${id}`, `${name}：镜湖基金投资了${name}。`]);
+      await store.query(`INSERT INTO scopes (id, kind, key, sha, status, applied_at) VALUES ($1, $2, $3, $1, 'active', now())`, [`s-${id}`, kind, page]);
+      for (const e of ['jh', id]) await store.query(`INSERT INTO entity_mentions (entity_id, chunk_id, document_id, scope_id) VALUES ($1, $2, $3, $4)`, [e, `c-${id}`, `d-${id}`, `s-${id}`]);
+      await store.query(`INSERT INTO relations (id, source_id, target_id, type, description, weight) VALUES ($1, 'jh', $2, 'invested_in', $3, 1)`, [`r-${id}`, id, `镜湖基金投资了${name}。`]);
+      await store.query(`INSERT INTO evidence (kind, target_id, scope_id, extractor, tx_from) VALUES ('relation', $1, $2, 'test', now())`, [`r-${id}`, `s-${id}`]);
+    }
+    const walk = await walkRelations(store, '镜湖基金投资了哪些公司？它们的负责人是谁', ['jh'], { maxHops: 1 });
+    expect(walk.steps.map((s) => s.target).sort()).toEqual(['云帆物流', '青石建材']);
+    // nor is the page the source its fact cites
+    expect(stepsAsFacts(walk.steps).map((f) => f.path)).toEqual([null, null]);
+    for (const name of ['云帆物流', '青石建材']) {
+      const passage = walk.bridges.find((b) => b.trace?.bridgeEntities?.includes(name));
+      // a page knode wrote is no source: the passage is shown only as a co-mention, and says so
+      if (passage) {
+        expect(passage.trace?.coMention).toBe(true);
+        expect(passage.content).toMatch(/^\(mentions 镜湖基金 and /);
+      }
+    }
   });
 
   it('reads a bounded number of rows for a hub mentioned in hundreds of chunks', async () => {
@@ -289,4 +367,59 @@ describe('the walk\'s vocabulary', () => {
     expect(walkTerms('他后来调到了哪个组').budget.has('type:organization')).toBe(true);
     expect(walkTerms('他后来调到了哪个团队').budget.has('type:organization')).toBe(true);
   });
+});
+
+describe('the walk\'s cost', () => {
+  /** The store, with every statement it is asked recorded. */
+  const recording = () => {
+    const sqls: string[] = [];
+    const q0 = store.query.bind(store);
+    const spy = Object.assign(Object.create(Object.getPrototypeOf(store)), store, {
+      query: async (sql: string, params?: unknown[]) => {
+        sqls.push(sql);
+        return q0(sql, params as never[]);
+      },
+    }) as Store;
+    return { spy, sqls };
+  };
+
+  it('reads no document dates for candidates whose own claims date them', async () => {
+    const { spy, sqls } = recording();
+    const walk = await walkRelations(spy, '风控平台组今年第一起事故是谁修复的？', ['risk'], { maxHops: 1, now: '2026-06-01' });
+    expect(walk.steps.find((s) => s.order)?.source).toBe('EVT-150');
+    expect(sqls.filter((q) => q.includes("date_trunc('day'"))).toEqual([]);
+    expect(sqls.filter((q) => q.includes('FROM entity_mentions WHERE entity_id = ANY'))).toEqual([]);
+  });
+
+  it('returns what it has when its time budget is spent, and says so', async () => {
+    const walk = await walkRelations(store, '二部平台组的事故是谁修复的？他还修复过哪些事故', ['plat'], { maxHops: 3, budgetMs: 0 });
+    expect(walk.steps.length).toBeGreaterThan(0);
+    expect(walk.steps.every((s) => s.hop === 1)).toBe(true);
+    expect(walk.spent).toMatchObject({ budgetMs: 0, before: 'hop 2' });
+  });
+
+  it('tells the answer that its time budget ran out, through the multi-hop route', async () => {
+    // the walk's first read of relations takes longer than its whole budget (1500 ms)
+    const q0 = store.query.bind(store);
+    const slow = Object.assign(Object.create(Object.getPrototypeOf(store)), store, {
+      query: async (sql: string, params?: unknown[]) => {
+        if (sql.includes('AS near_id')) await new Promise((r) => setTimeout(r, 1600));
+        return q0(sql, params as never[]);
+      },
+    }) as Store;
+    const prompts: string[] = [];
+    const llm = {
+      enabled: true,
+      complete: async (messages: ChatMessage[]) => {
+        prompts.push(messages.map((m) => m.content).join('\n'));
+        return 'Unknown.\n{"citations":[],"gaps":[]}';
+      },
+      completeJson: async () => ({}),
+    } as unknown as LlmClient;
+    const embedder = { model: MODEL, dimensions: 4, embed: async (t: string[]) => t.map(() => [1, 0, 0, 0]) } as EmbeddingProvider;
+    const res = await ask(slow, config, embedder, llm, '二部平台组的事故是谁修复的？他还修复过哪些事故', { route: 'multihop' });
+    expect(res.route.walked?.spent).toMatchObject({ budgetMs: 1500, before: 'hop 2' });
+    expect(res.facts.some((f) => f.id === 'walk:spent')).toBe(true);
+    expect(prompts.some((p) => /The relation walk stopped before hop 2: its time budget \(1500 ms\) was spent after \d+ ms/.test(p))).toBe(true);
+  }, 10_000);
 });

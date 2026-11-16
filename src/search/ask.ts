@@ -41,6 +41,8 @@ export interface AskRoute {
     hops: number; relations: number; reached: number; bridges: number;
     /** What the question ordered ("第二起"), the hop it ordered, and each branch's pick or why there was none. */
     ordering?: { asked: string; hop: number | null; picks: string[] };
+    /** The walk's time budget was spent before it finished: what it stopped before, after how long. */
+    spent?: { budgetMs: number; ms: number; before: string };
   };
   /** For a question asking for a set, a count or a value as of a date: what the claims gave (docs/design/34 §1). */
   computed?: { op: string; scope: string; matched: number; items: number; rows: number; ms: number };
@@ -344,6 +346,9 @@ async function enumeratedAnswer(env: RouteEnv): Promise<AskResult | null> {
   }), heading);
 }
 
+/** Entities the walk reached that a chain's computed set may be scoped to, at most. */
+const CHAIN_SET_SCOPES = 8;
+
 /**
  * Multi-hop: SAG search, and a bounded walk over the named entities' relations with the passages stating each
  * hop, beside what the lookup route would have found for the same question (the set the claims compute, the
@@ -357,16 +362,27 @@ async function multihopAnswer(env: RouteEnv): Promise<AskResult> {
   // mode answers, whose hybrid search falls back to the keyword and graph channels as the lookup route's does
   const asked = opts.mode ?? 'hybrid';
   const mode: SearchMode = asked === 'keyword' ? 'keyword' : queryVector ? 'sag' : 'hybrid';
-  const [retrieved, walk, graph, computed] = await Promise.all([
+  const chain = isChainQuestion(question);
+  const [retrieved, walk, graph, setFirst] = await Promise.all([
     search(store, embedder, question, { k, mode, heat: config.heat, sag: config.retrieval.sag, rerank: config.retrieval.rerank, queryVector, track: opts.track }),
-    walkRelations(store, question, named, { maxHops: router.maxHops, queryVector, model: embedder.model }),
+    walkRelations(store, question, named, { maxHops: router.maxHops, queryVector, model: embedder.model, now: opts.now }),
     graphSearch(store, question, { depth: 2, chunkLimit: 4, heat: config.heat, track: opts.track }),
-    // a walked question gets a computed set too, under the same switch, reference day and time budget as any other
+    // a walked question gets a computed set too, under the same switch, reference day and time budget as any other;
+    // a chain's waits for the walk (below)
     env.computed ? Promise.resolve(env.computed)
-      : (opts.computed ?? router.computedSets === true)
+      : (opts.computed ?? router.computedSets === true) && !chain
         ? computeSet(store, question, { kind: 'lookup', range: env.routed.range }, named, opts.now, router, env.spent)
         : Promise.resolve(null),
   ]);
+  // a chain ("平台组的INC-001是谁修复的？此人还修复过哪些事故？") asks for the set of what it finds, not of what it names
+  // first: its set is computed over the entities the walk reached, and kept only when it is scoped to one of them
+  let computed = setFirst;
+  if (chain && !env.computed && (opts.computed ?? router.computedSets === true)) {
+    const found = walk.reached.filter((id) => !named.includes(id)).slice(0, CHAIN_SET_SCOPES);
+    const set = found.length ? await computeSet(store, question, { kind: 'lookup', range: env.routed.range }, found, opts.now, router, env.spent) : null;
+    const names = set ? new Set((await store.query<{ name: string }>(`SELECT name FROM entities WHERE id = ANY($1::text[])`, [found])).map((r) => r.name)) : new Set<string>();
+    computed = set && set.scope && names.has(set.scope) ? set : null;
+  }
   const seen = new Set(retrieved.map((r) => r.chunkId));
   // the passages that state the hops share the top of the context with the search: a chain's later hops are
   // rarely what a search of the whole question finds; the graph search's chunks come after both
@@ -393,11 +409,20 @@ async function multihopAnswer(env: RouteEnv): Promise<AskResult> {
     statement: `Ordered by the walk from the dates the sources state (no source states this order): ${walk.ordering!.asked} — ${pick}`,
     startDate: null, endDate: null, eventDate: null, path: null, chunkId: null,
   }));
+  // a walk cut short by its time budget says where it stopped: what lies past it was not looked for, not absent
+  if (walk.spent) {
+    ordering.push({
+      id: 'walk:spent', subject: '', object: null, type: 'walk', status: 'computed', kind: 'fact',
+      statement: `The relation walk stopped before ${walk.spent.before}: its time budget (${walk.spent.budgetMs} ms) was spent after ${walk.spent.ms} ms; relations past that point were not looked for`,
+      startDate: null, endDate: null, eventDate: null, path: null, chunkId: null,
+    });
+  }
   const facts: PromptFact[] = [...ordering, ...steps, ...ranked.filter((f) => !stepIds.has(f.id))];
   return compose({ ...env, computed }, contexts, [...facts, ...currentFacts(contexts, facts)], '', routeOf(env.routed, {
     walked: {
       hops: walk.steps.reduce((n, s) => Math.max(n, s.hop), 0), relations: walk.steps.length, reached: walk.reached.length, bridges: walk.bridges.length,
       ...(walk.ordering ? { ordering: walk.ordering } : {}),
+      ...(walk.spent ? { spent: walk.spent } : {}),
     },
   }));
 }
