@@ -111,7 +111,16 @@ export function ordinalInQuestion(question: string): OrdinalAsk | null {
 export function presentOf(asOf: string | null, now: string | null = null, today = new Date()): { date: string; by: 'question' | 'caller' | 'clock' } {
   if (asOf) return { date: asOf.slice(0, 10), by: 'question' };
   if (now) return { date: now.slice(0, 10), by: 'caller' };
-  return { date: today.toISOString().slice(0, 10), by: 'clock' };
+  return { date: localDate(today), by: 'clock' };
+}
+
+/**
+ * A day in the local time zone (YYYY-MM-DD), read as the computed sets read today (claimset.ts `todayIso`): a
+ * question asked at 00:30 on 1 January in Shanghai is asked in the new year, not on 31 December (UTC).
+ */
+export function localDate(at = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())}`;
 }
 
 /**
@@ -295,7 +304,7 @@ export function pickByOrder(ask: OrdinalAsk, candidates: Placed[], present: { da
   let scope = dated;
   let period = '';
   if (ask.period) {
-    const now = present?.date ?? new Date().toISOString().slice(0, 10);
+    const now = present?.date ?? localDate();
     const relative = ask.period.year === null && present && present.by !== 'question' ? ` (this ${ask.period.unit}: the ${present.by === 'clock' ? 'clock' : "caller's now"}, ${present.date})` : '';
     if (ask.period.unit === 'year') {
       const y = ask.period.year ?? Number(now.slice(0, 4));

@@ -1,14 +1,14 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { defaultConfig } from '../src/config.js';
 import { entityKeyKinds } from '../src/graph/normalize.js';
 import type { EmbeddingProvider } from '../src/ingest/embeddings.js';
 import type { LlmClient } from '../src/llm/client.js';
 import { ask } from '../src/search/ask.js';
 import { stepsAsFacts, walkRelations, walkTerms } from '../src/search/walk.js';
-import { ordinalInQuestion } from '../src/search/walk-order.js';
+import { ordinalInQuestion, pickByOrder, presentOf } from '../src/search/walk-order.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
 
 /**
@@ -212,6 +212,23 @@ describe('the ordering step', () => {
     const past = await walkRelations(store, '清算组今年第一起事故是谁修复的？', ['clear'], { maxHops: 1, now: '2025-12-31' });
     expect(past.steps.find((s) => s.order)?.source).toBe('INC-OLD-olda');
     expect(past.ordering?.picks[0]).toMatch(/dated in 2025 \(this year: the caller's now, 2025-12-31\)/);
+  });
+
+  it('reads the clock\'s today in the local time zone, as the computed sets do', () => {
+    const tz = process.env.TZ;
+    process.env.TZ = 'Asia/Shanghai';
+    vi.useFakeTimers({ now: new Date('2026-12-31T16:30:00Z') }); // 2027-01-01 00:30 in Shanghai
+    try {
+      expect(presentOf(null, null, new Date('2027-01-01T00:30:00+08:00'))).toEqual({ date: '2027-01-01', by: 'clock' });
+      expect(presentOf(null)).toEqual({ date: '2027-01-01', by: 'clock' });
+      // with no present given, the ordering's 今年 is the local year too
+      const ask = ordinalInQuestion('清算组今年第一起事故是谁修复的？')!;
+      const pick = pickByOrder(ask, [{ id: 'a', name: 'INC-A', date: '2027-01-01', level: null, datedBy: 'event' }, { id: 'b', name: 'INC-B', date: '2026-12-30', level: null, datedBy: 'event' }]);
+      expect(pick.picked).toBe('a');
+    } finally {
+      vi.useRealTimers();
+      if (tz === undefined) delete process.env.TZ; else process.env.TZ = tz;
+    }
   });
 
   it('takes a year named elsewhere in the question as no period of the ordering', () => {
