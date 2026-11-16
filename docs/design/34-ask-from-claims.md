@@ -98,10 +98,12 @@ Default config (computed sets off, second round on):
 
 Computed sets (still off by default), one commit each with its test:
 
-- **合计 is a sum; a peer is no item** (d5a96ba).
+- **合计 is a sum; a peer is no item** (d5a96ba, narrowed in 6c44915): only a peer's own figure (a number, no object, not naming the scope) is left out; what it did ("客户甲升级了事故") still lists it — the first rule lost 9 of the 10x pack's customer-escalation tasks.
 - **Scale after the currency** (a220f77): "HK$ bn", "USD billion".
 - **Threshold in its own unit** (5c61ebe): "超过1万亿元" is compared in the base; a bare figure in the unit shown.
 - **Running totals** (07f6707): "前三季度", "1-9月", "Q3 YTD" and a validity window from 1 January through another month than June or December are `ytd`, never the third quarter; a sum or mean of running totals is not computed. A question's "前三季度" is the window from 1 January.
 - **Fiscal quarters** (760d0ec): a quarter or half of a fiscal year with no days recorded is in no calendar window, and is said.
 - **Disagreeing figures** (2fc56af): a period with two figures, neither recorded as replacing the other, gives an answer only where either figure gives the same one: a maximum it cannot reach, a threshold both figures pass or fail. Otherwise nothing is computed, and a value as of a day whose period disagrees is not computed either — the two paths agree.
 - **Time budget** (f0537e8): a set asked for and left uncomputed past its budget is said in the prompt ("Not computed: its time budget of N ms ran out"), in `route.computedSkipped` and in the gaps ("the answer may be incomplete"). On PGlite no timer fires while a statement runs (WASM on the event loop's thread), so the budget is overrun by the statement under way when it passes (a 50 ms budget returned after 509–567 ms on the 113k-entity store). On PostgreSQL the race ends at the budget and the statement finishes on the server, unwaited; a `statement_timeout` per statement would end it there too.
+
+Measured on the 10x no-model replay (`--now 2025-11-07`). Default config, 312 asked: gold document in the prompt 0.81, as at 36f6ea5. The second round ran for 46 and added something to 20; against the same questions without it, it brought a gold document into the prompt for 3 (0.07; all three are lookups) and pushed none out. Computed sets on, 482 set tasks: set in facts 0.83, computed correct 0.83, no task changed against 36f6ea5 (the C2–C7 cases do not occur in the pack); 498 sets computed, mean 57 ms, p95 84 ms, none over budget.
