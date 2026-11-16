@@ -475,6 +475,17 @@ describe('units: a scale and a base (re-check item 4)', () => {
     expect(min!.lines.join('\n')).toMatch(/another unit .*亿美元/);
   });
 
+  it('takes a count written with or without its noun for one unit, and a week by the window its first day is in', async () => {
+    for (const [i, unit, v, mon] of [[1, '万', 120, '2025-06-16'], [2, '万用户', 125, '2025-06-23'], [3, '万人', 130, '2025-06-30']] as const) {
+      const fri = mon.replace(/\d\d$/, (x) => String(Number(x) + 4).padStart(2, '0')).replace('2025-06-34', '2025-07-04');
+      await addClaim('r2', 'catl', `宁德时代本周注册用户${v}${unit}${i}`, { attribute: '注册用户', num: v, unit, at: d(mon), from: d(mon), to: d(fri) });
+    }
+    // the week of 30 June closes on 4 July; it is still a week of the first half
+    const mean = await set('宁德时代上半年注册用户的周均值是多少？', ['catl'], '2025-12-31');
+    expect(mean).toMatchObject({ op: 'mean', answer: '125' });
+    expect(mean!.lines[0]).toContain('over 3 readings');
+  });
+
   it('compares one base across scales: 1.1万亿元 is above 9800亿元', async () => {
     const max = await set('宁德时代的最高市值是多少？', ['catl']);
     expect(max).toMatchObject({ op: 'max', answer: '1.1' });

@@ -312,6 +312,8 @@ interface Cand {
 /** How a claim not stated as fact was stated: its kind, and its status when hedged ("rumor, suspected"). */
 const claimKind = (c: { kind: string | null; status: string | null }) => [c.kind && c.kind !== 'fact' ? c.kind : '', c.status && c.status !== 'fact' ? c.status : ''].filter(Boolean).join(', ') || 'fact';
 const CJK_SCALES: [string, number][] = [['万亿', 1e12], ['千亿', 1e11], ['百亿', 1e10], ['十亿', 1e9], ['亿', 1e8], ['千万', 1e7], ['百万', 1e6], ['十万', 1e5], ['万', 1e4]];
+/** Nouns a count is written with that name no measure of their own ("万人", "3名", "12个"). */
+const COUNT_NOUNS = new Set(['人', '个', '名', '位', '次', '家', '件', '项', '条', '户', 'people', 'persons', 'items']);
 const EN_SCALES: Record<string, number> = { trillion: 1e12, tn: 1e12, billion: 1e9, bn: 1e9, million: 1e6, mn: 1e6, thousand: 1e3, k: 1e3 };
 
 /**
@@ -1016,6 +1018,12 @@ async function computeWithin(
     const readings = new Map<string, Cand>();
     const periods = new Map<string, Period | null>();
     const conflicted = new Set<string>();
+    // a unit's noun that only repeats what is counted (用户 of 周活跃用户) or is a bare count noun (人, 个, 名) names no
+    // other measure: "万", "万用户" and "万人" of one attribute are one unit; "亿元" and "亿美元" are still two
+    const baseOfC = (c: Cand) => {
+      const b = unitParts(c.unit).base;
+      return !b || COUNT_NOUNS.has(b) || (c.attribute ?? '').includes(b) ? '' : b;
+    };
     for (const c of matched) {
       if (read.op !== 'value' && matchedAttrs.size > 0 && (!c.attribute || !matchedAttrs.has(c.attribute))) continue;
       if (c.value_num === null && (read.op !== 'value' || !c.value_text)) {
@@ -1026,8 +1034,13 @@ async function computeWithin(
       // value as of a day, on when it was stated (what was known that day)
       const covers = periodOf(c);
       if (!read.asOf && covers && (from || to)) {
+        // a week belongs to the window its first day is in (its report may close in the next month); a longer period
+        // must lie inside the window ("2024年下半年" is no part of 2025's first half)
         const span = periodSpan(covers);
-        if ((from && span.from < from) || (to && span.to > to)) continue;
+        const outside = covers.gran === 'week'
+          ? (from && span.from < from) || (to && span.from > to)
+          : (from && span.from < from) || (to && span.to > to);
+        if (outside) continue;
       } else if (!inPeriod(c)) continue;
       if (peer(c)) { left.peers.set(c.subject, (left.peers.get(c.subject) ?? 0) + 1); continue; }
       if (!isFact(c)) { left.notFact++; continue; }
@@ -1045,7 +1058,7 @@ async function computeWithin(
       }
       const d = dateOf(c);
       // one reading per subject, period and base: a figure in another currency is another measure, never the same one restated
-      const key = read.op === 'value' ? c.id : `${c.subject_id}|${unitParts(c.unit).base}|${period ? `${period.gran}:${period.key}` : d ? isoWeek(d) : c.id}`;
+      const key = read.op === 'value' ? c.id : `${c.subject_id}|${baseOfC(c)}|${period ? `${period.gran}:${period.key}` : d ? isoWeek(d) : c.id}`;
       const prev = readings.get(key);
       // two figures of one subject, period and base, neither replacing the other, are two measures under one name
       // (宁德时代's revenue and its overseas revenue): neither is the figure, and the period is left out
@@ -1063,7 +1076,6 @@ async function computeWithin(
     // one base: the commonest; a tie names no figure. A base that begins another is the same one written with its
     // noun ("个" and "个连接"); a bare scale ("亿", "万") joins a base only when one base is named among the readings
     // ("万" with "万用户"), never when two are ("亿" beside "亿元" and "亿美元"); "亿元" and "亿美元" are two
-    const baseOfC = (c: Cand) => unitParts(c.unit).base;
     const namedBases = [...new Set([...readings.values()].map(baseOfC).filter(Boolean))].sort((a, b) => a.length - b.length);
     const rootOf = (b: string) => (b ? namedBases.find((v) => b.startsWith(v)) ?? b : namedBases.length === 1 ? namedBases[0] : '');
     const unitOf = (c: Cand) => rootOf(baseOfC(c));
