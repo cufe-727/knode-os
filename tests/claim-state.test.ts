@@ -59,6 +59,7 @@ describe('reading a claim as attribute + value', () => {
       { attribute: '在岗人数', count: 5, units: ['人'] },
       { attribute: '活跃度', count: 2, units: ['%'] },
     ]);
+    // named by the most used key, as stored mappings were named before
     expect(m.get('周活跃用户数')?.canonical).toBe('周活跃用户');
     expect(m.has('在岗人数')).toBe(false);
     expect(m.has('活跃度')).toBe(false);
@@ -68,27 +69,33 @@ describe('reading a claim as attribute + value', () => {
     expect(keyQualifiers('支付成功率')).toBe('');
     expect(keyQualifiers('支付成功率环比变化')).toBe(keyQualifiers('支付成功率环比'));
     expect(keyQualifiers('初始间隔')).toBe('初始');
+    expect(keyQualifiers('目标价')).toBe('计划');
     const m = unifyAttributeKeys([
       { attribute: '支付成功率', count: 40, units: ['%'] },
       { attribute: '支付成功率环比变化', count: 30, units: ['%'] },
       { attribute: '支付成功率环比', count: 9, units: ['%'] },
-    ]);
-    expect(m.has('支付成功率环比变化')).toBe(false);
-    expect(m.get('支付成功率环比')?.canonical).toBe('支付成功率环比变化');
+      { attribute: '股价', count: 5, units: ['元'] },
+      { attribute: '目标价', count: 9, units: ['元'] },
+      { attribute: '营收', count: 9, units: ['亿元'] },
+      { attribute: '营收指引', count: 3, units: ['亿元'] },
+    ], ['贵州茅台']);
+    // only the two spellings of one week-on-week change are one key; a target is not the price, guidance not revenue
+    expect([...m.entries()].map(([k, v]) => `${k}→${v.canonical}`)).toEqual(['支付成功率环比→支付成功率环比变化']);
   });
 
   it('makes the keys that name a setting itself one key, and its first value another', () => {
     const spellings = subjectSpellingsOf('对账批次间隔（第一事业部支付组 · T2-C2）', ['T2-C2', '批次间隔']);
-    expect(spellings).toEqual(expect.arrayContaining(['对账批次间隔', 'T2-C2', '批次间隔']));
+    // the name, the name without the split's suffix, the code — not the other aliases
+    expect(spellings.sort()).toEqual(['T2-C2', '对账批次间隔', '对账批次间隔（第一事业部支付组 · T2-C2）'].sort());
     expect(namesSubject('间隔', spellings)).toBe(true);
+    expect(namesSubject('批次间隔', spellings)).toBe(true);
     expect(namesSubject('配置值', spellings)).toBe(true);
     expect(namesSubject('在岗人数', spellings)).toBe(false);
     // the head of a name is its end: 增长 does not name 增长组
     expect(namesSubject('增长', ['增长组'])).toBe(false);
-    // the same head as a name that is a measure: 连接上限 is the value of 订单库连接池上限
-    expect(namesSubject('连接上限', ['订单库连接池上限'])).toBe(true);
-    expect(namesSubject('支付成功率', ['第一事业部支付组'])).toBe(false);
-    expect(namesSubject('在岗人数', ['第一事业部平台组'])).toBe(false);
+    // one head word is not one measure, and a value word names nothing of a subject without a code
+    expect(namesSubject('连接上限', ['订单库连接池上限'])).toBe(false);
+    expect(namesSubject('配置值', ['某基金'])).toBe(false);
     const m = unifyAttributeKeys([
       { attribute: '初始间隔', count: 14, units: ['分钟'] },
       { attribute: '间隔', count: 9, units: ['分钟'] },
@@ -96,19 +103,26 @@ describe('reading a claim as attribute + value', () => {
       { attribute: '批次间隔', count: 1, units: ['分钟'] },
       { attribute: '初始对账批次间隔', count: 3, units: ['分钟'] },
     ], spellings);
+    // canonical by rule: the shortest key that names the setting, whatever the counts
     expect(m.get('配置值')?.canonical).toBe('间隔');
     expect(m.get('批次间隔')?.canonical).toBe('间隔');
     expect(m.has('间隔')).toBe(false);
     expect(m.get('初始对账批次间隔')?.canonical).toBe('初始间隔');
   });
 
-  it('reads a severity as one key however it is called', () => {
+  it('reads a severity as one key however it is called, and names a group by its synonym head', () => {
     expect(normalizeAttribute('事故等级')).toBe('级别');
     const m = unifyAttributeKeys([
       { attribute: '事故级别', count: 3, units: [''] },
       { attribute: '事故等级', count: 2, units: [''] },
     ]);
-    expect(m.get('事故等级')?.canonical).toBe('事故级别');
+    expect(m.get('事故等级')?.canonical).toBe('级别');
+    expect(m.get('事故级别')?.canonical).toBe('级别');
+    // a stored key alone moves to its head: an owner stays an owner however it was read
+    expect(unifyAttributeKeys([{ attribute: '跟进人', count: 9, units: [''] }, { attribute: '负责人', count: 3, units: [''] }]).get('跟进人')?.canonical).toBe('负责人');
+    expect(unifyAttributeKeys([{ attribute: '跟进人', count: 9, units: [''] }]).get('跟进人')?.canonical).toBe('负责人');
+    // 审批状态 contains 状态 and was always one key with it; the group is named by the head, not by the count
+    expect(unifyAttributeKeys([{ attribute: '审批状态', count: 9, units: [''] }, { attribute: '状态', count: 3, units: [''] }]).get('审批状态')?.canonical).toBe('状态');
   });
 
   it('reads one week however a value spells it', () => {
@@ -166,13 +180,18 @@ describe('a series of one attribute', () => {
     expect(marks.get('w30')).toBeNull();
   });
 
-  it('keeps one owner and one state per subject whatever object a claim names, and a measure toward an object apart', () => {
-    expect(seriesObject('状态', '赖艳')).toBe('');
-    expect(seriesObject('负责人', '廖欣')).toBe(seriesObject('负责人', '孙欣'));
+  it('keeps a series per object, except where the object is the value or who handles a state', () => {
+    // a person named on a state line, and an owner whose object is the owner: one series of the subject
+    expect(seriesObject('状态', { id: '赖艳', name: '赖艳', type: 'person' }, '跟进中')).toBe('');
+    expect(seriesObject('负责人', { id: '廖欣', name: '廖欣', type: 'person' }, '廖欣')).toBe(seriesObject('负责人', { id: '孙欣', name: '孙欣', type: 'person' }, '孙欣'));
+    expect(seriesObject('跟进人', { id: '陈伟平台组', name: '陈伟（平台组）', type: 'person' }, '陈伟')).toBe('');
     expect(normalizeAttribute('跟进人')).toBe('负责人');
+    // a thing the attribute belongs to keeps its own series
+    expect(seriesObject('负责人', { id: '电池业务', name: '电池业务', type: 'product' }, '李四')).toBe('电池业务');
+    expect(seriesObject('状态', { id: '半导体业务', name: '半导体业务', type: 'product' }, '审核中')).toBe('半导体业务');
     expect(seriesObject('持股比例', 'company-a')).not.toBe(seriesObject('持股比例', 'company-b'));
     const base = { subject: 'r-03', kind: 'fact', attribute: '状态', unit: null, value_num: null };
-    expect(seriesRelation({ ...base, object: '赖艳', value_text: '跟进中', eff: '2025-06-16' }, { ...base, object: null, value_text: '已关闭', eff: '2025-07-18' })).toBe('different_time');
+    expect(seriesRelation({ ...base, object: '赖艳', object_name: '赖艳', object_type: 'person', value_text: '跟进中', eff: '2025-06-16' }, { ...base, object: null, value_text: '已关闭', eff: '2025-07-18' })).toBe('different_time');
   });
 
   it('settles pairs of one series without a model: other days are history, one day and one value are one claim', () => {

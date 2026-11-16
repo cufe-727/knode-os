@@ -1,3 +1,4 @@
+import { codeOf } from './identity.js';
 /**
  * Claim state (docs/design/29). A measure-like claim — "风控引擎完成度为11%",
  * "支付组在岗人数为7人", "Orion项目负责人为孙欣", "Atlas completion is 68%" — says
@@ -36,7 +37,7 @@ const ATTRIBUTE_SYNONYMS: readonly string[][] = [
   ['headcount', 'staff', 'team size', 'staff count', 'employees'],
   ['负责人', '负责', '主负责人', '牵头人', '项目负责人', '责任人', '跟进人', '跟进负责人', 'owner'],
   ['lead', 'owner', 'project lead'],
-  ['状态', '现状', '当前状态', '项目状态'],
+  ['状态', '现状', '当前状态', '项目状态', '风险状态', '事故状态', '处理状态', '跟进状态'],
   ['status', 'state'],
   ['阶段', '当前阶段', '所处阶段'],
   ['stage', 'phase'],
@@ -55,18 +56,200 @@ const SYNONYM: ReadonlyMap<string, string> = (() => {
 /** Keys whose value is a text (a person, a stage), read from "<key>为<text>". */
 const TEXT_KEYS = new Set(['负责人', 'lead', '状态', 'status', '阶段', 'stage']);
 
+/** Keys of a state or a stage, whose object, when a person, is who handles it. */
+const STATE_KEYS = new Set(['状态', 'status', '阶段', 'stage']);
+
+/** The object of a claim as series identity reads it. */
+export interface SeriesObject {
+  id: string | null | undefined;
+  name?: string | null;
+  type?: string | null;
+}
+
 /**
- * The object a series of `attribute` is kept apart by. A measure of a subject
- * toward one object is a series per object (a holding in each company); the
- * owner or the state of a subject is one series whatever the claim names
- * besides: "R-03由赖艳负责，处于跟进中" and "R-03已关闭" are one state, and
- * "负责人为廖欣" / "负责人为孙欣" — whose object is the value itself — one
- * owner. Kept apart by object, a risk closed in week 19 stayed open beside it
- * (108 of 120 risks on the 10× benchmark had two or more current states).
+ * The object a series of `attribute` is kept apart by: a series is one
+ * attribute of one thing, so a claim toward an object is a series of that
+ * object ("电池业务由李四负责" and "云业务由张三负责" are two owners of 比亚迪), and a
+ * claim with no object one of its own. Two exceptions, where the object is
+ * not a thing the attribute belongs to:
+ *   - the object is the value itself: 负责人 = 廖欣 with 廖欣 as the object;
+ *   - a person named on a state or stage line ("R-03由赖艳负责，处于跟进中"):
+ *     who handles it, not a part of it.
+ * Read on the attribute's synonym head, so a stored 跟进人 is an owner.
  */
-export function seriesObject(attribute: string | null | undefined, objectId: string | null | undefined): string {
-  if (attribute && TEXT_KEYS.has(attribute)) return '';
-  return objectId ?? '';
+export function seriesObject(attribute: string | null | undefined, object: SeriesObject | string | null | undefined, valueText?: string | null): string {
+  const o: SeriesObject = typeof object === 'string' || object == null ? { id: object ?? null } : object;
+  if (!o.id) return '';
+  const head = attributeHead(attribute);
+  if (head && TEXT_KEYS.has(head)) {
+    const bare = (n: string) => fold(n.replace(/[（(][^）)]*[）)]$/u, ''));
+    if (valueText && o.name && bare(o.name) === bare(valueText)) return '';
+    if (STATE_KEYS.has(head) && o.type === 'person') return '';
+  }
+  return o.id;
+}
+
+/** Kind words written before or after a name: 风险R-54, 事故INC-001, Orion项目. */
+const KIND_WORDS = /^(?:风险|事故|故障|项目|公司|集团|系统|平台|团队|小组|部门|工程|方案|计划|risk|incident|project|company|the)+|(?:风险|事故|故障|项目|公司|集团|系统|平台|团队|小组|部门)+$/giu;
+
+/** Where an owner or a state is said, what stands before it is what the owner or state is of. */
+const OWNER_AT = /(?:改为|转为|仍然|依然|统一|继续|暂时|正式|后续|今后|改|现|交|转|仍|已|将|拟|均|暂){0,2}\s*(?:由|归)\s*[\p{Script=Han}A-Za-z·]{2,12}?\s*(?:负责|牵头|主导|跟进)|(?:的)?(?:负责人|牵头人|责任人|跟进人)\s*(?:(?:变更|更换|调整|改|换|变)为|为|是|：|:)|\b(?:is )?(?:led|owned|run) by\b|\b(?:lead|owner)\s+(?:is|was|:)/iu;
+const STATE_AT = /(?:的)?(?:状态|阶段)\s*(?:为|是|：|:)|\b(?:status|stage|phase)\s+(?:is|was|:)/iu;
+
+/**
+ * What an owner or a state statement is about when the claim carries no
+ * object: the last clause before "由张三负责" / "负责人为" / "状态为", without
+ * the subject's own spellings and function words. "" when that is the subject
+ * itself ("R-03由赖艳负责", "Atlas负责人是廖欣" of Orion, formerly Atlas). The
+ * model often leaves the object out: "云业务由张三负责" and "电池业务由李四负责",
+ * both filed under 比亚迪, are the owners of two businesses, not one owner
+ * changing.
+ */
+export function statementObject(statement: string, attribute: string | null | undefined, spellings: readonly string[], valueText?: string | null): string {
+  const head = attributeHead(attribute);
+  if (!head || !TEXT_KEYS.has(head)) return '';
+  const text = statement.normalize('NFKC');
+  const at = (STATE_KEYS.has(head) ? STATE_AT : OWNER_AT).exec(text);
+  let before: string;
+  if (at) before = (text.slice(0, at.index).split(/[，,;；。:：]/).pop() ?? '').trim();
+  else {
+    // the active voice: "张三负责云业务", what the owner (the value) is said to take on
+    const active = STATE_KEYS.has(head) ? null : activeOwnerObject(text, valueText);
+    if (active === null) return '';
+    before = active;
+  }
+  before = normalizeReading(before);
+  // the subject written in the clause: what follows it is the thing ("比亚迪云业务由…"), what precedes it a lead
+  // phrase ("经评审R-03状态为…"); a gloss in brackets is the subject's ("R-03（支付超时）")
+  const named = lastSpelling(before, spellings);
+  if (named) {
+    const after = before.slice(named.end).replace(BRACKETED, '').trim();
+    const lead = before.slice(0, named.start).trim();
+    before = !after && /\bof$/i.test(lead) ? lead.replace(/\s*\bof$/i, '') : after;
+  }
+  before = before.replace(BRACKETED, '').replace(LEAD_PHRASE, '');
+  before = before.replace(DATE_WORDS, ' ').replace(/\s+/g, '').replace(LEADING_FUNCTION, '').replace(TRAILING_FUNCTION, '').replace(/^(?:的|之|其)+|(?:的|之)+$/u, '');
+  // the kind word a name is written with ("风险R-54", "项目Orion") is not another thing
+  before = before.replace(KIND_WORDS, '');
+  before = normalizeReading(before);
+  if (/^(?:the|its|their)$/i.test(before)) return '';
+  return before.length >= 2 ? fold(before) : '';
+}
+
+/**
+ * What is read, without the particles and adverbs around it that are not the
+ * thing: 了 / 的 before it, an adverb left alone ("原由张三负责的…" leaves "原"),
+ * "now" / "currently" and a trailing "is" ("Cloud is now owned by" → Cloud),
+ * and "张三负责的云业务" → 云业务.
+ */
+function normalizeReading(text: string): string {
+  let t = text.trim();
+  for (let prev = ''; prev !== t; ) {
+    prev = t;
+    t = t
+      .replace(/^(?:了|的)+/u, '')
+      // an adverb alone ("原" of "原由张三负责…"); not the first character of a name (现金业务)
+      .replace(/^(?:现|改|暂|原|仍|已|将|now|currently)$/iu, '')
+      .replace(/^(?:now|currently|still)\s+/i, '')
+      .replace(/\s+(?:is|was|are|were|now|currently|still|being|has been|have been)$/i, '')
+      .replace(/^[\p{Script=Han}A-Za-z·、和与及]{0,12}?(?:负责|主导|牵头|管理|主管|分管|跟进)的/u, '')
+      .trim();
+  }
+  return t;
+}
+
+/** A bracketed gloss: "R-03（支付超时）", "云业务(含海外)". */
+const BRACKETED = /\([^()]*\)|\[[^\[\]]*\]|【[^【】]*】/gu;
+/**
+ * A phrase that opens a sentence and says when or by whose decision, not what:
+ * "自2025年3月起", "从下周开始", "经评审", "经董事会决定后".
+ */
+const LEAD_PHRASE = /^(?:(?:自|从|于)[^起]{0,16}?(?:起|开始)|经(?:过)?[\p{Script=Han}A-Za-z]{0,8}?(?:评审|审议|审批|批准|决定|决议|讨论|研究|协商|确认|同意|评估|复核|会议)(?:后|通过)?)/u;
+
+/** Verbs an owner takes a thing on with, written after the owner: "张三负责云业务", "李四接手电池业务". */
+const OWNER_VERB = /^(?:\s*(?:、|和|与|及)\s*[\p{Script=Han}A-Za-z·]{2,4}?)*\s*(?:现在|目前|如今|将|已|仍|现|也|继续|正式|开始|改为|转为|共同|一起|联合){0,2}\s*(?:负责|主导|牵头|跟进|接手|接管|分管|主管)(?!(?:人|方)(?:[为是:：，,。；;、\s]|$))/u;
+
+/** In the active voice, the clause after the owner's verb with its "…的工作" tail dropped; null when the owner is not written so. */
+function activeOwnerObject(text: string, valueText: string | null | undefined): string | null {
+  const owner = valueText?.normalize('NFKC').trim();
+  if (!owner || owner.length < 2) return null;
+  for (let i = text.indexOf(owner); i >= 0; i = text.indexOf(owner, i + 1)) {
+    const verb = OWNER_VERB.exec(text.slice(i + owner.length));
+    if (!verb) continue;
+    const rest = text.slice(i + owner.length + verb[0].length).split(/[，,;；。:：]/)[0] ?? '';
+    return rest.replace(/(?:的)?(?:相关)?(?:工作|事宜|事务|方面|领域)$/u, '').trim();
+  }
+  return null;
+}
+
+/** The last place in `text` a spelling of the subject is written, longest spelling first. */
+function lastSpelling(text: string, spellings: readonly string[]): { start: number; end: number } | null {
+  const lower = text.toLowerCase();
+  let best: { start: number; end: number } | null = null;
+  for (const sp of [...spellings].map((x) => x.normalize('NFKC').trim().toLowerCase()).filter((x) => x.length >= 2).sort((a, b) => b.length - a.length)) {
+    const i = lower.lastIndexOf(sp);
+    if (i >= 0 && (!best || i + sp.length > best.end)) best = { start: i, end: i + sp.length };
+  }
+  return best;
+}
+
+/** A claim as series identity reads it: the object it carries (seriesObject), else what its statement is about (statementObject). */
+export interface SeriesReading {
+  statement: string;
+  /** seriesObject's answer: an object id, or "". */
+  object: string;
+  /** statementObject's reading, when `object` is "". */
+  about: string;
+}
+
+/**
+ * The object part of each owner or state claim's series among one subject's
+ * claims, settled against the things that subject's claims are known to be
+ * about. Clause reading misses wordings ("原由张三负责的云业务现由李四负责",
+ * "张三不再负责云业务，改由李四接手"), and a claim read as about nothing would be
+ * the subject's own series and leave two current owners. So a claim read as
+ * about nothing goes to the series of the one known thing its statement
+ * names — an object another claim carries (`objects`: key and names) or a
+ * reading of another claim; the longest when one contains another. Two
+ * named, or none: the subject's own ("由李四负责" says nothing of 云业务).
+ * A claim read as about something keeps that reading, said once or many
+ * times, whatever else its statement names ("海外云业务由李四负责" beside
+ * 云业务, "云业务拆分后，储能业务由王五负责"): moving the first mention of a new
+ * thing onto a known one would make the outcome depend on how many reports
+ * have arrived. Only a reading that is a carried object's name joins that
+ * object's series.
+ * Returns "~reading", an object key, or "" for each row.
+ */
+export function settleSeriesObjects(rows: readonly SeriesReading[], objects: readonly { key: string; names: readonly string[] }[] = []): string[] {
+  const read = new Map<string, number>();
+  for (const r of rows) if (!r.object && r.about) read.set(r.about, (read.get(r.about) ?? 0) + 1);
+  const known: { key: string; name: string }[] = [
+    ...objects.flatMap((o) => o.names.map((n) => ({ key: o.key, name: fold(n.replace(/[（(][^）)]*[）)]$/u, '')) }))),
+    ...[...read.keys()].map((r) => ({ key: `~${r}`, name: r })),
+  ].filter((k) => k.name.length >= 2);
+  return rows.map((r) => {
+    if (r.object) return r.object;
+    const carried = [...new Set(known.filter((k) => !k.key.startsWith('~') && k.name === r.about).map((k) => k.key))];
+    if (r.about && carried.length === 1) return carried[0];
+    if (r.about) return `~${r.about}`;
+    const text = fold(r.statement).replace(/\s+/g, '');
+    const hits = known.filter((k) => text.includes(k.name.replace(/\s+/g, '')));
+    const longest = hits.filter((h) => !hits.some((o) => o.name !== h.name && o.name.includes(h.name)));
+    const keys = [...new Set(longest.map((h) => h.key))];
+    return keys.length === 1 ? keys[0] : '';
+  });
+}
+
+/** Whether a key is an owner or a state (its synonym head is 负责人, 状态, 阶段 …): such claims are read for what they are about. */
+export function isTextKey(attribute: string | null | undefined): boolean {
+  const head = attributeHead(attribute);
+  return !!head && TEXT_KEYS.has(head);
+}
+
+/** The head of a key's synonym group (跟进人 → 负责人), or the key. */
+export function attributeHead(attribute: string | null | undefined): string | null {
+  if (!attribute) return null;
+  return SYNONYM.get(fold(attribute)) ?? attribute;
 }
 
 /** Verbs and hedges between an attribute and its value, longest first. */
@@ -294,6 +477,81 @@ export function formatValue(c: { value_num?: number | null; value_text?: string 
 
 /* ------------------------- per-subject key unification ------------------------- */
 
+export interface AttributeUse {
+  attribute: string;
+  /** How many claims of the subject use it. */
+  count: number;
+  /** Units it was read with; keys only unify when they measure in one unit (or both carry text). */
+  units: string[];
+}
+
+/**
+ * The qualifiers that make a key another measure of the same thing: a change
+ * (环比 / 同比 / 变化), the first value (初始 / 最初), a plan or forecast, an
+ * average, a running total, a peak. Keys with different qualifiers never
+ * unify, whatever else they share: a week-on-week change is not the week's
+ * value, and a report's "（对账批次间隔最初定的是15分钟）" is the setting's first
+ * value, not its newest.
+ */
+const QUALIFIERS: readonly [string, RegExp][] = [
+  ['环比', /环比|week[- ]on[- ]week|\bwow\b|month[- ]on[- ]month/i],
+  ['同比', /同比|year[- ]on[- ]year|\byoy\b/i],
+  ['变化', /变化|变动|增幅|降幅|涨幅|增速|增量|差值|增减|\bchange\b|\bdelta\b|\bgrowth\b/i],
+  ['初始', /初始|最初|起初|原始|原定|最早|\binitial\b|\boriginal\b|\bfirst\b/i],
+  ['计划', /计划|预计|预期|预测|目标|指引|\btarget\b|\bguidance\b|\bplanned\b|\bforecast\b|\bexpected\b/i],
+  ['平均', /平均|均值|\baverage\b|\bmean\b/i],
+  ['累计', /累计|累积|\bcumulative\b|\bytd\b/i],
+  ['峰值', /峰值|最高|最大|\bpeak\b|\bmax(?:imum)?\b/i],
+  ['最低', /最低|最小|\bmin(?:imum)?\b/i],
+];
+
+/** Which qualifiers a key carries; a change word goes with the period it is a change over. */
+export function keyQualifiers(key: string): string {
+  const q = QUALIFIERS.filter(([, re]) => re.test(key)).map(([k]) => k);
+  const period = q.includes('环比') || q.includes('同比');
+  return q.filter((k) => !(period && k === '变化')).join('+');
+}
+
+/** Words that name "the value" of a thing that is a value itself (a coded setting): 配置值, 取值, 数值. */
+const VALUE_WORDS = /^(?:值|取值|数值|配置值|设定值|设置值|参数值|value)$/i;
+
+/**
+ * Whether a key names the subject's own value: the subject's name (without
+ * the "（平台组 · T1-C2）" a split adds), a tail of it of two characters or more
+ * ("批次间隔", "间隔" of 对账批次间隔: the head of a Chinese name is its end),
+ * or its code; and, for a subject that carries a code (a coded setting), a
+ * generic value word (配置值, 取值). Aliases do not count — a group's aliases
+ * collect what extractions listed (美联储: 联邦基金利率) — and neither does a
+ * key that only shares a name's last word (零售价格 is not 猪肉价格's value).
+ */
+export function namesSubject(key: string, spellings: readonly string[]): boolean {
+  // a qualified key ("初始间隔") names the subject's first value: compared without its qualifier, grouped with its own kind
+  const k = fold(key).replace(new RegExp(QUALIFIERS.map(([, re]) => re.source).join('|'), 'gi'), '').replace(/的/g, '').trim();
+  if (k.length < 2) return false;
+  const names = spellings.map((s) => fold(s).replace(/的/g, '')).filter((s) => s.length >= 2);
+  if (names.some((s) => s === k || (s.endsWith(k) && !codeOf(s)))) return true;
+  return VALUE_WORDS.test(k) && spellings.some((s) => codeOf(s) !== null);
+}
+
+/** The spellings a key may name an entity by: its name, the name without a split's "（…）", the codes among its name parts and aliases, and — for an entity named by a code — its aliases. */
+export function subjectSpellingsOf(name: string, aliases: readonly string[] = []): string[] {
+  const out = new Set<string>([name]);
+  const m = /^(.+?)[（(]([^）)]*)[）)]$/.exec(name.trim());
+  if (m) {
+    out.add(m[1].trim());
+    for (const part of m[2].split(/[·・,，]/)) if (codeOf(part.trim())) out.add(part.trim());
+  }
+  // an entity named by its code ("T1-C3") has its names among its aliases; any other entity's aliases are what extractions listed
+  const coded = codeOf(name.trim()) !== null;
+  for (const a of aliases) if (coded || codeOf(a.trim())) out.add(a.trim());
+  return [...out].filter((s) => s.trim().length >= 2);
+}
+
+/** A key with "的", spaces, a neutral last word (数, 数量, 值) and the change word after 环比/同比 left out: 周活跃用户数 / 周活跃用户, 环比 / 环比增幅 read alike. */
+function neutralKey(key: string): string {
+  return fold(key).replace(/[的\s]/g, '').replace(/(环比|同比)(?:变化|变动|增幅|增速|涨幅|增长|增减)/gu, '$1').replace(/(?:数量|数|水平)$/u, '');
+}
+
 function bigrams(s: string): Set<string> {
   const out = new Set<string>();
   const t = s.replace(/\s+/g, '');
@@ -310,120 +568,67 @@ function dice(a: string, b: string): number {
   return (2 * shared) / Math.max(1, x.size + y.size);
 }
 
-export interface AttributeUse {
-  attribute: string;
-  /** How many claims of the subject use it. */
-  count: number;
-  /** Units it was read with; keys only unify when they measure in one unit (or both carry text). */
-  units: string[];
-}
-
 /**
- * The qualifiers that make a key another measure of the same thing: a change
- * (环比 / 同比 / 变化), the first value (初始 / 最初), a plan or forecast, an
- * average, a running total, a peak. "支付成功率环比变化" contains
- * "支付成功率" and "初始间隔" contains "间隔", but neither is that measure:
- * unified with it, a week-on-week change of +0.04% stood beside the week's
- * 98.64% as a second current value of one day, and a report's "（对账批次间隔
- * 最初定的是15分钟）" became the setting's newest value.
- */
-const QUALIFIERS: readonly [string, RegExp][] = [
-  ['环比', /环比|week[- ]on[- ]week|\bwow\b|month[- ]on[- ]month/i],
-  ['同比', /同比|year[- ]on[- ]year|\byoy\b/i],
-  ['变化', /变化|变动|增幅|降幅|涨幅|增速|增量|差值|增减|\bchange\b|\bdelta\b|\bgrowth\b/i],
-  ['初始', /初始|最初|起初|原始|原定|最早|\binitial\b|\boriginal\b|\bfirst\b/i],
-  // not 目标 / target: an extraction labels a setting put back ("决定改回原来的80分") 目标阈值
-  ['计划', /计划|预计|预期|预测|\bplanned\b|\bforecast\b|\bexpected\b/i],
-  ['平均', /平均|均值|\baverage\b|\bmean\b/i],
-  ['累计', /累计|累积|\bcumulative\b|\bytd\b/i],
-  ['峰值', /峰值|最高|最大|\bpeak\b|\bmax(?:imum)?\b/i],
-  ['最低', /最低|最小|\bmin(?:imum)?\b/i],
-];
-
-/** Which qualifiers a key carries; a change word goes with the period it is a change over. */
-export function keyQualifiers(key: string): string {
-  const q = QUALIFIERS.filter(([, re]) => re.test(key)).map(([k]) => k);
-  const period = q.includes('环比') || q.includes('同比');
-  return q.filter((k) => !(period && k === '变化')).join('+');
-}
-
-/**
- * Keys that name the value of the subject itself: "配置值", "取值", "数值",
- * or a spelling of the subject (its name without the "（平台组 · T1-C2）" a
- * split adds, an alias, a code) or a part of one ("批次间隔", "间隔" of
- * 对账批次间隔). A setting reported as "对账批次间隔定为15分钟", "批次间隔从本周
- * 起调整为30分钟" and "T2-C2调整为20分钟" was three series (批次间隔 / 间隔 /
- * 配置值), each with a current value of its own.
- */
-const VALUE_WORDS = /^(?:值|取值|数值|配置值|设定值|设置值|参数值|当前值|配置|设定|设置|参数|配置数值|value|setting|current value)$/i;
-
-/** The head words of a name that is a measure, not a thing that has measures: 上限, 时长, 天数, 金额, 分数线 … */
-const MEASURE_HEAD = /(?:上限|下限|阈值|时长|天数|间隔|金额|额度|配额|比例|比率|分数线|分数|数量|次数|人数|周期|期限|费率|利率|价格|单价)$/u;
-
-export function namesSubject(key: string, spellings: readonly string[]): boolean {
-  const bare = key.replace(new RegExp(QUALIFIERS.map(([, re]) => re.source).join('|'), 'gi'), '').trim();
-  if (!bare) return false;
-  if (VALUE_WORDS.test(bare)) return true;
-  return spellings.some((sp) => {
-    const s = fold(sp);
-    if (s.length < 2 || bare.length < 2) return false;
-    // the head of a name is its end: 间隔 names 对账批次间隔, 增长 does not name 增长组; a key
-    // with the head of a name that is a measure itself (…上限, …时长) is that measure's value
-    if (s === bare || s.endsWith(bare)) return true;
-    if (/^\p{Script=Han}+$/u.test(s) && /^\p{Script=Han}+$/u.test(bare) && s.length >= 4 && bare.length >= 3 && MEASURE_HEAD.test(s) && s.slice(-2) === bare.slice(-2)) return true;
-    const rest = bare.split(s).join('').trim();
-    return bare.includes(s) && (!rest || VALUE_WORDS.test(rest));
-  });
-}
-
-/** The spellings of an entity a key may name it by: its name, the name without a split's "（…）", the codes and aliases. */
-export function subjectSpellingsOf(name: string, aliases: readonly string[] = []): string[] {
-  const out = new Set<string>([name, ...aliases]);
-  const m = /^(.+?)[（(]([^）)]*)[）)]$/.exec(name.trim());
-  if (m) {
-    out.add(m[1].trim());
-    for (const part of m[2].split(/[·・,，]/)) if (/\d/.test(part) && /[A-Za-z]/.test(part)) out.add(part.trim());
-  }
-  return [...out].filter((s) => s.trim().length >= 2);
-}
-
-/**
- * A subject's near-synonym keys, unified: two keys of one unit join when one
- * contains the other (在岗 / 在岗人数) or their bigrams mostly agree (Dice ≥
- * 0.67: 支付成功率 / 支付的成功率), and only when they carry the same
- * qualifiers (keyQualifiers: 支付成功率环比 is not 支付成功率). Keys that name
- * the subject itself (namesSubject, given the subject's `spellings`) are one
- * key per qualifier. The most used key of a group names it.
+ * A subject's keys that are one attribute, unified. Keys of one unit and the
+ * same qualifiers (keyQualifiers: a change, a first value, a plan, an
+ * average, a total, a peak) are one when
+ *   - one contains the other or their bigrams mostly agree (Dice ≥ 0.67):
+ *     the rule claim state was built with (归母净利润 / 净利润, 销售毛利率 /
+ *     毛利率, 市盈率TTM / 市盈率), kept as it was;
+ *   - a synonym group holds both (事故级别 / 事故等级, 跟进人 / 负责人);
+ *   - they differ by 的, spaces or a neutral last word (周活跃用户 / 周活跃用户数);
+ *   - both name the subject itself (namesSubject).
+ * What the qualifiers keep apart is what that rule used to join across them:
+ * a week-on-week change and the week's value, a setting's first value and its
+ * current one, 环比涨幅 and 同比涨幅. Keys are taken most used first (ties:
+ * code-point order) and each joins the first group it is one with, as before.
+ * A group's canonical key is its most used key, as before, so that an
+ * upgrade rewrites as few stored mappings as it can: ties go to a name the
+ * group is already stored under (`stored`, the canonical keys in
+ * claim_attribute_keys), then to code-point order. One exception: a group
+ * with a key of a synonym group goes by that group's head (负责人, 状态,
+ * 级别), a key alone included: owner and state series are read on the head
+ * (审批状态 joined with 状态 is a state), and stored keys of an older reading
+ * (跟进人) move with the mapping, without re-reading their claims.
  * Returns key → canonical key, with the reason, for keys that change.
  */
-export function unifyAttributeKeys(uses: AttributeUse[], spellings: readonly string[] = []): Map<string, { canonical: string; reason: string }> {
-  const sorted = [...uses].sort((a, b) => b.count - a.count || a.attribute.localeCompare(b.attribute));
+export function unifyAttributeKeys(uses: AttributeUse[], spellings: readonly string[] = [], stored: ReadonlySet<string> = new Set()): Map<string, { canonical: string; reason: string }> {
+  const sorted = [...uses].sort((a, b) => b.count - a.count || (a.attribute < b.attribute ? -1 : a.attribute > b.attribute ? 1 : 0));
   const unitOf = (u: AttributeUse) => [...new Set(u.units.map((x) => x || '∅'))].sort().join('|');
-  const groups: { head: AttributeUse; unit: string; qualifiers: string; self: boolean; members: AttributeUse[] }[] = [];
-  const out = new Map<string, { canonical: string; reason: string }>();
+  type Key = { use: AttributeUse; unit: string; qualifiers: string; synonym: string | null; neutral: string; self: boolean; why: string };
+  const groups: Key[][] = [];
+  const related = (m: Key, k: Key): string | null => {
+    if (m.synonym && m.synonym === k.synonym) return '同义';
+    if (m.neutral === k.neutral) return '仅措辞不同';
+    if (m.self && k.self) return '都指主体自身的取值';
+    const [s, l] = m.use.attribute.length <= k.use.attribute.length ? [m.use.attribute, k.use.attribute] : [k.use.attribute, m.use.attribute];
+    if ((s.length >= 2 && l.includes(s)) || dice(m.use.attribute, k.use.attribute) >= 0.67) return '同单位且名称相近';
+    return null;
+  };
   for (const use of sorted) {
-    const unit = unitOf(use);
-    const qualifiers = keyQualifiers(use.attribute);
-    const self = namesSubject(use.attribute, spellings);
-    const synonym = SYNONYM.get(fold(use.attribute));
-    const group = groups.find((g) => {
-      if (g.unit !== unit || g.qualifiers !== qualifiers) return false;
-      if (self && g.self) return true;
-      // keys a synonym group holds (事故级别 / 事故等级) are one key, however they were read when written
-      if (synonym && g.members.some((m) => SYNONYM.get(fold(m.attribute)) === synonym)) return true;
-      return g.members.some((m) => {
-        const [s, l] = m.attribute.length <= use.attribute.length ? [m.attribute, use.attribute] : [use.attribute, m.attribute];
-        return (s.length >= 2 && l.includes(s)) || dice(m.attribute, use.attribute) >= 0.67;
-      });
-    });
-    if (!group) {
-      groups.push({ head: use, unit, qualifiers, self, members: [use] });
-      continue;
+    const k: Key = { use, unit: unitOf(use), qualifiers: keyQualifiers(use.attribute), synonym: SYNONYM.get(fold(use.attribute)) ?? null, neutral: neutralKey(use.attribute), self: namesSubject(use.attribute, spellings), why: '同义' };
+    let joined = false;
+    for (const g of groups) {
+      if (g[0].unit !== k.unit || g[0].qualifiers !== k.qualifiers) continue;
+      const why = g.map((m) => related(m, k)).find(Boolean);
+      if (!why) continue;
+      k.why = why;
+      g.push(k);
+      joined = true;
+      break;
     }
-    group.members.push(use);
-    group.self ||= self;
-    const why = self && group.self ? '都指主体自身的取值' : '同单位且名称相近';
-    out.set(use.attribute, { canonical: group.head.attribute, reason: `与"${group.head.attribute}"${why}（${use.count} 条断言）` });
+    if (!joined) groups.push([k]);
+  }
+  const out = new Map<string, { canonical: string; reason: string }>();
+  for (const keys of groups) {
+    const head = keys.find((k) => k.synonym)?.synonym;
+    // keys are in count order: the most used, a tie going to the name already stored, then code point
+    const top = keys.filter((k) => k.use.count === keys[0].use.count);
+    const canonical = head ?? (top.find((k) => stored.has(k.use.attribute)) ?? top[0]).use.attribute;
+    for (const k of keys) {
+      if (k.use.attribute === canonical) continue;
+      out.set(k.use.attribute, { canonical, reason: `与"${canonical}"${k.why}（${k.use.count} 条断言）` });
+    }
   }
   return out;
 }

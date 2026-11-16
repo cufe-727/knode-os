@@ -3,7 +3,7 @@ import path from 'node:path';
 import { CONFIG_FILE, loadConfig, ReviewResolution } from '../config.js';
 import { Queryable } from '../store/migrations.js';
 import { EntityCorrections, refusedKeys, refuses } from './corrections.js';
-import { codeOf, codesDiffer, codesKey, codesOf, MentionContext, namesakeFor, namesakeName, NamesakeRule } from './identity.js';
+import { codeOf, codesKey, codesOf, MentionContext, namesakeFor, namesakeName, NamesakeRule } from './identity.js';
 import { entityKeys, mentionKeys, nameKey, typesCompatible } from './normalize.js';
 import { slugify } from './store.js';
 
@@ -108,40 +108,49 @@ export function nameCode(name: string): ReturnType<typeof codeOf> {
   return codeOf(t) ?? codeOf(t.replace(/^\p{Script=Han}{1,4}/u, '').replace(/\p{Script=Han}{1,4}$/u, ''));
 }
 
-/**
- * Two names that are each an identifier of one kind with different values
- * (INC-017-D7T3, INC-020-D3T3) are two things, whatever spellings they share.
- * A mention matched by an alias would otherwise land on the other: an
- * extraction lists the incident's title as an alias ("活动页白屏"), every
- * team's incident of that title carries it, and the first such incident took
- * the later ones' claims (11 of 210 incidents on the 10× benchmark, among them
- * fixes credited to another division's engineer). Only the two names count,
- * not alias lists, so the order documents arrive in decides nothing: each
- * identifier gets its own entity. For the same reason a spelling without an
- * identifier that several such entities carry as an alias resolves to none
- * of them (byKeys).
- */
-export function namesApartByCode(a: string, b: string): boolean {
-  const x = nameCode(a);
-  const y = nameCode(b);
-  return Boolean(x && y && codesDiffer(x, y));
+/** An identifier of a numbered series: letters, a separator, a counter, and what follows ("INC-020-D3T3", "R-71"). */
+export interface SeriesCode {
+  prefix: string;
+  counter: string;
+  rest: string;
 }
 
 /**
- * Whether live entities are named by other identifiers of the kind `name` is
- * one of (INC-001-T1 … beside INC-006-T1): a numbered series. Only a kind
- * whose identifiers start with letters is looked for (a ticker such as
- * 600519.SH is not), by the letters before its first digit.
+ * The numbered series a name is one of, or null. Only an identifier made of
+ * letters, a separator and a counter is one — INC-001-T1, R-07, GPT-4 — not a
+ * model or contract code that runs letters into digits (H100, X100, CU2501,
+ * FY24, 24Q3): those are not counted, and a brand or exchange in front
+ * (vivoX100, SHFE.CU2501) is not another series.
  */
-async function numberedSeries(q: Queryable, name: string): Promise<boolean> {
-  const code = nameCode(name);
-  const prefix = code ? /^[A-Z][A-Z._/-]*/.exec(code.value)?.[0] : undefined;
-  if (!code || !prefix) return false;
-  const rows = await q.query<{ name: string }>(
-    `SELECT name FROM entities WHERE tx_to IS NULL AND canonical_id IS NULL AND upper(name) LIKE $1 LIMIT 50`,
-    [`%${prefix.replace(/[%_\\]/g, (c) => `\\${c}`)}%`],
-  );
-  return rows.some((r) => namesApartByCode(name, r.name));
+export function seriesCode(name: string): SeriesCode | null {
+  const c = nameCode(name);
+  if (!c) return null;
+  const m = /^([A-Z]+)[-_](\d+)(.*)$/.exec(c.value);
+  return m ? { prefix: m[1], counter: m[2], rest: m[3] } : null;
+}
+
+/**
+ * Two names that are each an identifier of one numbered series with
+ * different values (INC-017-D7T3, INC-020-D3T3; R-01, R-02) are two things,
+ * whatever spellings they share. An extraction lists an incident's title as
+ * its alias ("活动页白屏"), every team's incident of that title carries it, and
+ * the first such incident took the later ones' claims (11 of 210 incidents on
+ * the 10× benchmark). Only the two names count, so the order documents arrive
+ * in decides nothing. Codes outside a numbered series are never kept apart by
+ * this: vivoX100 and X100, ChatGPT-4 and GPT-4, FY24 and FY2024 may be one.
+ */
+export function namesApartByCode(a: string, b: string): boolean {
+  const x = seriesCode(a);
+  const y = seriesCode(b);
+  // INC-006 and INC-006-T1: one written without its tail is not another member (it may be that one)
+  return Boolean(x && y && x.prefix === y.prefix && (x.counter !== y.counter || (x.rest !== '' && y.rest !== '' && x.rest !== y.rest)));
+}
+
+/** Whether an entity carries one of these identifier keys among its spellings. */
+async function answersToCode(q: Queryable, id: string, codeKeys: string[]): Promise<boolean> {
+  if (codeKeys.length === 0) return false;
+  const rows = await q.query(`SELECT 1 FROM entity_alias_keys WHERE entity_id = $1 AND alias_key = ANY($2::text[]) LIMIT 1`, [id, codeKeys]);
+  return rows.length > 0;
 }
 
 async function byKeys(q: Queryable, keys: Set<string>, type: string | undefined, mode: ReviewResolution, refusing?: (id: string) => boolean, mention?: string): Promise<CandidateRow | null> {
@@ -162,13 +171,13 @@ async function byKeys(q: Queryable, keys: Set<string>, type: string | undefined,
     const own = nameKey(r.name);
     return keys.has(own.key) || (mode === 'suffix' && keys.has(own.bare));
   };
-  // a spelling several identifiers carry as an alias names none of them: "登录失败事故" is the title of
-  // every team's incident of that kind, and landing on the most mentioned one credited a fix to it
-  const coded = mention && !nameCode(mention) ? rows.filter((r) => !names(r) && typesCompatible(type, r.type) && nameCode(r.name)) : [];
-  const shared = coded.some((a, i) => coded.slice(i + 1).some((b) => namesApartByCode(a.name, b.name)));
+  // the mention's spellings that are identifiers: what a series-named entity may be reached by
+  const codeKeys = mention ? [...keys].filter((k) => nameCode(k)) : [];
   for (const r of [...rows.filter(names), ...rows.filter((r) => !names(r))]) {
     if (!typesCompatible(type, r.type)) continue;
-    if (shared && coded.includes(r)) continue;
+    // an entity named by a series identifier is reached by that identifier only: "登录失败事故", the title
+    // every team's incident of that kind carries as an alias, is not INC-001-T1 because it was mentioned first
+    if (mention && seriesCode(r.name) && !names(r) && !(await answersToCode(q, r.id, codeKeys))) continue;
     if (mention && namesApartByCode(mention, r.name)) continue;
     const canonical = await canonicalOf(q, r);
     if (mention && canonical.id !== r.id && namesApartByCode(mention, canonical.name)) continue;
@@ -267,10 +276,9 @@ export async function resolveEntityId(
   if (own) return finish(await settle(await canonicalOf(q, own)));
 
   // 3. name / alias key match against live entities of a compatible type (exact spellings, or suffix-stripped too in 'suffix' mode)
-  // a name that is one of a numbered series ("INC-006-T1" beside other INC-… entities) is that thing by its
-  // number alone: its other spellings (the incident's title) are what every incident of the kind is called
-  const code = nameCode(name);
-  if (code && (input.aliases ?? []).length > 0 && (await numberedSeries(q, name))) {
+  // a series identifier ("INC-006-T1") is that thing by its identifier alone: its other spellings (the
+  // incident's title) are what every incident of the kind is called. It lands on whatever carries exactly it.
+  if (seriesCode(name)) {
     const byNumber = await byKeys(q, mentionKeys(name, [], mode), input.type, mode, refusing, name);
     return finish(byNumber ? await settle(byNumber) : { id: slug });
   }

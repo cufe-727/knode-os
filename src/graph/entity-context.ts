@@ -9,7 +9,8 @@ import { mergeSuggestionId } from './dedupe.js';
 import { applyMerge } from './merge.js';
 import { tier0Known, weakLinkKey } from './concepts.js';
 import { ANCHOR_TYPES as ANCHOR_TYPE_LIST, Code, codeOf, Codes, codesDiffer, codesOf, namesakeName, NamesakeRule } from './identity.js';
-import { keyOf, nameKey } from './normalize.js';
+import { keyOf, nameKey, typesCompatible } from './normalize.js';
+import { namesApartByCode } from './resolve.js';
 import { ExtractedEntity, slugify } from './store.js';
 
 /**
@@ -1011,48 +1012,88 @@ async function splitCoded(store: Store, config: KnodeConfig | undefined, stats: 
   await applyPartings(store, config, partings, stats, progress, relink);
 }
 
+/** Code-named entities one refine looks at for a carrier (mergeCodesIntoCarriers), and its cursor. */
+export const CODE_MERGE_STEP = 5_000;
+const CODE_MERGE_META = 'code_merge_pass';
+
 /**
- * An entity whose name is nothing but a code ("T2-C2") into the entity a
- * coded split labelled with that very code ("对账批次间隔（第一事业部支付组 ·
- * T2-C2）"). A report that names a setting by its code alone ("T2-C2调整为20
- * 分钟") resolves to an entity of that name when it is applied before the
- * report that introduces the code, and the split, which re-applies the
- * documents of the name it parts, never sees it: the setting's change stood
- * on an entity of its own (12 of 90 settings on the 10× benchmark). The label
- * is the split's own identifier for the thing, so the two are one; the merge
- * is reversible (`entities unmerge`) and a merge a person undid is not made
- * again.
+ * An entity whose name is nothing but a code ("T2-C2") into the one entity
+ * that answers to that code: the entity a coded split labelled with it
+ * ("对账批次间隔（第一事业部支付组 · T2-C2）"), else the one live entity that
+ * carries the code among its spellings (the setting 对账批次间隔 with alias
+ * T2-C2, with review.identity "name"). A report that names the thing by its
+ * code alone resolves to that entity when it is applied after the report that
+ * gives the code as an alias, and to an entity of its own when applied before:
+ * refine, which sees both, makes the two orders end alike. Two carriers, a
+ * carrier named by another code, or a type that does not fit: nothing. The
+ * merge is reversible (`entities unmerge`); a merge a person undid is not
+ * made again. A run reads at most CODE_MERGE_STEP code-named entities, from a
+ * cursor in meta 'code_merge_pass' (finance: a pass in a handful of refines).
  */
-async function mergeCodesIntoParts(store: Store, stats: EntityContextStats, progress: (msg: string) => void): Promise<void> {
+async function mergeCodesIntoCarriers(store: Store, stats: EntityContextStats, progress: (msg: string) => void, step = CODE_MERGE_STEP): Promise<void> {
   const rules = await store.query<{ id: string; label: string }>(
-    `SELECT n.id, n.label FROM entity_namesakes n JOIN entities e ON e.id = n.id AND e.tx_to IS NULL AND e.canonical_id IS NULL`,
+    `SELECT n.id, n.label FROM entity_namesakes n JOIN entities e ON e.id = n.id AND e.tx_to IS NULL AND e.canonical_id IS NULL ORDER BY n.id COLLATE "C"`,
   );
-  const byCode = new Map<string, string[]>();
+  const byLabel = new Map<string, string[]>();
   for (const r of rules) {
     const c = codeOf(r.label);
-    if (c) (byCode.get(c.value) ?? byCode.set(c.value, []).get(c.value)!).push(r.id);
+    if (c) (byLabel.get(c.value) ?? byLabel.set(c.value, []).get(c.value)!).push(r.id);
   }
-  if (byCode.size === 0) return;
+  // a bounded slice a run, from the cursor on: a pass over every code-named entity takes as many refines as it has steps
+  const after = (await store.getMeta<{ after?: string }>(CODE_MERGE_META))?.after;
   const named = await store.query<{ id: string; name: string; type: string }>(
-    `SELECT id, name, type FROM entities WHERE tx_to IS NULL AND canonical_id IS NULL AND type = ANY($1::text[]) AND name ~ '[0-9]'
-       AND NOT EXISTS (SELECT 1 FROM entity_namesakes n WHERE n.id = entities.id)`,
-    [[...CODED_TYPES, 'concept']],
+    `SELECT id, name, type FROM entities WHERE tx_to IS NULL AND canonical_id IS NULL AND name ~ '[0-9]'
+       AND NOT EXISTS (SELECT 1 FROM entity_namesakes n WHERE n.id = entities.id)${after ? ' AND id COLLATE "C" > $2 COLLATE "C"' : ''}
+     ORDER BY id COLLATE "C" LIMIT $1`,
+    after ? [step, after] : [step],
   );
+  await store.setMeta(CODE_MERGE_META, named.length < step ? {} : { after: named.at(-1)!.id });
+  // the cursor has moved past the slice: an entity that throws is reported and left for the next pass, the rest go on
   for (const e of named) {
-    const c = codeOf(e.name);
-    const into = c ? byCode.get(c.value) : undefined;
-    if (!into || into.length !== 1 || into[0] === e.id) continue;
-    if (await refusedByPerson(store, e.id, into[0])) continue;
-    const reason = `编号即拆分标签：${e.name} 是拆分出的实体 ${into[0]} 的编号`;
     try {
-      const res = await applyMerge(store, { entityId: e.id, canonicalId: into[0], reason, actor: 'entity-context' });
-      if (res.outcome === 'merged') {
-        stats.merged++;
-        progress(`entities: merged ${e.name} into ${into[0]} — ${reason}`);
-      }
+      await mergeCodeIntoCarrier(store, stats, progress, e, byLabel);
     } catch (err) {
-      progress(`entities: code merge ${e.name} → ${into[0]} failed: ${err instanceof Error ? err.message : err}`);
+      progress(`entities: code merge of ${e.name} skipped until the next pass: ${err instanceof Error ? err.message : err}`);
     }
+  }
+}
+
+async function mergeCodeIntoCarrier(
+  store: Store,
+  stats: EntityContextStats,
+  progress: (msg: string) => void,
+  e: { id: string; name: string; type: string },
+  byLabel: Map<string, string[]>,
+): Promise<void> {
+  const c = codeOf(e.name);
+  if (!c) return;
+  let into: string | undefined;
+  const labelled = byLabel.get(c.value);
+  if (labelled) {
+    if (labelled.length !== 1) return;
+    into = labelled[0];
+  } else {
+    const carriers = await store.query<{ id: string; name: string; type: string; aliases: string[] | null }>(
+      `SELECT DISTINCT x.id, x.name, x.type, x.aliases FROM entity_alias_keys k JOIN entities x ON x.id = k.entity_id
+       WHERE k.alias_key = $1 AND k.kind = 'exact' AND x.id <> $2 AND x.tx_to IS NULL AND x.canonical_id IS NULL ORDER BY x.id`,
+      [nameKey(e.name).key, e.id],
+    );
+    // not a carrier named by a code, nor one that carries another identifier of the same series (a title every incident has)
+    const fit = carriers.filter((x) => typesCompatible(e.type, x.type) && !codeOf(x.name) && !(x.aliases ?? []).some((a) => namesApartByCode(a, e.name)));
+    if (carriers.length !== 1 || fit.length !== 1) return;
+    into = fit[0].id;
+  }
+  if (!into || into === e.id) return;
+  if (await refusedByPerson(store, e.id, into)) return;
+  const reason = labelled ? `编号即拆分标签：${e.name} 是拆分出的实体 ${into} 的编号` : `编号即别名：${e.name} 只有 ${into} 以它为别名`;
+  try {
+    const res = await applyMerge(store, { entityId: e.id, canonicalId: into, reason, actor: 'entity-context' });
+    if (res.outcome === 'merged') {
+      stats.merged++;
+      progress(`entities: merged ${e.name} into ${into} — ${reason}`);
+    }
+  } catch (err) {
+    progress(`entities: code merge ${e.name} → ${into} failed: ${err instanceof Error ? err.message : err}`);
   }
 }
 
@@ -1092,17 +1133,16 @@ export function namesakeChoice(rules: NamesakeRule[], documentEntities: Extracte
  * spellings of one organization the audit has just proposed to merge are one
  * roof here.
  */
-export async function splitEntities(store: Store, opts: { config?: KnodeConfig; onProgress?: (msg: string) => void } = {}): Promise<Pick<EntityContextStats, 'split' | 'replayed'>> {
+export async function splitEntities(store: Store, opts: { config?: KnodeConfig; onProgress?: (msg: string) => void; codeMergeStep?: number } = {}): Promise<Pick<EntityContextStats, 'split' | 'replayed'>> {
   const progress = opts.onProgress ?? (() => {});
   const stats: EntityContextStats = { merged: 0, suggested: 0, split: 0, replayed: 0 };
   const relink: string[] = [];
   const same = await pendingSame(store);
   await splitNamesakes(store, opts.config, stats, progress, relink, same);
   // parting an entity by its codes is something a workspace turns on (review.identity "context")
-  if (opts.config?.review?.identity === 'context') {
-    await splitCoded(store, opts.config, stats, progress, relink, same);
-    await mergeCodesIntoParts(store, stats, progress);
-  }
+  if (opts.config?.review?.identity === 'context') await splitCoded(store, opts.config, stats, progress, relink, same);
+  // in either mode: a code-named entity and the one entity that answers to its code end as one, whatever came first
+  await mergeCodesIntoCarriers(store, stats, progress, opts.codeMergeStep);
   if (relink.length > 0) {
     const { relinkTier0 } = await import('./concepts.js');
     await relinkTier0(store, { only: [...new Set(relink)] });

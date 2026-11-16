@@ -74,14 +74,19 @@ claims:
 INC-020-D3T3（P1）活动页白屏，吴婷修复。
 `,
     });
-    const rows = await ctx.store.query<{ subject_id: string; statement: string }>(`SELECT subject_id, statement FROM claims WHERE tx_to IS NULL ORDER BY statement`);
+    const rows = (await ctx.store.query<{ subject_id: string; statement: string }>(`SELECT subject_id, statement FROM claims WHERE tx_to IS NULL`))
+      .sort((a, b) => (a.statement < b.statement ? -1 : 1));
     expect(rows).toEqual([
       { subject_id: 'inc-017-d7t3', statement: 'INC-017-D7T3已由周磊修复' },
       { subject_id: 'inc-020-d3t3', statement: 'INC-020-D3T3已由吴婷修复' },
     ]);
-    // the title alone still finds an incident of that title
-    const both = await ctx.store.query<{ id: string }>(`SELECT id FROM entities WHERE tx_to IS NULL AND id LIKE 'inc-%' ORDER BY id`);
-    expect(both.map((r) => r.id)).toEqual(['inc-017-d7t3', 'inc-020-d3t3']);
+    const both = await ctx.store.query<{ id: string }>(`SELECT id FROM entities WHERE tx_to IS NULL AND id LIKE 'inc-%'`);
+    expect(both.map((r) => r.id).sort()).toEqual(['inc-017-d7t3', 'inc-020-d3t3']);
+    // the title alone names neither incident: it is the title's own entity, not whichever incident came first
+    const { resolveEntityId } = await import('../src/graph/resolve.js');
+    expect((await resolveEntityId(ctx.store, { name: '活动页白屏', type: 'event' })).id).toBe('活动页白屏');
+    // the incident's own identifier still finds it
+    expect((await resolveEntityId(ctx.store, { name: 'INC-020-D3T3', type: 'event' })).id).toBe('inc-020-d3t3');
   });
 });
 
@@ -91,9 +96,10 @@ describe('back-references to the previous report', () => {
     expect(backReferenceIn('上周那起缓存击穿已由方杰修复，根因是参数填反了')).toBe('缓存击穿');
     expect(backReferenceIn('方杰已修复上周发生的配置下发失败。')).toBe('配置下发失败');
     expect(backReferenceIn('上周发生的登录失败事故已由贾洋修复。')).toBe('登录失败');
-    expect(backReferenceIn('上周发生的缓存击穿问题根因是一处空指针。')).toBe('缓存击穿');
-    expect(backReferenceIn('上周发生了一起推送重复事故。')).toBe('推送重复');
-    expect(backReferenceIn('十部增长组上周的登录失败事故根因是机器资源不足。')).toBe('登录失败');
+    // only a statement of a fix refers back: a cause or a report of the incident does not
+    expect(backReferenceIn('上周发生的缓存击穿问题根因是一处空指针。')).toBeNull();
+    expect(backReferenceIn('上周发生了一起推送重复事故。')).toBeNull();
+    expect(backReferenceIn('十部增长组上周的登录失败事故已由贺敏修复，根因是机器资源不足。')).toBe('登录失败');
     expect(backReferenceIn("Last week's cache stampede was fixed by Fang Jie")).toBe('cache stampede');
     expect(backReferenceIn('上周那起INC-001-T1已由方杰修复')).toBeNull();
     expect(backReferenceIn('方杰本周完成接口评审')).toBeNull();
@@ -135,16 +141,21 @@ claims:
 `),
     });
     const { linkBackReferences } = await import('../src/graph/backrefs.js');
-    const stats = await linkBackReferences(ctx.store);
+    // off unless the workspace says which folders are periodic reports
+    expect(await linkBackReferences(ctx.store, { config: ctx.config })).toMatchObject({ references: 0, linked: 0 });
+    const config = { review: { ...ctx.config.review, backReferences: { periodic: ['raw/docs/周报'] } } };
+    const stats = await linkBackReferences(ctx.store, { config });
     expect(stats).toMatchObject({ references: 3, resolved: 2, linked: 2, disposed: 0 });
     const links = await ctx.store.query<{ source_id: string; target_id: string }>(
-      `SELECT source_id, target_id FROM relations WHERE tx_to IS NULL AND target_id LIKE 'inc-%' ORDER BY source_id`,
+      `SELECT source_id, target_id FROM relations WHERE tx_to IS NULL AND target_id LIKE 'inc-%'`,
     );
-    expect(links).toEqual([{ source_id: '廖欣', target_id: 'inc-002-t1' }, { source_id: '方杰', target_id: 'inc-001-t1' }]);
-    // a second run keeps them; once the reading no longer holds, the link goes
-    expect(await linkBackReferences(ctx.store)).toMatchObject({ resolved: 2, disposed: 0 });
+    expect(links.map((l) => `${l.source_id}→${l.target_id}`).sort()).toEqual(['廖欣→inc-002-t1', '方杰→inc-001-t1'].sort());
+    // a second run reads only what changed since the first: nothing
+    expect(await linkBackReferences(ctx.store, { config })).toMatchObject({ references: 0, resolved: 0, disposed: 0 });
+    // read again in full it keeps them; once the reading no longer holds, the link goes
+    expect(await linkBackReferences(ctx.store, { config, full: true })).toMatchObject({ resolved: 2, disposed: 0 });
     await ctx.store.query(`UPDATE documents SET doc_date = doc_date - interval '30 days' WHERE path = 'raw/docs/周报/平台组/w05.md'`);
-    expect(await linkBackReferences(ctx.store)).toMatchObject({ resolved: 0, disposed: 2 });
+    expect(await linkBackReferences(ctx.store, { config, full: true })).toMatchObject({ resolved: 0, disposed: 2 });
     expect(await ctx.store.query(`SELECT 1 FROM relations WHERE tx_to IS NULL AND target_id LIKE 'inc-%'`)).toEqual([]);
   });
 });
@@ -168,37 +179,6 @@ describe('a title several incidents carry', () => {
     });
     const [row] = await ctx.store.query<{ subject_id: string }>(`SELECT subject_id FROM claims WHERE tx_to IS NULL AND statement LIKE 'INC-005%'`);
     expect(row.subject_id).toBe('inc-005-t3');
-  });
-});
-
-describe('a setting named by its code alone', () => {
-  it('joins the entity a coded split labelled with that code', async () => {
-    const { splitEntities } = await import('../src/graph/entity-context.js');
-    const { slugify } = await import('../src/graph/store.js');
-    const parted = '日志保留天数（七部平台组 · D7T1-C2）';
-    const ctx = await workspace('coded', {
-      // the code alone, applied before the report that introduces it
-      'raw/docs/a0.md': `---\ntitle: 七部平台组周报\nentities:\n  - { name: D7T1-C2, type: other }\nclaims:\n  - { subject: D7T1-C2, statement: D7T1-C2调整为45天, type: other }\n---\nD7T1-C2调整为45天\n`,
-      'raw/docs/c1.md': `---\ntitle: 七部平台组周报\nentities:\n  - { name: ${parted}, type: other, aliases: ["保留期"] }\nclaims:\n  - { subject: ${parted}, statement: 日志保留天数定为30天, type: other }\n---\n日志保留天数（D7T1-C2）定为30天\n`,
-    });
-    // what a coded split leaves on record: the parted entity and its rule
-    const id = slugify(parted);
-    expect((await ctx.store.query(`SELECT id FROM entities WHERE id = $1 AND tx_to IS NULL`, [id])).length).toBe(1);
-    await ctx.store.query(
-      `INSERT INTO entity_namesakes (id, base_id, name, label, anchors, base_anchors, documents, reason)
-       VALUES ($1, '日志保留天数', '日志保留天数', 'D7T1-C2', '["七部平台组"]'::jsonb, '[]'::jsonb, '["raw/docs/c1.md"]'::jsonb, 'test')`, [id],
-    );
-    // the merge is the coded split's companion: a workspace that turned the split on
-    ctx.config.review.identity = 'context';
-    await splitEntities(ctx.store, { config: ctx.config });
-    const [code] = await ctx.store.query<{ canonical_id: string | null }>(`SELECT canonical_id FROM entities WHERE id = 'd7t1-c2'`);
-    expect(code.canonical_id).toBe(id);
-    // undone by a person, it is not made again
-    const { unmergeEntity } = await import('../src/graph/merge.js');
-    await unmergeEntity(ctx.store, 'd7t1-c2');
-    await splitEntities(ctx.store, { config: ctx.config });
-    const [after] = await ctx.store.query<{ canonical_id: string | null }>(`SELECT canonical_id FROM entities WHERE id = 'd7t1-c2'`);
-    expect(after.canonical_id).toBeNull();
   });
 });
 

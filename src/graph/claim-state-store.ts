@@ -1,7 +1,7 @@
 import { breather } from '../pool.js';
 import { Store } from '../store/db.js';
 import { EvidenceAtRow, foldClaimEvidence, groupBy, toDateString, toIso } from '../store/temporal.js';
-import { CLAIM_STATE_VERSION, sameValue, seriesObject, subjectSpellingsOf, unifyAttributeKeys } from './claim-state.js';
+import { CLAIM_STATE_VERSION, isTextKey, sameValue, seriesObject, settleSeriesObjects, statementObject, subjectSpellingsOf, unifyAttributeKeys } from './claim-state.js';
 import { packSubjectBatches } from './subject-batches.js';
 
 /**
@@ -106,22 +106,24 @@ export async function refreshAttributeKeys(store: Store, opts: { subjects?: stri
   );
   const spellings = new Map<string, string[]>();
   for (const [root, list] of groupBy(names, (r) => r.root)) spellings.set(root, list.flatMap((r) => subjectSpellingsOf(r.name, r.aliases ?? [])));
+  const current = await store.query<{ subject_id: string; attribute: string; canonical: string }>(
+    `SELECT subject_id, attribute, canonical FROM claim_attribute_keys${opts.subjects ? ' WHERE subject_id = ANY($1::text[])' : ''}`,
+    only,
+  );
+  // the names groups are stored under, so that a tie keeps its name
+  const storedBySubject = groupBy(current, (r) => r.subject_id);
   const desired = new Map<string, { subject: string; attribute: string; canonical: string; reason: string }>();
   for (const [root, list] of groupBy(uses, (u) => u.root)) {
     const keys = [...groupBy(list, (u) => u.attribute).entries()].map(([attribute, rows]) => ({
       attribute, count: rows.reduce((n, r) => n + r.n, 0), units: [...new Set(rows.flatMap((r) => r.units))],
     }));
-    if (keys.length < 2) continue;
-    const map = unifyAttributeKeys(keys, spellings.get(root) ?? []);
+    const stored = new Set([...new Set(list.map((u) => u.subject_id))].flatMap((id) => (storedBySubject.get(id) ?? []).map((r) => r.canonical)));
+    const map = unifyAttributeKeys(keys, spellings.get(root) ?? [], stored);
     for (const u of list) {
       const m = map.get(u.attribute);
       if (m) desired.set(`${u.subject_id}\u0000${u.attribute}`, { subject: u.subject_id, attribute: u.attribute, ...m });
     }
   }
-  const current = await store.query<{ subject_id: string; attribute: string; canonical: string }>(
-    `SELECT subject_id, attribute, canonical FROM claim_attribute_keys${opts.subjects ? ' WHERE subject_id = ANY($1::text[])' : ''}`,
-    only,
-  );
   const have = new Map(current.map((r) => [`${r.subject_id}\u0000${r.attribute}`, r.canonical]));
   const stale = current.filter((r) => !desired.has(`${r.subject_id}\u0000${r.attribute}`));
   if (stale.length > 0) {
@@ -147,6 +149,11 @@ export interface StateRow {
   subject: string;
   attribute: string;
   object_id: string | null;
+  /** The object's name and type, which say whether it is the value or who handles a state (seriesObject). */
+  object_name?: string | null;
+  object_type?: string | null;
+  /** The statement, read for what an owner or state claim with no object is about (statementObject). */
+  statement?: string;
   kind: string;
   value_num: number | null;
   value_text: string | null;
@@ -198,10 +205,34 @@ export function seriesSupersession(series: StateRow[]): Map<string, string | nul
   return out;
 }
 
+/** The object part of a claim's series: its object (seriesObject), else what its owner or state statement is about. */
+export function seriesKeyObject(r: Pick<StateRow, 'attribute' | 'object_id' | 'object_name' | 'object_type' | 'value_text' | 'statement'>, spellings: readonly string[]): string {
+  return seriesKeyObjects([r], spellings)[0];
+}
+
+/**
+ * The object part of the series of each of one subject's claims: its object,
+ * else what its owner or state statement is about, settled against the
+ * things the subject's other claims are about (settleSeriesObjects).
+ */
+export function seriesKeyObjects(rows: readonly Pick<StateRow, 'attribute' | 'object_id' | 'object_name' | 'object_type' | 'value_text' | 'statement'>[], spellings: readonly string[]): string[] {
+  const read = rows.map((r) => {
+    const object = seriesObject(r.attribute, { id: r.object_id, name: r.object_name, type: r.object_type }, r.value_text);
+    return { statement: r.statement ?? '', object, about: object ? '' : statementObject(r.statement ?? '', r.attribute, spellings, r.value_text), text: isTextKey(r.attribute) };
+  });
+  const objects = rows.flatMap((r, i) => (read[i].object && r.object_name ? [{ key: read[i].object, names: [r.object_name] }] : []));
+  // only owner and state claims are read for what they are about
+  const owner = read.map((r, i) => i).filter((i) => read[i].text);
+  const settled = settleSeriesObjects(owner.map((i) => read[i]), objects);
+  const out = read.map((r) => r.object);
+  owner.forEach((i, k) => (out[i] = settled[k]));
+  return out;
+}
+
 /**
  * Supersession by attribute, in every domain: the series of a subject's
- * attribute (its canonical key, per object unless it is an owner or a state —
- * seriesObject —, facts and forecasts apart) runs
+ * attribute (its canonical key, per object — seriesObject says when an
+ * object is the value or who handles a state —, facts and forecasts apart) runs
  * by effective date, and only the newest is current (seriesSupersession).
  * Disputed, absent, opinion and rumour claims take no part. Returns the
  * claims whose mark changed.
@@ -229,7 +260,7 @@ export async function supersedeByAttribute(store: Store, opts: { claimsPerBatch?
     await pause();
     const rows = await store.query<StateRow>(
       `SELECT c.id, COALESCE(se.canonical_id, c.subject_id) AS subject, COALESCE(ak.canonical, c.attribute) AS attribute,
-              COALESCE(oe.canonical_id, c.object_id) AS object_id, c.kind, c.value_num, c.value_text, c.unit,
+              COALESCE(oe.canonical_id, c.object_id) AS object_id, oe.name AS object_name, oe.type AS object_type, c.statement, c.kind, c.value_num, c.value_text, c.unit,
               COALESCE(c.effective_at, c.event_at, c.valid_from, c.observed_at) AS eff, c.valid_to, c.correction, c.superseded_by, c.tx_from
        FROM claims c
        JOIN entities se ON se.id = c.subject_id
@@ -240,7 +271,19 @@ export async function supersedeByAttribute(store: Store, opts: { claimsPerBatch?
     );
     const ids: string[] = [];
     const marks: (string | null)[] = [];
-    for (const series of groupBy(rows, (r) => `${r.subject}\u0000${r.attribute}\u0000${seriesObject(r.attribute, r.object_id)}\u0000${r.kind}`).values()) {
+    // the spellings of each subject group: what an owner or state statement with no object is about is read against them
+    const names = await store.query<{ root: string; name: string; aliases: string[] | null }>(
+      `SELECT COALESCE(canonical_id, id) AS root, name, aliases FROM entities WHERE COALESCE(canonical_id, id) = ANY($1::text[])`,
+      [[...new Set(rows.map((r) => r.subject))]],
+    );
+    const spellings = new Map<string, string[]>();
+    for (const n of names) (spellings.get(n.root) ?? spellings.set(n.root, []).get(n.root)!).push(n.name, ...(n.aliases ?? []));
+    const keyOf = new Map<string, string>();
+    for (const [subject, list] of groupBy(rows, (r) => r.subject)) {
+      const keys = seriesKeyObjects(list, spellings.get(subject) ?? []);
+      list.forEach((r, i) => keyOf.set(r.id, keys[i]));
+    }
+    for (const series of groupBy(rows, (r) => `${r.subject}\u0000${r.attribute}\u0000${keyOf.get(r.id)}\u0000${r.kind}`).values()) {
       await pause();
       const want = seriesSupersession(series);
       for (const r of series) {
@@ -280,6 +323,104 @@ export async function seriesSubjects(store: Store, claims: string[]): Promise<st
     [claims],
   );
   return rows.map((r) => r.id);
+}
+
+/** Keyed claims one refine re-reads keys and supersession for (refreshClaimStateStep). */
+export const CLAIM_STATE_STEP_CLAIMS = 200_000;
+const STEP_META = 'claim_state_pass';
+const SKIPPED_META = 'claim_state_skipped';
+/** Runs in a row a slice whose every subject throws is retried before it is let go (refreshClaimStateStep). */
+export const CLAIM_STATE_SLICE_TRIES = 3;
+/** How many skipped subjects meta 'claim_state_skipped' keeps, the latest. */
+export const CLAIM_STATE_SKIPPED_KEPT = 200;
+
+/**
+ * One bounded slice of what refine keeps current about claim state: the
+ * attribute keys (refreshAttributeKeys) and supersession by attribute
+ * (supersedeByAttribute) of the next subjects — whole merged groups, in
+ * code-point order of their canonical id after the cursor in meta
+ * 'claim_state_pass' — up to `budget` keyed claims. A pass over every subject
+ * takes as many refines as the workspace has budgets of keyed claims (finance:
+ * about six), then starts again. What an ingest pass touched is kept current
+ * at once, apart from this (supersedeForClaims). Returns what the slice did
+ * and whether it ended a pass.
+ *
+ * A slice that throws is not retried forever. It is tried again subject by
+ * subject at once: the subjects that still throw are left out, recorded in
+ * meta 'claim_state_skipped' (root, error, when; the latest
+ * CLAIM_STATE_SKIPPED_KEPT), and the cursor moves on; the next pass tries them
+ * again, and one that goes through then leaves the record. When every subject throws, the trouble is not the slice's (the store,
+ * say): the cursor stays and the error is raised, up to
+ * CLAIM_STATE_SLICE_TRIES runs in a row; then the slice is let go and
+ * recorded the same way. `apply` stands in for the slice's work in tests.
+ */
+export async function refreshClaimStateStep(
+  store: Store,
+  opts: { budget?: number; apply?: (subjects: string[]) => Promise<{ keys: number; superseded: number }> } = {},
+): Promise<{ subjects: number; claims: number; keys: number; superseded: number; skipped: number; passDone: boolean }> {
+  const budget = Math.max(1, opts.budget ?? CLAIM_STATE_STEP_CLAIMS);
+  const pass = (await store.getMeta<{ after?: string; failures?: number }>(STEP_META)) ?? {};
+  const after = pass.after;
+  const roots = await store.query<{ root: string; n: number }>(
+    `SELECT COALESCE(se.canonical_id, c.subject_id) AS root, count(*)::int AS n
+     FROM claims c JOIN entities se ON se.id = c.subject_id
+     WHERE c.tx_to IS NULL AND c.attribute IS NOT NULL${after ? ' AND COALESCE(se.canonical_id, c.subject_id) COLLATE "C" > $1 COLLATE "C"' : ''}
+     GROUP BY 1 ORDER BY COALESCE(se.canonical_id, c.subject_id) COLLATE "C"`,
+    after ? [after] : [],
+  );
+  const take: string[] = [];
+  let claims = 0;
+  for (const r of roots) {
+    if (take.length > 0 && claims + r.n > budget) break;
+    take.push(r.root);
+    claims += r.n;
+  }
+  const passDone = take.length === roots.length;
+  const apply = opts.apply ?? (async (subjects: string[]) => {
+    const k = await refreshAttributeKeys(store, { subjects });
+    return { keys: k.mapped + k.dropped, superseded: await supersedeByAttribute(store, { subjects }) };
+  });
+  const subjectsOf = async (group: string[]) => {
+    const members = await store.query<{ id: string }>(`SELECT id FROM entities WHERE id = ANY($1::text[]) OR canonical_id = ANY($1::text[])`, [group]);
+    return [...new Set([...group, ...members.map((m) => m.id)])];
+  };
+  let keys = 0;
+  let superseded = 0;
+  const failed: { root: string; error: string }[] = [];
+  if (take.length > 0) {
+    try {
+      const r = await apply(await subjectsOf(take));
+      keys += r.keys;
+      superseded += r.superseded;
+    } catch (err) {
+      // which of the slice's subjects is it: each alone
+      let lastError = err;
+      for (const root of take) {
+        try {
+          const r = await apply(await subjectsOf([root]));
+          keys += r.keys;
+          superseded += r.superseded;
+        } catch (e) {
+          lastError = e;
+          failed.push({ root, error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+      const failures = (pass.failures ?? 0) + 1;
+      if (failed.length === take.length && failures < CLAIM_STATE_SLICE_TRIES) {
+        await store.setMeta(STEP_META, { ...(after ? { after } : {}), failures });
+        throw lastError;
+      }
+    }
+  }
+  // the record holds what is skipped now: a subject that went through this time leaves it
+  const before = take.length > 0 ? (await store.getMeta<{ root: string; error: string; at: string }[]>(SKIPPED_META)) ?? [] : [];
+  if (failed.length > 0 || before.some((b) => take.includes(b.root))) {
+    const at = new Date().toISOString();
+    const kept = [...before.filter((b) => !take.includes(b.root)), ...failed.map((f) => ({ ...f, at }))];
+    await store.setMeta(SKIPPED_META, kept.slice(-CLAIM_STATE_SKIPPED_KEPT));
+  }
+  await store.setMeta(STEP_META, passDone ? {} : { after: take.at(-1) });
+  return { subjects: take.length, claims, keys, superseded, skipped: failed.length, passDone };
 }
 
 /** Refine's claim-state step: read what is unread, unify keys, then mark supersession. */
