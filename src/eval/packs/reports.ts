@@ -4,6 +4,7 @@ import type { GoldAlias, GoldItem, ListSpec, Task } from '../types.js';
 import { CORPUS_TASK_MIN_DOCS, STRUCTURED_MIN_DOCS } from '../types.js';
 import { registerRecipe, RecipeContext } from './index.js';
 import { cnNum, crossLingualOf, Draft, enOrdinal, exactSetSpec, lexicallyDisjoint, lexicalOverlap, paraphraseOf, quarterForms } from './separation.js';
+import { buildReportsV3 } from './reports-v3-build.js';
 import { PackWriter } from './writer.js';
 
 /**
@@ -1547,7 +1548,8 @@ export function registerReportRecipes(): void {
       network: false,
       needsAuthor: false,
       padding: 'local',
-      build: (dir, ctx) => buildReports(lang, dir, ctx),
+      // recipe v3 (docs/design/33 §4) on `{"version": 3}`; without it the v2 pack, byte for byte
+      build: (dir, ctx) => (Number(ctx.options.version) === 3 ? buildReportsV3(lang, dir, ctx) : buildReports(lang, dir, ctx)),
     });
   }
 }

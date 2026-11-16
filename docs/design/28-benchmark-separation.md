@@ -6,6 +6,9 @@
 > and `src/eval/metrics/entities.ts`; report in `src/eval/report.ts`. Tests: `tests/eval-separation.test.ts`.
 > Extends [design 23](23-knowledge-benchmarks.md) (the suite, packs, scoring and report), which this document does not
 > restate.
+>
+> Superseded for new runs by recipe v3 of the weekly reports ([design 33 §10](33-evaluation-ladder.md)), built with
+> `--options '{"version":3}'`; without that option the recipe still builds the v2 pack described here, byte for byte.
 
 ## 0. Why
 

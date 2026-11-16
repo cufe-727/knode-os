@@ -1,6 +1,6 @@
 # 33 — The evaluation as a ladder: what search adds, what the wiki adds, what knode's tools add
 
-Status: design (2026-11-14); stage 1 built 2026-11-15 (§10). Stages 2–5 are not.
+Status: design (2026-11-14); stage 1 (§10) and stage 2 (recipe v3, the families of §3, pack lint: §11) built 2026-11-15. Stages 3–5 are not.
 
 ## 0. Why
 
@@ -161,3 +161,117 @@ Cost at API prices, from the 10× run: an agent answer is $0.08–0.18, so four 
 - *knode tools and correctness*, per pack and every agent that called knode's tools (D, and `agent-knode` when it runs): calls per tool, and mean correctness of the scored answers that called it against those that did not. Descriptive: the groups differ in their questions too.
 
 Not shown without a model-backed run: whether agents use `search` or knode's tools much when grep is beside them, whether Codex's `item.completed` events carry outputs in exactly the fields read here (the reader tolerates missing ones, which leave `outputs` absent), and every number the ladder will report.
+
+## 11. Stage 2 as built: recipe v3 and the pack lint (2026-11-15)
+
+Code: `src/eval/packs/reports-v3.ts` (the script), `reports-v3-render.ts` (documents), `reports-v3-tasks.ts`
+(families), `reports-v3-build.ts` (layout and pack), `src/eval/lint.ts`, `src/eval/grepability.ts`. Tests:
+`tests/eval-reports-v3.test.ts`, `tests/eval-pack-lint.test.ts`.
+
+**Building.** `knode-os eval pack build synthetic-reports-zh --options '{"version":3,"size":10}'` (also `en`;
+`layout: "by-team"` for the old layout, `taskDivisions` for more divisions' own questions). Without `version` the
+recipe builds the v2 pack of design 28 byte for byte; a test pins main's digests of v2's tasks, gold and corpus.
+Packs: `synthetic-reports-{zh,en}-v3[-x10|-x100]`.
+
+**The corpus.**
+
+- 130 weeks, 2024-W01 … 2026-W26 (ISO weeks): weeks 1–122 the corpus (a team's 122 reports), 123–126 four update
+  batches, 127–130 the holdout. A report counts in the month, quarter and year of its Monday, and every question whose
+  gold depends on that says so.
+- Files by week: `周报/2025-W34/<hash>.md`, `季度复盘/2025-Q2/`, `事故复盘/2025-04/`, `会议纪要/2025-04/`, `月报/2025-04/`
+  (English: `weekly/`, `quarterly/`, `postmortems/`, `minutes/`, `monthly/`).
+- Teams are named after their division's city ("杭州平台组", "Oslo Platform"). The design's "七部平台组" would put
+  "一部平台组" inside "十一部平台组"; city names leave no team's name inside another's at 100 divisions.
+- Long documents, 5,000–12,500 characters: a quarterly review per team and quarter (OKR score, budget execution,
+  each project's sponsor and each hire's mentor are stated only here; counts, launches and moves repeated in other
+  words; the week-by-week table as the PMO checked it), a postmortem per P1 (duration, impact, how it was found and
+  the owner of the follow-up only here), the division's monthly minutes (budgets approved, a customer's new name, some
+  nicknames, actions owned by nickname).
+- Precedence: every PMO summary opens by saying its figures are checked and prevail over the weekly reports, and it
+  corrects four weekly figures a team and one setting a team. A correction (a team's or the PMO's) says the earlier
+  value was wrong: the state as of a date between the two is the corrected one. State questions say so, and name the
+  PMO's precedence only where the PMO decides the gold (a clause naming it everywhere was a one-class word, below).
+- Renames (two projects a team, one customer a division) and nicknames (three people a team) are stated once, then the
+  new name or the nickname is used alone in the documents that follow; a mentor or a follow-up owner is often given by
+  nickname only.
+- Divisions are drawn in order from one stream and customers belong to their division, so the first division — its
+  documents and its questions — is the same at 1×, 10× and 100× (tested). From 3×, someone of each team of divisions 2
+  and 3 (4 and 5 …) moves to the other division late and takes over a project there; division 1 is never linked.
+
+**The questions.** By default only the first division's own questions (D5), plus, from 10×, company-wide aggregates
+(`co-`) and, from 3×, hops that cross divisions (`x-`). Families are `meta.family`; the minimums are in the manifest
+(`lint.families`, `lint.strata`) so the lint checks them.
+
+| Family | Type | What is asked |
+| --- | --- | --- |
+| aggregate | structured | per quarter and year over the three teams: incidents, P1s, escalations, the team with most, teams with P1s, P1 minutes (postmortems), headcount at quarter end; hires, departures, moves, top fixer, repeat escalators, yearly means |
+| current-state | stale | a setting as of dates between its changes and at the end, by its first name (later changes use its code or short alias); a weekly figure the PMO corrected |
+| alias | alias | old project and customer names, nicknames, short aliases, the lead by role and date |
+| hop | deep-hop | 3–7 documents (§ below) |
+| timeline | timeline | a project's milestones, a risk's life, a setting's values with corrections, what changed between two weeks of a team |
+| lookalike | lookalike, unanswerable | namesakes in two teams, near-identical customers; questions no document answers (a person's OKR, a third namesake, a P1 that did not happen, another kind of team's setting, a P2's duration, a budget never approved, a customer that does not exist) |
+| update | update | after each batch: latest figure, headcount, a setting changed (and corrected) in the stream, progress, open risks, the newest incident |
+| controls | single-hop, paraphrase, cross-lingual | 24 each |
+
+Hops, as decided here where the design left room:
+
+- A step is a document. A chain's steps are the documents that state each link (`fix:`, `takeover:`, `sponsor:`,
+  `mentor:` … lines), and no document may state two steps, so none can be skipped. Where a document names a bridge by
+  another name (a nickname, a project's or customer's other name), the document that maps the names is a step of its
+  own. `meta.hops` is the number of documents, `meta.stratum` `h3`…`h7`, `meta.chain` the links, `meta.bridges` the
+  entities passed through, `meta.anchor` how the first one is named.
+- No word of the question is on any step's line, beyond the anchor's own name. Anchors are either named (a nickname,
+  a project's first name) or described in words no document uses: an incident by its team's job, its year and its rank
+  among the top-severity ones, in a division described by where it sits ("西湖边办公的那几个组里，管收款的那个组在2025年
+  出的第1起最严重一档的故障"), a customer by its business. Those questions name no team — the one family that does not
+  name its team as the documents do, since naming it would be a shared word.
+- Entities are labelled (甲乙丙…, A B C…) so a seven-link question stays unambiguous.
+
+**The pack lint** (`knode-os eval pack lint <dirs...>`; `eval run` runs it on its packs first and stops unless
+`--no-lint`): one-class words, ambiguous subjects (against the alias gold), file-name answers (a path segment, or the
+file count of a folder the question names), family and stratum minimums, duplicate questions with different gold, hop
+shortcuts (the answer on one line beside a question word held by at most 0.5% of documents). Chinese "words" are
+two-character sequences without a function character (的, 一, 个, 起 …): "起事" of "几起事故" is no word anyone
+searches for. On the v2 10× pack the 2026-11-14 run used, the lint finds 1,679 questions with the PMO-only "事业部"
+prefix and 74 that say "平台组" where ten teams have that name — the two artifacts §0 names.
+
+**Grep-ability** (`knode-os eval pack grepability <dirs...>`, no model): per family, the share of questions whose gold
+documents all hold a literal term of the question (a word, a name of the alias gold, or an id held by at most 5% of
+documents), the share whose first-step document does, and the same two for the ten documents a BM25 search on the
+question ranks first. Any question that names its team reaches that team's reports by the team's name, so the
+literal-term shares change little where the rules require naming the team; the BM25 columns and the hop rows are where
+v3 differs.
+
+**The packs built (2026-11-15, seed 0), all lint-clean:**
+
+| Pack | Documents | Characters | Questions | Hops h3 / h4 / h5 / h6 / h7 |
+| --- | --- | --- | --- | --- |
+| `synthetic-reports-zh-v3` | 473 (366 weekly, 28 PMO, 28 minutes, 27 quarterly, 24 postmortems) | 0.88M | 564 | 10 / 14 / 24 / 24 / 24 |
+| `synthetic-reports-en-v3` | 473 | 1.15M | 567 | 10 / 14 / 24 / 24 / 24 |
+| `synthetic-reports-zh-v3-x10` | 4,730 | 8.7M | 607 | 10 / 17 / 30 / 30 / 30 (21 cross-division) |
+| `synthetic-reports-zh-v3-x100` | 47,300 | 88.4M | 607 | as 10× |
+
+Per family at 1× (zh): aggregate 71, current-state 66, alias 69, hop 96, timeline 70, lookalike 60 (47 of them
+unanswerable), update 60, each control 24; 10× and 100× add 22 company-wide aggregates.
+
+**Grep-ability at 10× (zh)**, the share of questions whose gold documents all / whose first-step document hold a
+rare literal term, then whose gold documents all / first-step document BM25 ranks in its top 10. "v2" is the current
+v2 recipe built afresh (the pack the 2026-11-14 run used still has the PMO-only prefix, which sends BM25 to the
+monthly summaries: 0% almost everywhere).
+
+| Family | v2 10× | v3 10× |
+| --- | --- | --- |
+| aggregate | 61% · 62% · 1% · 7% | 76% · 76% · 0% · 6% |
+| current-state | 90% · 92% · 0% · 84% | 100% · 100% · 0% · 32% |
+| alias | — | 49% · 100% · 28% · 52% |
+| hop | 2% · 35% · 0% · 8% | 0% · 21% · 0% · 3% |
+| timeline | 97% · 97% · 3% · 12% | 91% · 100% · 1% · 40% |
+| lookalike (answerable ones) | 54% · 72% · 38% · 48% | 77% · 77% · 31% · 38% |
+
+v3 is harder to look up where it was built to be — the hops and the current state behind corrections — and is not
+harder on aggregates (neither pack's gold is reachable by one search) or timelines (v3 names its project, and the
+project's start is one search away).
+
+**Not done.** No model has answered a v3 question; the gold is checked by tests against the script, the hop chains by
+hand on samples. English 3× and 10× packs have few cross-division hops (the English script's people are busy until
+late, so few can move). The life recipe has neither the long documents nor the extra years (§9).
