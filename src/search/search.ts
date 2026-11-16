@@ -564,11 +564,12 @@ export function nearestFor(k: number): number {
 }
 
 /**
- * The most rows a narrowed search may read for its vector channel, whatever
- * the index's size and however many candidates it asks for. On the finance
- * copy that is 120,000 to 190,000 blocks touched at the worst (twelve a row
- * read, fourteen a row walked, more where the read is planned as a scan),
- * and half a second to a second when it is all walked. Narrowed searches are
+ * The most rows a narrowed search may walk the index for, and the most a side
+ * of it may hold and be read, whatever the index's size and however many
+ * candidates it asks for. On the finance copy 10,000 rows are 120,000 to
+ * 190,000 blocks touched (twelve a row read, fourteen a row walked, more
+ * where the read is planned as a scan), and half a second to a second when
+ * they are walked. Narrowed searches are
  * routine — a research agent
  * names a folder or a kind in most of its searches, the web interface in
  * every search of a picked folder — and the √ below grows with `k`: at the
@@ -577,9 +578,8 @@ export function nearestFor(k: number): number {
 export const SCOPED_ROWS_MAX = 10000;
 
 /**
- * The rows a search its caller narrowed (to kinds, to places, to a trust tier
- * or an actor, to a date) may read for its vector channel, both sides and
- * reading and walking together (`vectorSearch` shares them out): a side of
+ * The rows a side may cost in a search its caller narrowed (to kinds, to
+ * places, to a trust tier or an actor, to a date): a side of
  * this many chunks at most is ranked by reading its
  * vectors, and the index is walked on for a larger one for this many rows.
  *
@@ -791,25 +791,19 @@ async function vectorSearch(
    * search of `wiki`, of `wiki/entities`); or its chunks among the nearest of all the search may
    * return, without walking on for them (pages beside sources).
    *
-   * A narrowed search has one budget of rows for all of it. The sides that fit are read, the smaller
-   * first, and each takes its size from the budget; a side that does not fit what is left is walked
-   * for, and the walks share what is left. So a search reads `budget` rows at the most, however its
-   * sides lie: reading one side to the limit and then walking as far again for the other, with a
-   * second walk on top, came to several times that. A search of everything keeps its own measure,
-   * `SIDE_ROWS_MAX` to a side.
+   * Each side is judged on its own. One that holds `readMax` chunks at the most is read, exactly; a
+   * larger one is walked for, `budget` rows of the index at the most, half each where both sides are
+   * walked. For a day the two shared one budget, the smaller side read first and the other given what
+   * was left: a folder of 2,000 chunks read beside 2,000 pages left the pages a walk of 555 rows, which
+   * found none and said nothing, and a side that would have been read on its own was walked for a few
+   * hundred rows because the other had been read. What one side costs no longer decides how the other
+   * is ranked; a narrowed search reads at the most two sides of `readMax`, or one and a walk.
    */
   const size = (generated: boolean) => ((generated ? wantsPages : wantsSources) ? (generated ? held.generated : held.sources) : 0);
-  let left = narrowed ? budget : Infinity;
-  const reads = new Set<boolean>();
-  for (const generated of [false, true].sort((x, y) => size(x) - size(y))) {
-    if (size(generated) === 0 || size(generated) > Math.min(readMax, left)) continue;
-    reads.add(generated);
-    left -= size(generated);
-  }
-  const sources: 'none' | 'read' | 'walk' = size(false) === 0 ? 'none' : reads.has(false) ? 'read' : 'walk';
-  const pages: 'none' | 'read' | 'near' | 'walk' = size(true) === 0 ? 'none' : reads.has(true) ? 'read' : sources === 'none' ? 'walk' : 'near';
+  const sources: 'none' | 'read' | 'walk' = size(false) === 0 ? 'none' : size(false) <= readMax ? 'read' : 'walk';
+  const pages: 'none' | 'read' | 'near' | 'walk' = size(true) === 0 ? 'none' : size(true) <= readMax ? 'read' : sources === 'none' ? 'walk' : 'near';
   const walks = Number(sources === 'walk') + Number(pages === 'walk' || pages === 'near');
-  const walkMax = narrowed ? Math.max(1, Math.floor(left / Math.max(1, walks))) : SIDE_ROWS_MAX;
+  const walkMax = narrowed ? Math.floor(budget / Math.max(1, walks)) : SIDE_ROWS_MAX;
   if (sources === 'none' && pages === 'none') return [];
   const iterative = (sources === 'walk' || pages === 'walk' || pages === 'near') && (await scansIteratively(store));
   // The settings a walk of the index is made under, for this statement alone: the scan that walks on, as
@@ -832,7 +826,7 @@ async function vectorSearch(
     walk: (generated: boolean, when?: string) => string;
     read: (generated: boolean) => string;
     lim: () => string;
-  }) => string[]): Promise<(RankedChunk & { walked: boolean })[]> => {
+  }) => string[]): Promise<(RankedChunk & { walked: boolean; near_rows?: number | string | null })[]> => {
     const p = new Params([toVectorLiteral(qv)]);
     // only vectors of the query's own space: while a new model's vectors are still coming in
     // (a re-embed, or the deferred backlog) the table holds two (docs/design/12 §3.3)
@@ -886,9 +880,11 @@ async function vectorSearch(
        ) hit
        JOIN embeddings v ON v.chunk_id = hit.chunk_id AND v.model = ${model}`;
     const hitColumns = `hit.chunk_id, hit.document_id, hit.path, hit.title, hit.doc_date, hit.content, 1 - (v.embedding <=> $1::${VECTOR_TYPE}) AS raw`;
+    // in a narrowed search every row says how many rows the walk for both sides came to, when it is one of them
+    const notNear = narrowed ? ', NULL::bigint AS near_rows' : '';
     // the index, walked on until the side has its `k` (or `walkMax` rows have been read)
     const walk = (generated: boolean, when = '') => (narrowed
-      ? `(SELECT ${hitColumns}, ${generated} AS generated, true AS walked
+      ? `(SELECT ${hitColumns}, ${generated} AS generated, true AS walked${notNear}
        FROM ${hits(lim(), `${cond} AND ${onSide(generated)}`, when)})`
       : `(SELECT ${columns}, 1 - (e.embedding <=> $1::${VECTOR_TYPE}) AS raw, ${generated} AS generated, true AS walked
        ${from}
@@ -897,7 +893,7 @@ async function vectorSearch(
        LIMIT ${lim()})`);
     // a side's own vectors, read from its documents. The inner query has no order (and OFFSET 0 keeps it
     // a step of its own), so the planner has no use for the vector index there
-    const read = (generated: boolean) => `(SELECT ${columns}, 1 - nearest.far AS raw, ${generated} AS generated, false AS walked
+    const read = (generated: boolean) => `(SELECT ${columns}, 1 - nearest.far AS raw, ${generated} AS generated, false AS walked${notNear}
        FROM (
          SELECT held.chunk_id, held.far FROM (
            SELECT c.id AS chunk_id, e.embedding <=> $1::${VECTOR_TYPE} AS far
@@ -929,7 +925,7 @@ async function vectorSearch(
       const picked = `chunk_id, document_id, path, title, doc_date, content, raw, generated, walked`;
       ctes.push(narrowed
         ? `near AS MATERIALIZED (
-       SELECT found.*${wide ? ', row_number() OVER (ORDER BY found.raw DESC) AS place' : ''}
+       SELECT found.*, count(*) OVER () AS near_rows${wide ? ', row_number() OVER (ORDER BY found.raw DESC) AS place' : ''}
        FROM (
          SELECT ${hitColumns}, hit.generated, false AS walked
          FROM ${hits(width, cond)}
@@ -949,8 +945,10 @@ async function vectorSearch(
        JOIN chunks c ON c.id = nearest.chunk_id
        JOIN documents d ON d.id = c.document_id
        WHERE ${cond})`);
-      const kept = [pagesOnly ? 'generated' : '', wide ? `(NOT generated OR place <= ${NEAREST_OF_ALL})` : ''].filter(Boolean);
-      return `(SELECT ${picked} FROM near${kept.length ? ` WHERE ${kept.join(' AND ')}` : ''})`;
+      // (a narrowed search takes every row of it, with how many there are: beside sources that are read,
+      // the sources among them are dropped once the count is known)
+      const kept = [pagesOnly && !narrowed ? 'generated' : '', wide ? `(NOT generated OR place <= ${NEAREST_OF_ALL})` : ''].filter(Boolean);
+      return `(SELECT ${picked}${narrowed ? ', near_rows' : ''} FROM near${kept.length ? ` WHERE ${kept.join(' AND ')}` : ''})`;
     };
     const branches = compose({ near, walk, read, lim });
     // first in the statement: the walks that read it follow
@@ -958,7 +956,7 @@ async function vectorSearch(
       ctes.unshift(`scan AS MATERIALIZED (
        SELECT concat_ws(' ', ${settings.join(', ')}) AS made)`);
     }
-    return store.query<RankedChunk & { walked: boolean }>(
+    return store.query<RankedChunk & { walked: boolean; near_rows?: number | string | null }>(
       `${ctes.length ? `WITH ${ctes.join(',\n     ')}\n     ` : ''}${branches.join('\n     UNION ALL\n     ')}`,
       p.list,
     );
@@ -982,8 +980,10 @@ async function vectorSearch(
   });
   // where the index was walked on for the sources, that list is the sources': it holds the nearest ones too
   const walkedSources = rows.some((r) => r.walked && !r.generated);
+  // (sources that are read are the read's rows: those among the walk for both sides came with it for its count)
+  const ofNear = (r: { near_rows?: number | string | null }) => r.near_rows !== undefined && r.near_rows !== null;
   const of = (generated: boolean) => rows
-    .filter((r) => Boolean(r.generated) === generated && (generated || !walkedSources || r.walked))
+    .filter((r) => Boolean(r.generated) === generated && (generated || (sources === 'read' ? !ofNear(r) : !walkedSources || r.walked)))
     .sort((x, y) => y.raw - x.raw)
     .slice(0, k);
   const out: Recall = mergeSides(of(false), of(true));
@@ -992,8 +992,20 @@ async function vectorSearch(
   // its first rows. What was found is returned, nearest first, and the channel says the list is short.
   // Nothing more is read: any part of the side that could be read within a limit is no nearer the
   // question than the rest of it.
+  //
+  // The pages beside sources are those among the nearest chunks the search may return, and a walk that
+  // comes to its count of those has shown what they hold: no pages there is an answer. In a narrowed
+  // search the walk can end at its limit before it has them — the filter's chunks lie further — and
+  // then it has shown nothing: that is said too.
+  const nearWidth = sources === 'walk' ? nearest : NEAREST_OF_ALL;
+  const nearRows = Number(rows.find(ofNear)?.near_rows ?? 0);
+  const cutShort = (generated: boolean) => {
+    const way = generated ? pages : sources;
+    if (of(generated).length >= k) return false;
+    return way === 'walk' || (way === 'near' && narrowed && nearRows < nearWidth);
+  };
   const short = [false, true]
-    .filter((generated) => (generated ? pages : sources) === 'walk' && of(generated).length < k)
+    .filter(cutShort)
     .map((generated) => `${of(generated).length} of the ${k} ${generated ? 'pages' : 'sources'} asked for`);
   if (short.length > 0) {
     out.partial = `the walk of the vector index ended ${iterative ? `at its limit of ${walkMax} rows` : 'at its first rows (this pgvector has no iterative scan)'} with ${short.join(' and ')}`;

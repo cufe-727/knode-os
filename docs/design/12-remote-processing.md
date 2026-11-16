@@ -208,21 +208,18 @@ processing is started, as embedding does now.
   A search its caller narrowed — to kinds or places (`kinds`, `sources`), to a trust tier or an actor's reading
   (`trust`, `actor`), or to a date (`asOf`) — is costed for itself (since 2026‑11‑16;
   `scopedRows`): the side is the caller's choice and may lie anywhere from the question, so the 2,000 rows a search
-  of everything spends on a side are not its bound. It has one budget of rows for its vector channel,
-  √(8 · k · chunks) and 10,000 at the most (the finance index is at that limit), for both sides and for reading and
-  walking together: the sides that fit are ranked by reading their vectors, the smaller first, each taking its size
-  from the budget, and a side that does not fit what is left is walked for with what is left, shared between the
-  walks. Each walk is a step of its own in the statement, that many rows of the index at the most, each row looked
-  up as it is pulled: the planner cannot answer by reading the side instead (left to choose, it ranked 34,000
-  chunks of four folders without the index, 420,000 blocks), and a side near the question ends its walk in a few
-  dozen rows. So a narrowed search reads 10,000 rows at the most, 120,000 to 190,000 blocks on the finance copy;
-  before the budget was shared it could read a side to the limit, walk twice as far again and read once more.
-  The price is at the edge: a folder a little over the budget and away from the question (12,383 chunks) is walked
-  for 10,000 rows in half a second or more and comes back short for half the questions, where reading it would
-  take 153,000 blocks and a tenth of a second. `SCOPED_ROWS_MAX` is that choice. A side counted past the budget is not
-  counted again for a minute by a search with the same conditions. A walk that ends short of `k` is all such a side gets: what it found is returned, nearest
+  of everything spends on a side are not its bound. Its measure is √(8 · k · chunks) rows, 10,000 at the most (the
+  finance index is at that limit). Each side is judged on its own: one that holds that many chunks at the most is
+  ranked by reading its vectors, a larger one by walking the index for that many rows, half each where both sides
+  are walked. (For a day the two sides shared one budget, the smaller read first: a folder read beside pages left
+  the pages a walk of a few hundred rows that found none and said nothing.) Each walk is a step of its own in the
+  statement, that many rows of the index at the most, each row looked up as it is pulled: the planner cannot answer
+  by reading the side instead (left to choose, it ranked 34,000 chunks of four folders without the index, 420,000
+  blocks), and a side near the question ends its walk in a few dozen rows. A side counted past the measure, or
+  empty, is not counted again for a minute by a search with the same conditions. A walk that ends short of `k` is all such a side gets: what it found is returned, nearest
   first, and the channel is marked partial (`SearchChannel.partial`, in `channels.vector` of an explained search)
-  with what stopped it and how many it has. Nothing is read after a walk: for a day a side the walk found nothing of
+  with what stopped it and how many it has; so is the walk that looks for pages beside the sources, when it ends at
+  its limit before it has its forty rows. Nothing is read after a walk: for a day a side the walk found nothing of
   was read as far as four times the walk's rows, and of a larger side that was its first so-many chunks in no
   order, returned as if they were its nearest. The 2,000 had bounded narrowed searches too, and a folder of 2,500
   chunks away from the question returned nothing.

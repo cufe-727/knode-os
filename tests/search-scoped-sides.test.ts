@@ -17,7 +17,8 @@ import { resolveScopeFilter } from '../src/store/resolver.js';
  *
  * The index here is large enough that no side of it is read whole without a
  * filter, and its vector index is walked: 3,000 generated pages around one
- * direction, 31,000 reports around another, a small folder (`near`, 500)
+ * direction (and 600 more, timelines, off on their own), 30,400 reports around
+ * another, a small folder (`near`, 500)
  * around a third, two folders that lie opposite all of them (`far`, 2,500
  * chunks; `deep`, 3,500), and a pair of which one lies in front of the other
  * from where the first is (`front`, 2,150; `behind`, 3,200).
@@ -76,7 +77,8 @@ const embedder = new FixtureEmbedder();
 /** Folder, documents, the direction its vectors scatter around. */
 const FOLDERS: { id: string; dir: string; root: string; kind: 'source' | 'view'; n: number; around: [number, number, number, number] }[] = [
   { id: 'p', dir: 'wiki/entities', root: 'wiki', kind: 'view', n: 3000, around: [1, 0, 0, 0] },
-  { id: 'm', dir: 'raw/docs/main', root: 'docs', kind: 'source', n: 31000, around: [1, 1, 0, 0] },
+  { id: 'g', dir: 'wiki/timelines', root: 'wiki', kind: 'view', n: 600, around: [0, -1, 0, 0] },
+  { id: 'm', dir: 'raw/docs/main', root: 'docs', kind: 'source', n: 30400, around: [1, 1, 0, 0] },
   { id: 'n', dir: 'raw/docs/near', root: 'docs', kind: 'source', n: 500, around: [0, 0, 1, 0] },
   { id: 'f', dir: 'raw/docs/far', root: 'docs', kind: 'source', n: 2500, around: [-1, -1, -1, 0.5] },
   { id: 'e', dir: 'raw/docs/deep', root: 'docs', kind: 'source', n: 3500, around: [-1, -1, -1, -0.5] },
@@ -176,6 +178,22 @@ describe.each(BACKENDS)('scoped searches on %s', (backend) => {
     return old;
   };
 
+  /**
+   * A store on which a walk of the index comes back with nothing, whatever index it walked (which rows a
+   * walk reaches within its limit depends on how the index was built): the statements that walk the index
+   * return no row, every other statement is the store's own. `sent` lists the vector statements.
+   */
+  const walksFindNothing = (): { on: Store; sent: string[] } => {
+    const sent: string[] = [];
+    const on = Object.create(store) as Store;
+    on.query = ((sql: string, params?: unknown[]) => {
+      if (!sql.includes('<=>')) return store.query(sql, params);
+      sent.push(sql);
+      return sql.includes('ORDER BY e.embedding <=>') ? Promise.resolve([]) : store.query(sql, params);
+    }) as typeof store.query;
+    return { on, sent };
+  };
+
   describe('a search scoped to the wiki', () => {
     it('is answered by the vector channel: the statement it sends is one the server takes', async () => {
       for (const sources of [['wiki'], ['wiki/entities']]) {
@@ -194,7 +212,7 @@ describe.each(BACKENDS)('scoped searches on %s', (backend) => {
     it('walks on for its pages past nearer sources, as a search for the kind does', async () => {
       // the question among the 500 reports of raw/docs/near: the nearest forty chunks of all hold no page.
       // Either search sends the walk for the pages alone, with the narrowed search's rows to walk (how many
-      // pages a walk comes on within them depends on how the index was built: 3,000 lie among 45,850)
+      // pages a walk comes on within them depends on how the index was built: 3,600 lie among 45,850)
       const sent: string[] = [];
       const watched = Object.create(store) as Store;
       watched.query = ((sql: string, params?: unknown[]) => {
@@ -210,7 +228,7 @@ describe.each(BACKENDS)('scoped searches on %s', (backend) => {
         expect(sql).not.toContain('UNION ALL');
       }
       expect(bySource).toEqual(byKind);
-      expect(bySource.every((id) => id.startsWith('p'))).toBe(true);
+      expect(bySource.every((id) => /^[pg]/.test(id))).toBe(true);
     });
   });
 
@@ -258,20 +276,11 @@ describe.each(BACKENDS)('scoped searches on %s', (backend) => {
     it('returns what the walk found of a side too large to read, and says the channel is partial', async () => {
       const partialOf = async (on: Store, scope: { sources?: string[]; kinds?: string[] }, queryVector: number[], mode: 'vector' | 'hybrid' = 'vector') =>
         searchExplained(on, embedder, 'chunk', { k: 8, mode, track: false, current: false, queryVector, filter: resolveScopeFilter(scope) });
-      // A walk that comes back with nothing, whatever index it walked (which rows a walk reaches within its
-      // limit depends on how the index was built, so here the store answers for it): the statements that walk
-      // the index return no row, every other statement is the store's own.
-      const vectorStatements: string[] = [];
-      const unreached = Object.create(store) as Store;
-      unreached.query = ((sql: string, params?: unknown[]) => {
-        if (!sql.includes('<=>')) return store.query(sql, params);
-        vectorStatements.push(sql);
-        return sql.includes('ORDER BY e.embedding <=>') ? Promise.resolve([]) : store.query(sql, params);
-      }) as typeof store.query;
-      // Two folders too large for a narrowed search to read: 3,500 chunks, and 31,000. Nothing is read after
+      const { on: unreached, sent: vectorStatements } = walksFindNothing();
+      // Two folders too large for a narrowed search to read: 3,500 chunks, and 30,400. Nothing is read after
       // the walk: the first so-many chunks of a folder are not its nearest, and a search answered from them
       // looked as well ranked as any other.
-      for (const [dir, n] of [['raw/docs/deep', 3500], ['raw/docs/main', 31000]] as const) {
+      for (const [dir, n] of [['raw/docs/deep', 3500], ['raw/docs/main', 30400]] as const) {
         expect(n).toBeGreaterThan(scopedRows(24, 45_850));
         vectorStatements.length = 0;
         const { results, channels } = await partialOf(unreached, { sources: [dir] }, AMONG_PAGES);
@@ -317,21 +326,22 @@ describe.each(BACKENDS)('scoped searches on %s', (backend) => {
       }
     });
 
-    it('holds a narrowed search to one budget of rows, for both its sides and for reading and walking alike', async () => {
-      // the budget: as before on an index this size, and 10,000 rows at the most on any
+    it('holds a walk to the rows of a narrowed search, and two walks to half of them each', async () => {
+      // the rows: as before on an index this size, and 10,000 at the most on any
       expect(scopedRows(24, 45_850)).toBe(2967);
       expect([24, 60].map((k) => scopedRows(k, 566_914))).toEqual([SCOPED_ROWS_MAX, SCOPED_ROWS_MAX]);
       expect(SCOPED_ROWS_MAX).toBe(10_000);
       const limitOf = (sql: string) => Number(/set_config\('hnsw.max_scan_tuples', '(\d+)'/.exec(sql)?.[1]);
-      // a folder that is read (2,500 chunks) beside pages that are not (3,000): the walk has what is left
+      // a folder that is read (2,500 chunks) beside pages that are not (3,600): the walk for the pages has its
+      // rows whatever the folder took
       let sent = await sentBy(() => found({ sources: ['raw/docs/far', 'wiki'] }));
       expect(sent).toHaveLength(1);
-      expect(limitOf(sent[0])).toBe(2967 - 2500);
-      // both sides too large to read (31,000 reports, 3,000 pages): two walks, half the budget each
+      expect(limitOf(sent[0])).toBe(2967);
+      // both sides too large to read (30,400 reports, 3,600 pages): two walks, half each
       sent = await sentBy(() => found({ sources: ['raw/docs/main', 'wiki'], queryVector: AMONG_REPORTS }));
       expect(sent).toHaveLength(1);
       expect(limitOf(sent[0])).toBe(Math.floor(2967 / 2));
-      // one side walked alone has it all
+      // one side walked alone has them all
       sent = await sentBy(() => found({ sources: ['raw/docs/main'], queryVector: AMONG_REPORTS }));
       expect(limitOf(sent[0])).toBe(2967);
     });
@@ -398,6 +408,49 @@ describe.each(BACKENDS)('scoped searches on %s', (backend) => {
       const sent = await sentBy(() => found({ queryVector: AMONG_PAGES }));
       expect(sent).toHaveLength(1);
       expect(sent[0]).toContain(`set_config('hnsw.max_scan_tuples', '${SIDE_ROWS_MAX}', true)`);
+    });
+  });
+
+  describe('the two sides of a narrowed search', () => {
+    const explained = (on: Store, sources: string[], queryVector: number[]) =>
+      searchExplained(on, embedder, 'chunk', { k: 8, mode: 'vector', track: false, current: false, queryVector, filter: resolveScopeFilter({ sources }) });
+
+    it('reads each side that is small enough to read, whatever the other side took', async () => {
+      // 2,500 chunks of a folder and 600 of timelines: each within the 2,967 a narrowed search reads of a side,
+      // 3,100 together. Read one after the other out of one budget, the timelines left the folder 2,367 rows
+      // to be walked for, and from among the reports the walk found none of it.
+      const { results, channels } = await explained(store, ['raw/docs/far', 'wiki/timelines'], AMONG_REPORTS);
+      expect(channels.vector).toEqual({ hits: 48, ms: expect.any(Number) });
+      const ids = results.map((r) => r.chunkId);
+      expect(ids.filter((id) => id.startsWith('f'))).toEqual((await exact('raw/docs/far', AMONG_REPORTS, 8)).slice(0, 6));
+      expect(ids.filter((id) => id.startsWith('g'))).toEqual((await exact('wiki/timelines', AMONG_REPORTS, 8)).slice(0, 2));
+    });
+
+    it('gives a walk its rows whatever was read beside it', async () => {
+      // the timelines are read; the reports, 30,400 of them, are walked for with the walk's own 2,967 rows
+      const sent: string[] = [];
+      const watched = Object.create(store) as Store;
+      watched.query = ((sql: string, params?: unknown[]) => {
+        if (sql.includes('<=>')) sent.push(sql);
+        return store.query(sql, params);
+      }) as typeof store.query;
+      const { results, channels } = await explained(watched, ['raw/docs/main', 'wiki/timelines'], AMONG_REPORTS);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toContain(`set_config('hnsw.max_scan_tuples', '2967', true)`);
+      expect(sent[0]).toContain('LIMIT 2967');
+      // 24 of each side: the reports the walk found (they are the nearest, and take the 8) and the timelines read
+      expect(channels.vector).toEqual({ hits: 48, ms: expect.any(Number) });
+      expect(results.map((r) => r.chunkId)).toHaveLength(8);
+      expect(results.every((r) => r.chunkId.startsWith('m'))).toBe(true);
+    });
+
+    it('says so when the walk that looks for pages beside the sources ran out', async () => {
+      // a folder that is read, and 3,600 pages, too many to read: the pages are those among the nearest forty
+      // chunks the filter leaves, and a walk that ends before it has forty has not shown there are none
+      const { on, sent } = walksFindNothing();
+      const { channels } = await explained(on, ['raw/docs/far', 'wiki'], AMONG_REPORTS);
+      expect(sent).toHaveLength(1);
+      expect(channels.vector?.partial).toMatch(/ended at its limit of 2967 rows with 0 of the 24 pages asked for/);
     });
   });
 
