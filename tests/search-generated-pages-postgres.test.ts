@@ -235,6 +235,15 @@ describe.skipIf(!ready)('postgres backend: the vector channel lists sources wher
     expect(pages.every((r) => r.chunkId.startsWith('p'))).toBe(true);
   });
 
+  it('walks on for the pages of a search its filter scopes to the wiki, as for a search of the kind', async () => {
+    // no kind asked for: the filter leaves no source, and the pages lie behind all 1,500 of them
+    for (const sources of [['wiki'], ['wiki/entities']]) {
+      const pages = await search(store, embedder, 'anything', { k: 8, mode: 'vector', track: false, current: false, queryVector: [1, 1, 0, 0], filter: resolveScopeFilter({ sources }) });
+      expect(pages).toHaveLength(8);
+      expect(pages.every((r) => r.chunkId.startsWith('p'))).toBe(true);
+    }
+  });
+
   it('reads a side a filter leaves a handful of chunks, however far from the question they lie', async () => {
     // three reports, behind all 6,000 pages and most sources: a walk would read to its limit for them
     const far = ['s11', 's222', 's1333'];

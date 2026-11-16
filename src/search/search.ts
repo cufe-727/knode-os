@@ -655,16 +655,17 @@ async function vectorSearch(
   /**
    * How a side is ranked: its vectors read; its chunks among the nearest of all, with the index walked
    * on when those are short of `k` (sources); the same without walking on (pages beside sources); or the
-   * index walked on for it alone (pages, in a search for pages).
+   * index walked on for it alone (pages, where the search has no sources to return: it asked for pages,
+   * or its filter leaves none — a search of `wiki`, of `wiki/entities`).
    */
-  const way = (generated: boolean): 'none' | 'read' | 'near' | 'walk' => {
+  const way = (generated: boolean, alone = false): 'none' | 'read' | 'near' | 'walk' => {
     const size = generated ? held.generated : held.sources;
     if (size === 0 || !(generated ? wantsPages : wantsSources)) return 'none';
     if (size <= readMax) return 'read';
-    return generated && !wantsSources ? 'walk' : 'near';
+    return generated && alone ? 'walk' : 'near';
   };
   const sources = way(false);
-  const pages = way(true);
+  const pages = way(true, sources === 'none');
   if (sources === 'none' && pages === 'none') return [];
   const walksOn = sources === 'near' || pages === 'walk';
   const iterative = walksOn && (await scansIteratively(store));
