@@ -249,6 +249,14 @@ describe('ask with a computed set', () => {
     expect(res.computed?.answer).toBe(3);
   });
 
+  it('computes the set for a question routed to the relation walk too', async () => {
+    const { llm, prompts } = recordingLlm();
+    const res = await ask(store, config, embedder, llm, 'How many incidents did Northwind Platform report?', { route: 'multihop' });
+    expect(res.route.kind).toBe('multihop');
+    expect(res.route.computed).toMatchObject({ op: 'count', scope: 'Northwind Platform', items: 3 });
+    expect(prompts[0]).toContain('# Computed from the claims\nScope: Northwind Platform.');
+  });
+
   it('computes nothing for a question that asks for no set', async () => {
     const { llm, prompts } = recordingLlm();
     const res = await ask(store, config, embedder, llm, 'What is Northwind Platform?');

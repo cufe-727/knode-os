@@ -204,6 +204,10 @@ interface Candidate {
   /** What the relation says, as scored: its type, its description, its far end. */
   text: string;
   score: number;
+  /** The question describes its far end better than its siblings (the meaning signal gave it a bonus). */
+  meant?: boolean;
+  /** One of a few siblings the question describes one of. */
+  described?: boolean;
   /** How the ordering step picked the far end. */
   order?: string;
 }
@@ -219,7 +223,13 @@ function zBonus(group: Candidate[], value: (c: Candidate) => number | undefined,
   const mean = v.reduce((a, b) => a + b, 0) / v.length;
   const sd = Math.sqrt(v.reduce((a, b) => a + (b - mean) ** 2, 0) / v.length);
   if (sd < 1e-6) return;
-  for (const c of withValue) c.score += weight * Math.max(0, (value(c)! - mean) / sd);
+  for (const c of withValue) {
+    const bonus = weight * Math.max(0, (value(c)! - mean) / sd);
+    if (bonus > 0) {
+      c.score += bonus;
+      c.meant = true;
+    }
+  }
 }
 
 /**
@@ -353,6 +363,14 @@ export async function walkRelations(
       siblings.set(k, [...(siblings.get(k) ?? []), c]);
     }
     for (const group of siblings.values()) zBonus(group, (c) => meaning.get(c.farId), MEANING_WEIGHT);
+    // a named entity's few siblings one of which the question describes ("第一事业部管基础设施的那个组" of a division's
+    // three groups) are all walked, the described one first: the description picks among them by meaning, and the
+    // later hops (an ordering, a fix) may yet tell them apart
+    if (hop === 1) {
+      for (const group of siblings.values()) {
+        if (group.length <= FRONTIER && group.some((c) => c.meant)) for (const c of group) c.described = true;
+      }
+    }
     // the ordering step, at the first hop where an entity leads to several of what the question orders:
     // each such branch keeps the one the question names, by date, and drops the others it ordered
     const dropped = new Set<Candidate>();
@@ -384,14 +402,17 @@ export async function walkRelations(
         }
       }
     }
-    const leads = (c: Candidate) => c.held.length > 0 || c.anchors.length > 0;
+    // a relation leads on when it holds a term of the question or is anchored by another entity it names, and on the
+    // first hop also when its far end is one of the few siblings the question describes; one that does none of these
+    // is not about the question, whatever its weight
+    const leads = (c: Candidate) => c.held.length > 0 || c.anchors.length > 0 || (hop === 1 && c.described === true);
     const scored = candidates
       .filter((c) => !dropped.has(c))
-      .filter((c) => !visited.has(c.farId) || leads(c))
       .sort((a, b) => b.score - a.score || b.r.weight - a.r.weight || (a.r.id < b.r.id ? -1 : 1));
-    // past the first hop, only relations that match the question or lead toward another entity it names go on;
+    // only relations that match the question or lead toward another entity it names go on, the first hop's too: a
+    // question the walk cannot help gets nothing from it rather than the heaviest relations of what it names;
     // every branch takes its own best step, then the best of the rest fill the hop, so a hub cannot take it whole
-    const eligible = hop === 1 ? scored : scored.filter(leads);
+    const eligible = scored.filter(leads);
     const chosen = new Set<Candidate>();
     if (hop > 1) {
       // the branches first whose way here scored best: an ordered pick or a well-matched chain keeps its lead

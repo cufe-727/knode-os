@@ -75,6 +75,15 @@ beforeAll(async () => {
     await relate(id, 'plat', `${name}是二部平台组报告的事故。`, at);
     await relate('qian', id, `钱勇修复了${name}。`, await doc(`钱勇修复了${name}。`, ['qian', id], date));
   }
+  // a company with heavy competitor relations and five yearly values: a question the walk cannot help
+  await entity('catl', '宁德时代');
+  for (let i = 0; i < 8; i++) {
+    await entity(`peer${i}`, `电池同行${i}号`);
+    await relate('catl', `peer${i}`, `宁德时代与电池同行${i}号存在竞争。`, await doc(`宁德时代与电池同行${i}号竞争`, ['catl', `peer${i}`], '2019-01-01'), 9, 'competes_with');
+  }
+  for (let y = 2021; y <= 2025; y++) {
+    await doc(`宁德时代${y}年人均产值为${300 + y - 2021}万元。`, ['catl'], `${y + 1}-03-01`, [['catl', `宁德时代${y}年人均产值为${300 + y - 2021}万元`, `${y}-12-31`, 'metric']]);
+  }
 });
 
 afterAll(async () => {
@@ -93,3 +102,18 @@ describe('a multi-hop answer without the embedder', () => {
     }
   });
 });
+
+describe('a question the walk cannot help', () => {
+  it('adds no relation that matches nothing, and keeps what the ordinary route would have found', async () => {
+    const embedder = { model: MODEL, dimensions: 4, embed: async (t: string[]) => t.map(() => [1, 0, 0, 0]) } as EmbeddingProvider;
+    const q = '宁德时代的人均产值是多少，它在行业里排第几';
+    const chained = await ask(store, config, embedder, noLlm, q, { route: 'multihop' });
+    const lookup = await ask(store, config, embedder, noLlm, q, { route: 'lookup' });
+    expect(chained.route.walked).toMatchObject({ relations: 0 });
+    expect(chained.facts.filter((f) => f.statement.includes('competes with'))).toEqual([]);
+    const have = new Set(chained.facts.map((f) => f.id));
+    expect(lookup.facts.map((f) => f.id).filter((id) => !have.has(id))).toEqual([]);
+    expect(chained.facts.filter((f) => f.statement.includes('人均产值')).length).toBeGreaterThanOrEqual(lookup.facts.filter((f) => f.statement.includes('人均产值')).length);
+  });
+});
+

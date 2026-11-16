@@ -310,7 +310,12 @@ async function enumeratedAnswer(env: RouteEnv): Promise<AskResult | null> {
   }), heading);
 }
 
-/** Multi-hop: SAG search, and a bounded walk over the named entities' relations with the passages stating each hop. */
+/**
+ * Multi-hop: SAG search, and a bounded walk over the named entities' relations with the passages stating each
+ * hop, beside what the lookup route would have found for the same question (the set the claims compute, the
+ * depth-2 graph search, the excerpts of a list question): a question the walk cannot help loses nothing by
+ * being routed to it.
+ */
 async function multihopAnswer(env: RouteEnv): Promise<AskResult> {
   const { store, config, embedder, question, opts, queryVector, router, named } = env;
   const k = opts.k ?? 8;
@@ -318,21 +323,33 @@ async function multihopAnswer(env: RouteEnv): Promise<AskResult> {
   // mode answers, whose hybrid search falls back to the keyword and graph channels as the lookup route's does
   const asked = opts.mode ?? 'hybrid';
   const mode: SearchMode = asked === 'keyword' ? 'keyword' : queryVector ? 'sag' : 'hybrid';
-  const [retrieved, walk] = await Promise.all([
+  const [retrieved, walk, graph, computed] = await Promise.all([
     search(store, embedder, question, { k, mode, heat: config.heat, sag: config.retrieval.sag, rerank: config.retrieval.rerank, queryVector, track: opts.track }),
     walkRelations(store, question, named, { maxHops: router.maxHops, queryVector, model: embedder.model }),
+    graphSearch(store, question, { depth: 2, chunkLimit: 4, heat: config.heat, track: opts.track }),
+    env.computed ? Promise.resolve(env.computed) : computeClaimSet(store, question, { kind: 'lookup', range: env.routed.range }, named).catch(() => null),
   ]);
   const seen = new Set(retrieved.map((r) => r.chunkId));
   // the passages that state the hops share the top of the context with the search: a chain's later hops are
-  // rarely what a search of the whole question finds
+  // rarely what a search of the whole question finds; the graph search's chunks come after both
   const bridges = walk.bridges.filter((c) => !seen.has(c.chunkId));
+  for (const b of bridges) seen.add(b.chunkId);
+  const fromGraph = graph.chunks.filter((c) => !seen.has(c.chunkId));
   const half = Math.ceil(k / 2);
-  const found = [...retrieved.slice(0, half), ...bridges.slice(0, k - half), ...retrieved.slice(half), ...bridges.slice(k - half)].slice(0, k + 4);
-  const ranked = await factsForQuestion(store, question, found, { limit: opts.facts, queryVector, model: embedder.model, named: [...named, ...walk.reached] });
+  const found = [...retrieved.slice(0, half), ...bridges.slice(0, k - half), ...retrieved.slice(half), ...bridges.slice(k - half), ...fromGraph].slice(0, k + 4);
+  const list = isListQuestion(question);
+  const excerptBudget = list ? (opts.excerpts ?? EXCERPT_CHARS) : 0;
+  const [ranked, excerpts]: [QuestionFact[], SearchResult[]] = await Promise.all([
+    factsForQuestion(store, question, found, { limit: opts.facts, queryVector, model: embedder.model, named: [...named, ...walk.reached], list }),
+    excerptBudget > 0
+      ? namedSurface(store, named).then((s) => excerptsForQuestion(store, question, found, { budget: excerptBudget, names: s.names, namedDocs: s.docs }))
+      : Promise.resolve([]),
+  ]);
+  const contexts = [...found, ...excerpts];
   const steps = stepsAsFacts(walk.steps);
   const stepIds = new Set(steps.map((s) => s.id));
   const facts: PromptFact[] = [...steps, ...ranked.filter((f) => !stepIds.has(f.id))];
-  return compose(env, found, [...facts, ...currentFacts(found, facts)], '', routeOf(env.routed, {
+  return compose({ ...env, computed }, contexts, [...facts, ...currentFacts(contexts, facts)], '', routeOf(env.routed, {
     walked: { hops: walk.steps.reduce((n, s) => Math.max(n, s.hop), 0), relations: walk.steps.length, reached: walk.reached.length, bridges: walk.bridges.length },
   }));
 }
