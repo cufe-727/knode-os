@@ -206,7 +206,7 @@ export function seriesSupersession(series: StateRow[]): Map<string, string | nul
 export function seriesKeyObject(r: Pick<StateRow, 'attribute' | 'object_id' | 'object_name' | 'object_type' | 'value_text' | 'statement'>, spellings: readonly string[]): string {
   const object = seriesObject(r.attribute, { id: r.object_id, name: r.object_name, type: r.object_type }, r.value_text);
   if (object) return object;
-  const about = statementObject(r.statement ?? '', r.attribute, spellings);
+  const about = statementObject(r.statement ?? '', r.attribute, spellings, r.value_text);
   return about ? `~${about}` : '';
 }
 

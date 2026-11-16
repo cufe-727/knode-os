@@ -690,7 +690,7 @@ export function seriesRelation(
   const of = (c: typeof a) => {
     const object = seriesObject(c.attribute, { id: c.object, name: c.object_name, type: c.object_type }, c.value_text);
     if (object) return object;
-    const about = c.statement ? statementObject(c.statement, c.attribute, c.subject_name ? [c.subject_name] : []) : '';
+    const about = c.statement ? statementObject(c.statement, c.attribute, c.subject_name ? [c.subject_name] : [], c.value_text) : '';
     return about ? `~${about}` : '';
   };
   if (of(a) !== of(b)) return null;

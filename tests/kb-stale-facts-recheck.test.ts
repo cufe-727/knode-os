@@ -92,3 +92,26 @@ describe('an owner change written with an adverb or a lead phrase', () => {
   });
 });
 
+
+describe('an owner written in the active voice', () => {
+  it('reads the thing after 负责', () => {
+    expect(statementObject('张三负责云业务', '负责人', ['比亚迪'], '张三')).toBe('云业务');
+    expect(statementObject('李四将负责电池业务的工作', '负责人', ['比亚迪'], '李四')).toBe('电池业务');
+    expect(statementObject('李四接手云业务', '负责人', ['比亚迪'], '李四')).toBe('云业务');
+    expect(statementObject('李四负责比亚迪云业务', '负责人', ['比亚迪'], '李四')).toBe('云业务');
+    expect(statementObject('赖艳负责R-03', '负责人', ['R-03'], '赖艳')).toBe('');
+    expect(statementObject('赖艳负责', '负责人', ['R-03'], '赖艳')).toBe('');
+    // the passive voice is read as before, the value given or not
+    expect(statementObject('云业务改由李四负责', '负责人', ['比亚迪'], '李四')).toBe('云业务');
+  });
+
+  it('keeps the owners of two things apart', async () => {
+    const ctx = await twoDocs('active', '比亚迪', [['张三负责云业务', '负责人', '张三']], [['李四负责电池业务', '负责人', '李四']]);
+    expect(await currentStatements(ctx)).toEqual(['张三负责云业务', '李四负责电池业务'].sort());
+  });
+
+  it('leaves one current owner of one thing, active or passive', async () => {
+    const ctx = await twoDocs('active-change', '比亚迪', [['张三负责云业务', '负责人', '张三']], ['云业务改由李四负责']);
+    expect(await currentStatements(ctx)).toEqual(['云业务改由李四负责']);
+  });
+});

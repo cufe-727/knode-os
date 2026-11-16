@@ -105,13 +105,19 @@ const STATE_AT = /(?:的)?(?:状态|阶段)\s*(?:为|是|：|:)|\b(?:status|stag
  * both filed under 比亚迪, are the owners of two businesses, not one owner
  * changing.
  */
-export function statementObject(statement: string, attribute: string | null | undefined, spellings: readonly string[]): string {
+export function statementObject(statement: string, attribute: string | null | undefined, spellings: readonly string[], valueText?: string | null): string {
   const head = attributeHead(attribute);
   if (!head || !TEXT_KEYS.has(head)) return '';
   const text = statement.normalize('NFKC');
   const at = (STATE_KEYS.has(head) ? STATE_AT : OWNER_AT).exec(text);
-  if (!at) return '';
-  let before = (text.slice(0, at.index).split(/[，,;；。:：]/).pop() ?? '').trim();
+  let before: string;
+  if (at) before = (text.slice(0, at.index).split(/[，,;；。:：]/).pop() ?? '').trim();
+  else {
+    // the active voice: "张三负责云业务", what the owner (the value) is said to take on
+    const active = STATE_KEYS.has(head) ? null : activeOwnerObject(text, valueText);
+    if (active === null) return '';
+    before = active;
+  }
   // the subject written in the clause: what follows it is the thing ("比亚迪云业务由…"), what precedes it a lead
   // phrase ("经评审R-03状态为…"); a gloss in brackets is the subject's ("R-03（支付超时）")
   const named = lastSpelling(before, spellings);
@@ -135,6 +141,22 @@ const BRACKETED = /\([^()]*\)|\[[^\[\]]*\]|【[^【】]*】/gu;
  * "自2025年3月起", "从下周开始", "经评审", "经董事会决定后".
  */
 const LEAD_PHRASE = /^(?:(?:自|从|于)[^起]{0,16}?(?:起|开始)|经(?:过)?[\p{Script=Han}A-Za-z]{0,8}?(?:评审|审议|审批|批准|决定|决议|讨论|研究|协商|确认|同意|评估|复核|会议)(?:后|通过)?)/u;
+
+/** Verbs an owner takes a thing on with, written after the owner: "张三负责云业务", "李四接手电池业务". */
+const OWNER_VERB = /^\s*(?:将|已|仍|现|也|继续|正式|开始|改为|转为){0,2}\s*(?:负责|主导|牵头|跟进|接手|接管|分管|主管)(?![人方])/u;
+
+/** In the active voice, the clause after the owner's verb with its "…的工作" tail dropped; null when the owner is not written so. */
+function activeOwnerObject(text: string, valueText: string | null | undefined): string | null {
+  const owner = valueText?.normalize('NFKC').trim();
+  if (!owner || owner.length < 2) return null;
+  for (let i = text.indexOf(owner); i >= 0; i = text.indexOf(owner, i + 1)) {
+    const verb = OWNER_VERB.exec(text.slice(i + owner.length));
+    if (!verb) continue;
+    const rest = text.slice(i + owner.length + verb[0].length).split(/[，,;；。:：]/)[0] ?? '';
+    return rest.replace(/(?:的)?(?:相关)?(?:工作|事宜|事务|方面|领域)$/u, '').trim();
+  }
+  return null;
+}
 
 /** The last place in `text` a spelling of the subject is written, longest spelling first. */
 function lastSpelling(text: string, spellings: readonly string[]): { start: number; end: number } | null {
