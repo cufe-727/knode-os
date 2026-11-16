@@ -209,9 +209,11 @@ processing is started, as embedding does now.
   (`trust`, `actor`), or to a date (`asOf`) — is costed for itself (since 2026‑11‑16;
   `scopedRows`): the side is the caller's choice and may lie anywhere from the question, so the 2,000 rows a search
   of everything spends on a side are not its bound. Its measure is √(8 · k · chunks) rows, 10,000 at the most (the
-  finance index is at that limit). Each side is judged on its own: one that holds that many chunks at the most is
-  ranked by reading its vectors, a larger one by walking the index for that many rows, half each where both sides
-  are walked. (For a day the two sides shared one budget, the smaller read first: a folder read beside pages left
+  finance index is at that limit). Each side is judged on its own: one that holds half as many chunks again at the
+  most (`scopedReadRows`: 15,000 there) is ranked by reading its vectors, a larger one by walking the index for the
+  measure's rows, half each where both sides are walked. The two were equal for a day, and a folder a little over
+  them and away from the question (12,383 chunks) was walked for 10,000 rows in most of a second and came back
+  short for 17 questions of 30, where reading it takes 153,000 blocks and a tenth of a second. (For a day the two sides shared one budget, the smaller read first: a folder read beside pages left
   the pages a walk of a few hundred rows that found none and said nothing.) Each walk is a step of its own in the
   statement, that many rows of the index at the most, each row looked up as it is pulled: the planner cannot answer
   by reading the side instead (left to choose, it ranked 34,000 chunks of four folders without the index, 420,000

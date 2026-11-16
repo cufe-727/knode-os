@@ -606,6 +606,22 @@ export function scopedRows(k: number, total: number): number {
   return Math.min(SCOPED_ROWS_MAX, Math.max(SIDE_ROWS_MAX, Math.round(Math.sqrt(8 * k * total))));
 }
 
+/**
+ * The chunks a side of a narrowed search may hold and be read: half as many
+ * again as the rows of its walk, 15,000 at the most.
+ *
+ * Equal, the two left a cliff at their edge. A folder of 12,383 chunks on the
+ * finance copy, away from the question, was walked for: 10,000 rows, 140,963
+ * blocks, most of a second, and short for 17 questions of 30 — three of them
+ * with nothing at all. Read, it is 153,013 blocks and a tenth of a second,
+ * and exact. A side a little over the walk's rows costs little more to read
+ * than the walk that fails on it, so it is read; the walk is for sides so
+ * large that reading them would cost several walks.
+ */
+export function scopedReadRows(k: number, total: number): number {
+  return Math.round(1.5 * scopedRows(k, total));
+}
+
 interface SideSizes {
   /** Searchable chunks of sources, counted as far as the cap. */
   sources: number;
@@ -782,8 +798,9 @@ async function vectorSearch(
   // the index that may lie anywhere from the question — a search as of a date whose live documents lay
   // away from it was held to the 2,000 rows of a search of everything, and returned nothing.
   const narrowed = Boolean(toIso(asOf)) || !isEmptyFilter(filter ?? NO_FILTER);
-  const budget = narrowed ? scopedRows(k, await chunkTotal(store)) : SIDE_ROWS_MAX;
-  const readMax = exactSide ?? budget;
+  const total = narrowed ? await chunkTotal(store) : 0;
+  const budget = narrowed ? scopedRows(k, total) : SIDE_ROWS_MAX;
+  const readMax = exactSide ?? (narrowed ? scopedReadRows(k, total) : SIDE_ROWS_MAX);
   const held = await sideSizes(store, sides, readMax, asOf, filter);
   /**
    * How a side is ranked: its vectors read; the index walked on for it (the sources, and the pages
@@ -798,6 +815,7 @@ async function vectorSearch(
    * found none and said nothing, and a side that would have been read on its own was walked for a few
    * hundred rows because the other had been read. What one side costs no longer decides how the other
    * is ranked; a narrowed search reads at the most two sides of `readMax`, or one and a walk.
+   * (`readMax` is half as much again as the walk's rows: `scopedReadRows`.)
    */
   const size = (generated: boolean) => ((generated ? wantsPages : wantsSources) ? (generated ? held.generated : held.sources) : 0);
   const sources: 'none' | 'read' | 'walk' = size(false) === 0 ? 'none' : size(false) <= readMax ? 'read' : 'walk';
