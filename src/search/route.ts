@@ -41,8 +41,8 @@ const TIMELINE = [
 ];
 
 const AGGREGATE = [
-  /多少|(?<![那这第])几[次个家条篇份项位年月天起名人种类款]|总共|一共|合计|总数|总额|平均|最多|最少|最高|最低|排名|占比|增长了?多少|频率/,
-  /\bhow (many|much|often)\b|\bcount\b|\bnumber of\b|\btotal\b|\bsum\b|\baverage\b|\bmean\b|\b(most|least|highest|lowest|largest|smallest)\b|\brank(ed|ing)?\b|\bpercentage\b/i,
+  /多少|(?<![那这第])几[次个家条篇份项位年月天起名人种类款]|总共|一共|合计|总数|总额|平均|最多|最少|最高|最低|最好|最差|最大|最小|最快|最慢|最强|最弱|最贵|最便宜|排名|占比|增长了?多少|频率/,
+  /\bhow (many|much|often)\b|\bcount\b|\bnumber of\b|\btotal\b|\bsum\b|\baverage\b|\bmean\b|\b(most|least|highest|lowest|largest|smallest|best|worst|biggest|fastest|cheapest)\b|\brank(ed|ing)?\b|\bpercentage\b/i,
 ];
 
 /**
@@ -111,6 +111,8 @@ const CHAIN_INTRO = [
  */
 const CHAIN_OPENING = [
   new RegExp(`^\\s*(?:请问|那么|并且|而且|又|是|由)?\\s*(?:谁|哪(?:一)?[个位家名项件组](?!些)|有?[一另][个位名家起项件]\\s*(?:[^，。？?；;、\\s]{0,12}?的)?${ENTITY_NOUN})`),
+  // "这家公司的创始人是谁，他…": the clause asks who or which one, at its end
+  /是(?:谁|哪(?:一)?[个位家名])\s*[，,。？?；;：:—]?\s*$/,
   /^\s*(?:and\s+|then\s+|so\s+)?(?:who(?:m)?\b(?!\s+(?:are|were)\b)|which\s+(?!\w+s\b)\w+|(?:a|an|another|one)\s+(?:[\w-]+\s+)?(?:person|engineer|employee|colleague|customer|client|supplier|vendor|company|owner|manager)\b)/i,
 ];
 
@@ -161,9 +163,15 @@ function chainAt(question: string): number {
   return -1;
 }
 
-/** A count or a list cue: what the aggregate and list routes compute. */
+/** A comparison of things the question names: the answer is one of them, nothing to find ("谁的装机量更大", "which was cheaper"). */
+const COMPARISON = [
+  /更[高大多低少好快慢强弱贵]|更便宜/,
+  /\b(?:more|less|fewer|higher|lower|bigger|larger|smaller|faster|slower|better|worse|cheaper|costlier)\b/i,
+];
+
+/** A count, a list or a comparison: what finds the thing without a walk (the aggregate and list routes, or the names given). */
 function countsOrLists(text: string): boolean {
-  return AGGREGATE.some((re) => re.test(text)) || isListQuestion(text);
+  return AGGREGATE.some((re) => re.test(text)) || isListQuestion(text) || COMPARISON.some((re) => re.test(text));
 }
 
 /**
