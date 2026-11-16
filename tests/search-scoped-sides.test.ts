@@ -232,6 +232,20 @@ describe.each(BACKENDS)('scoped searches on %s', (backend) => {
       }
       expect(bySource).toEqual(byKind);
       expect(bySource.every((id) => /^[pg]/.test(id))).toBe(true);
+      // And what the search returns, which the statement alone does not hold (an empty answer passes every
+      // line above): asked as any caller asks, the pages are read, and the eight are the nearest pages by a
+      // scan of every vector — none of them among the nearest forty chunks of all, which are reports.
+      const nearest = await exact('wiki', AMONG_NEAR, 8);
+      expect(nearest).toHaveLength(8);
+      expect((await exact('raw/docs/near', AMONG_NEAR, 40)).length).toBe(40);
+      for (const scope of [{ kinds: ['view'] }, { sources: ['wiki'] }, { sources: ['wiki/entities', 'wiki/timelines'] }]) {
+        const { results, channels } = await searchExplained(store, embedder, 'chunk', {
+          k: 8, mode: 'vector', track: false, current: false, queryVector: AMONG_NEAR, filter: resolveScopeFilter(scope),
+        });
+        expect(results.map((r) => r.chunkId)).toEqual(nearest);
+        expect(results.map((r) => r.signals.vector!)).toEqual(results.map((r) => r.signals.vector!).sort((a, b) => b - a));
+        expect(channels.vector).toEqual({ hits: 24, ms: expect.any(Number) });
+      }
     });
   });
 
@@ -400,14 +414,25 @@ describe.each(BACKENDS)('scoped searches on %s', (backend) => {
     });
 
     it('gives each side of a scoped search its candidates', async () => {
-      // the folder is read, exactly; the pages are the ones among the nearest chunks the filter leaves that
-      // the walk reaches with what the folder left of the budget (467 rows: on most builds of this index it
-      // starts among the pages, and they take their quarter of the 8)
-      const ids = await found({ sources: ['raw/docs/far', 'wiki'] });
-      const pages = ids.filter((id) => id.startsWith('p'));
-      expect(ids).toHaveLength(8);
-      expect(pages.length).toBeLessThanOrEqual(2);
-      expect(ids.filter((id) => id.startsWith('f'))).toEqual((await exact('raw/docs/far', AMONG_PAGES, 8)).slice(0, 8 - pages.length));
+      // a folder of 2,500 chunks and the 3,600 pages: each is read, and the eight are the folder's nearest six
+      // and the pages' nearest two — a quarter of the places, whichever lies nearer the question
+      for (const question of [AMONG_PAGES, AMONG_REPORTS, AMONG_FRONT]) {
+        const { results, channels } = await searchExplained(store, embedder, 'chunk', {
+          k: 8, mode: 'vector', track: false, current: false, queryVector: question, filter: resolveScopeFilter({ sources: ['raw/docs/far', 'wiki'] }),
+        });
+        expect(channels.vector).toEqual({ hits: 48, ms: expect.any(Number) });
+        const ids = results.map((r) => r.chunkId);
+        expect(ids).toHaveLength(8);
+        const folder = await exact('raw/docs/far', question, 8);
+        const pages = await exact('wiki', question, 8);
+        const places = ids.filter((id) => /^[pg]/.test(id)).length;
+        // the pages take two places where they are the nearer, and none past their quarter
+        expect(places).toBeLessThanOrEqual(2);
+        expect(ids.filter((id) => /^[pg]/.test(id))).toEqual(pages.slice(0, places));
+        expect(ids.filter((id) => id.startsWith('f'))).toEqual(folder.slice(0, 8 - places));
+      }
+      // among the pages they are the nearer: two of them, six of the folder
+      expect((await found({ sources: ['raw/docs/far', 'wiki'] })).filter((id) => id.startsWith('p'))).toEqual((await exact('wiki', AMONG_PAGES, 8)).slice(0, 2));
     });
 
     it('leaves a search of everything as it was: 2,000 rows a side at most', async () => {
