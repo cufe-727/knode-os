@@ -338,7 +338,7 @@ async function multihopAnswer(env: RouteEnv): Promise<AskResult> {
   const chain = isChainQuestion(question);
   const [retrieved, walk, graph, setFirst] = await Promise.all([
     search(store, embedder, question, { k, mode, heat: config.heat, sag: config.retrieval.sag, rerank: config.retrieval.rerank, queryVector, track: opts.track }),
-    walkRelations(store, question, named, { maxHops: router.maxHops, queryVector, model: embedder.model }),
+    walkRelations(store, question, named, { maxHops: router.maxHops, queryVector, model: embedder.model, now: opts.now }),
     graphSearch(store, question, { depth: 2, chunkLimit: 4, heat: config.heat, track: opts.track }),
     // a walked question gets a computed set too, under the same switch, reference day and time budget as any other;
     // a chain's waits for the walk (below)

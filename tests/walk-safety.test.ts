@@ -191,7 +191,7 @@ describe('the ordering step', () => {
     const walk = await walkRelations(store, '风控平台组今年第一起事故是谁修复的？', ['risk'], { maxHops: 1 });
     const picked = walk.steps.find((s) => s.order);
     expect(picked?.source).toBe('EVT-150');
-    expect(picked?.order).toMatch(/^the 1st of 200 dated in 2026 \(this year: the knowledge base's latest date, 2026-\d\d-\d\d\), by date \(2026-01-01\)/);
+    expect(picked?.order).toMatch(/^the 1st of 200 dated in 2026 \(this year: the clock, 2026-\d\d-\d\d\), by date \(2026-01-01\)/);
   });
 
   it('reads 今年 as the present year, not the latest year the candidates are dated in', async () => {
@@ -201,6 +201,17 @@ describe('the ordering step', () => {
     // a year the question names for the ordering is that year
     const named = await walkRelations(store, '清算组2025年第一起事故是谁修复的？', ['clear'], { maxHops: 1 });
     expect(named.steps.find((s) => s.order)?.source).toBe('INC-OLD-olda');
+  });
+
+  it('reads 今年 by the clock, or by the now its caller gives, and picks nothing from a year the knowledge base has no source in', async () => {
+    // the knowledge base's latest sources are of 2026; asked in 2027 its 今年 holds nothing
+    const later = await walkRelations(store, '风控平台组今年第一起事故是谁修复的？', ['risk'], { maxHops: 1, now: '2027-03-01' });
+    expect(later.steps.find((s) => s.order)).toBeUndefined();
+    expect(later.ordering?.picks[0]).toMatch(/not ordered: .*0 candidates are dated in 2027 \(this year: the caller's now, 2027-03-01\).*no source dated in 2027 \(its latest: 2026-/);
+    // an evaluation of a past corpus gives its own now, and its 今年 is that year
+    const past = await walkRelations(store, '清算组今年第一起事故是谁修复的？', ['clear'], { maxHops: 1, now: '2025-12-31' });
+    expect(past.steps.find((s) => s.order)?.source).toBe('INC-OLD-olda');
+    expect(past.ordering?.picks[0]).toMatch(/dated in 2025 \(this year: the caller's now, 2025-12-31\)/);
   });
 
   it('takes a year named elsewhere in the question as no period of the ordering', () => {

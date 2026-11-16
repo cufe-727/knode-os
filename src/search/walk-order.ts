@@ -103,19 +103,23 @@ export function ordinalInQuestion(question: string): OrdinalAsk | null {
 }
 
 /**
- * The present a relative period ("今年", "this month") is read against: the
- * day the question says it is asked as of ("截至2025年5月21日", "as of
- * 2025-05-21"), else the date of the knowledge base's latest source up to
- * today. A source's date is its own, or else the earliest date its claims
- * state: the week a report covers, not the launch it plans for next year (the
- * earliest, not the most stated, so one scan serves every document). On a
- * knowledge base kept current that is this year; on one whose sources stop in
- * an earlier year it is that year, and the note says so.
+ * The present a relative period ("今年", "this month") is read against: the day the question says it is asked as of
+ * ("截至2025年5月21日", "as of 2025-05-21"), else the day its caller gives (`ask`'s `now`: an evaluation of a past
+ * corpus sets its own), else the clock's. A knowledge base behind the clock is not read as current: its "今年" holds
+ * nothing, and the note says what its latest source is (`latestSourceDate`).
  */
-export async function presentOf(store: Store, asOf: string | null, today = new Date()): Promise<{ date: string; by: 'question' | 'knowledge base' | 'clock' }> {
-  const clock = today.toISOString().slice(0, 10);
+export function presentOf(asOf: string | null, now: string | null = null, today = new Date()): { date: string; by: 'question' | 'caller' | 'clock' } {
   if (asOf) return { date: asOf.slice(0, 10), by: 'question' };
-  const bound = `${clock}T23:59:59Z`;
+  if (now) return { date: now.slice(0, 10), by: 'caller' };
+  return { date: today.toISOString().slice(0, 10), by: 'clock' };
+}
+
+/**
+ * The date of the knowledge base's latest source up to `upTo`: a source's date is its own, or else the earliest its
+ * claims state (the week a report covers, not the launch it plans). Read only to say why a period holds nothing.
+ */
+export async function latestSourceDate(store: Store, upTo: string): Promise<string | null> {
+  const bound = `${upTo.slice(0, 10)}T23:59:59Z`;
   let [row] = await store.query<{ at: string | Date | null }>(`SELECT max(doc_date) AS at FROM documents WHERE doc_date <= $1::timestamptz`, [bound]);
   if (!row?.at) {
     [row] = await store.query<{ at: string | Date | null }>(
@@ -126,8 +130,7 @@ export async function presentOf(store: Store, asOf: string | null, today = new D
       [bound],
     );
   }
-  const kb = toDateString(row?.at ?? null);
-  return kb ? { date: kb, by: 'knowledge base' } : { date: clock, by: 'clock' };
+  return toDateString(row?.at ?? null);
 }
 
 export interface Placed {
@@ -287,7 +290,7 @@ export function pickByOrder(ask: OrdinalAsk, candidates: Placed[], present: { da
   let period = '';
   if (ask.period) {
     const now = present?.date ?? new Date().toISOString().slice(0, 10);
-    const relative = ask.period.year === null && present && present.by !== 'question' ? ` (this ${ask.period.unit}: the ${present.by === 'clock' ? 'clock' : "knowledge base's latest date"}, ${present.date})` : '';
+    const relative = ask.period.year === null && present && present.by !== 'question' ? ` (this ${ask.period.unit}: the ${present.by === 'clock' ? 'clock' : "caller's now"}, ${present.date})` : '';
     if (ask.period.unit === 'year') {
       const y = ask.period.year ?? Number(now.slice(0, 4));
       scope = dated.filter((c) => Number(c.date!.slice(0, 4)) === y);

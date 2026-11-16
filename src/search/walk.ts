@@ -4,7 +4,7 @@ import { toDateString } from '../store/temporal.js';
 import { ClaimItem, SearchResult } from '../types.js';
 import { keywordTerms, termCount } from './search.js';
 import { asOfDate } from './claimset.js';
-import { OrdinalAsk, ordinalInQuestion, pickByOrder, placeEntities, presentOf } from './walk-order.js';
+import { latestSourceDate, OrdinalAsk, ordinalInQuestion, pickByOrder, placeEntities, presentOf } from './walk-order.js';
 
 /**
  * The multi-hop route of `ask` (docs/design/30 §3): resolve → relations →
@@ -339,6 +339,8 @@ export async function walkRelations(
     /** The question's embedding and its model: far ends are then also preferred by meaning among their siblings. */
     queryVector?: number[];
     model?: string;
+    /** The day a relative period ("今年") is read from (YYYY-MM-DD), as `ask`'s `now`; default the clock's. */
+    now?: string;
   } = {},
 ): Promise<Walk> {
   const maxHops = Math.min(Math.max(opts.maxHops ?? 4, 1), 4);
@@ -353,7 +355,8 @@ export async function walkRelations(
   const orderKey = ordinal ? orderedNoun(question, ordinal, terms) : null;
   let orderedHop: number | null = null;
   const picks: string[] = [];
-  let present: Awaited<ReturnType<typeof presentOf>> | null = null;
+  let present: ReturnType<typeof presentOf> | null = null;
+  let latest: string | null | undefined;
   // per entity reached: the named entities its branch descends from (a branch is not anchored by its own start),
   // and the term keys the relations on its way have used
   const origins = new Map<string, Set<string>>(named.map((id) => [id, new Set([id])]));
@@ -440,7 +443,7 @@ export async function walkRelations(
       const ordered = [...pools.entries()].filter(([, pool]) => new Set(pool.map((c) => c.farId)).size >= 2);
       if (ordered.length > 0) {
         orderedHop = hop;
-        if (ordinal.period && ordinal.period.year === null && !present) present = await presentOf(store, asOfDate(question) ?? null);
+        if (ordinal.period && ordinal.period.year === null && !present) present = presentOf(asOfDate(question) ?? null, opts.now ?? null);
         // an entity with more relations than can be ordered makes no pick: its candidates are not placed
         const orderable = ordered.filter(([nearId]) => (counts.get(nearId) ?? 0) <= ORDER_MAX);
         const placed = await placeEntities(store, [...new Set(orderable.flatMap(([, pool]) => pool.map((c) => c.farId)))], { spellings, latest: ordinal.kind !== 'nth' });
@@ -454,7 +457,14 @@ export async function walkRelations(
           const byFar = new Map(pool.map((c) => [c.farId, c]));
           const pick = pickByOrder(ordinal, [...byFar.keys()].map((id) => placed.get(id)!), present);
           if (!pick.picked) {
-            picks.push(`${nearName}: ${pick.note}`);
+            // a relative period that holds nothing: say whether the knowledge base has any source in it at all
+            let why = '';
+            if (pick.dated === 0 && present && ordinal.period?.year === null) {
+              if (latest === undefined) latest = await latestSourceDate(store, present.date);
+              const start = ordinal.period.unit === 'year' ? `${present.date.slice(0, 4)}-01-01` : `${present.date.slice(0, 7)}-01`;
+              if (!latest || latest < start) why = `; the knowledge base has no source dated in ${ordinal.period.unit === 'year' ? present.date.slice(0, 4) : present.date.slice(0, 7)} (its latest: ${latest ?? 'none'})`;
+            }
+            picks.push(`${nearName}: ${pick.note}${why}`);
             continue;
           }
           picks.push(`${nearName}: ${placed.get(pick.picked)?.name ?? pick.picked} — ${pick.note}`);
