@@ -3,7 +3,7 @@ import path from 'node:path';
 import { CONFIG_FILE, loadConfig, ReviewResolution } from '../config.js';
 import { Queryable } from '../store/migrations.js';
 import { EntityCorrections, refusedKeys, refuses } from './corrections.js';
-import { codeOf, codesDiffer, codesKey, codesOf, MentionContext, namesakeFor, namesakeName, NamesakeRule } from './identity.js';
+import { codeOf, codesKey, codesOf, MentionContext, namesakeFor, namesakeName, NamesakeRule } from './identity.js';
 import { entityKeys, mentionKeys, nameKey, typesCompatible } from './normalize.js';
 import { slugify } from './store.js';
 
@@ -108,23 +108,41 @@ export function nameCode(name: string): ReturnType<typeof codeOf> {
   return codeOf(t) ?? codeOf(t.replace(/^\p{Script=Han}{1,4}/u, '').replace(/\p{Script=Han}{1,4}$/u, ''));
 }
 
+/** An identifier of a numbered series: letters, a separator, a counter, and what follows ("INC-020-D3T3", "R-71"). */
+export interface SeriesCode {
+  prefix: string;
+  counter: string;
+  rest: string;
+}
+
 /**
- * Two names that are each an identifier of one kind with different values
- * (INC-017-D7T3, INC-020-D3T3) are two things, whatever spellings they share.
- * A mention matched by an alias would otherwise land on the other: an
- * extraction lists the incident's title as an alias ("活动页白屏"), every
- * team's incident of that title carries it, and the first such incident took
- * the later ones' claims (11 of 210 incidents on the 10× benchmark, among them
- * fixes credited to another division's engineer). Only the two names count,
- * not alias lists, so the order documents arrive in decides nothing: each
- * identifier gets its own entity. For the same reason a spelling without an
- * identifier that several such entities carry as an alias resolves to none
- * of them (byKeys).
+ * The numbered series a name is one of, or null. Only an identifier made of
+ * letters, a separator and a counter is one — INC-001-T1, R-07, GPT-4 — not a
+ * model or contract code that runs letters into digits (H100, X100, CU2501,
+ * FY24, 24Q3): those are not counted, and a brand or exchange in front
+ * (vivoX100, SHFE.CU2501) is not another series.
+ */
+export function seriesCode(name: string): SeriesCode | null {
+  const c = nameCode(name);
+  if (!c) return null;
+  const m = /^([A-Z]+)[-_](\d+)(.*)$/.exec(c.value);
+  return m ? { prefix: m[1], counter: m[2], rest: m[3] } : null;
+}
+
+/**
+ * Two names that are each an identifier of one numbered series with
+ * different values (INC-017-D7T3, INC-020-D3T3; R-01, R-02) are two things,
+ * whatever spellings they share. An extraction lists an incident's title as
+ * its alias ("活动页白屏"), every team's incident of that title carries it, and
+ * the first such incident took the later ones' claims (11 of 210 incidents on
+ * the 10× benchmark). Only the two names count, so the order documents arrive
+ * in decides nothing. Codes outside a numbered series are never kept apart by
+ * this: vivoX100 and X100, ChatGPT-4 and GPT-4, FY24 and FY2024 may be one.
  */
 export function namesApartByCode(a: string, b: string): boolean {
-  const x = nameCode(a);
-  const y = nameCode(b);
-  return Boolean(x && y && codesDiffer(x, y));
+  const x = seriesCode(a);
+  const y = seriesCode(b);
+  return Boolean(x && y && x.prefix === y.prefix && (x.counter !== y.counter || x.rest !== y.rest));
 }
 
 /**

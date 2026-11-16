@@ -174,3 +174,35 @@ claims:
     expect(current.map((r) => r.statement)).toEqual(['R-07由钱博负责']);
   });
 });
+
+const ents = async (ctx: AppContext) => (await ctx.store.query<{ id: string; canonical_id: string | null }>(
+  `SELECT id, canonical_id FROM entities WHERE tx_to IS NULL ORDER BY id`)).map((r) => (r.canonical_id ? `${r.id}→${r.canonical_id}` : r.id)).sort();
+const subjects = async (ctx: AppContext) => (await ctx.store.query<{ subject: string; statement: string }>(
+  `SELECT COALESCE(e.canonical_id, e.id) AS subject, c.statement FROM claims c JOIN entities e ON e.id = c.subject_id WHERE c.tx_to IS NULL`)).map((r) => `${r.subject}:${r.statement}`).sort();
+const fm = (title: string, entities: string, claims = '') => `---\ntitle: ${title}\nentities:\n${entities}${claims ? `claims:\n${claims}` : ''}---\n${title}\n`;
+
+describe('codes of one kind', () => {
+  it('keeps apart only identifiers of one numbered series, and reads year and quarter forms as one', async () => {
+    const { namesApartByCode } = await import('../src/graph/resolve.js');
+    for (const [a, b] of [['X100', 'vivoX100'], ['GPT-4', 'ChatGPT-4'], ['CU2501', 'SHFE.CU2501'], ['24Q3', '2024Q3'], ['FY24', 'FY2024'], ['Model3', 'TeslaModel3'], ['H20', 'H100']]) {
+      expect(namesApartByCode(a, b), `${a} / ${b}`).toBe(false);
+    }
+    for (const [a, b] of [['INC-001-T1', 'INC-005-T3'], ['INC-001-T1', 'INC-001-D2T1'], ['R-01', 'R-02']]) expect(namesApartByCode(a, b), `${a} / ${b}`).toBe(true);
+  });
+
+  it('lands a code on the entity that carries exactly that code', async () => {
+    const ctx = await workspace('prefixed', {
+      'raw/docs/a.md': fm('a', '  - { name: vivoX100, type: product, aliases: ["X100"] }\n  - { name: ChatGPT-4, type: product, aliases: ["GPT-4"] }\n  - { name: SHFE.CU2501, type: product, aliases: ["CU2501"] }\n'),
+      'raw/docs/b.md': fm('b', '  - { name: X100, type: product }\n  - { name: GPT-4, type: product }\n  - { name: CU2501, type: product }\n'),
+    });
+    expect((await ents(ctx)).filter((e) => !['overview', 'wikilinks'].includes(e))).toEqual(['chatgpt-4', 'shfe.cu2501', 'vivox100'].sort());
+  });
+
+  it('lets a product code join the spelling it carries as an alias', async () => {
+    const ctx = await workspace('h20', {
+      'raw/docs/a.md': fm('a', '  - { name: H100, type: product }\n  - { name: Nvidia H20, type: product }\n'),
+      'raw/docs/b.md': fm('b', '  - { name: H20, type: product, aliases: ["Nvidia H20"] }\n'),
+    });
+    expect((await ents(ctx)).filter((e) => /h20|h100/.test(e))).toEqual(['h100', 'nvidia-h20']);
+  });
+});
