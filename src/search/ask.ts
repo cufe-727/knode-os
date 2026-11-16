@@ -158,8 +158,10 @@ export async function ask(
     route?: QuestionKind | 'auto';
     /** false: its searches record no hits (an evaluation answering against the index as built, docs/design/31 D3). */
     track?: boolean;
-    /** false: no second retrieval round however thin the first (docs/design/34 §2). */
+    /** false: no second retrieval round however thin the first; true: one whatever `retrieval.router.secondRound` says (docs/design/34 §2). */
     second?: boolean;
+    /** true / false: compute a set, count or value from the claims, whatever `retrieval.router.computedSets` says (docs/design/34 §1). */
+    computed?: boolean;
   } = {},
 ): Promise<AskResult> {
   const router = { ...defaultAskRouterConfig(), ...config.retrieval.router };
@@ -178,7 +180,8 @@ export async function ask(
     : await routeQuestion(question, { classifier: router.classifier, llm });
   // a set, a count or a value as of a date is computed from the claims, whichever route answers the rest
   const named = await namedEntities(store, question);
-  const computed = routed.kind === 'list' || routed.kind === 'aggregate' || routed.kind === 'lookup'
+  const computing = opts.computed ?? router.computedSets === true;
+  const computed = computing && (routed.kind === 'list' || routed.kind === 'aggregate' || routed.kind === 'lookup')
     ? await computeClaimSet(store, question, routed, named).catch(() => null)
     : null;
   const env: RouteEnv = { store, config, embedder, llm, question, opts, queryVector, router, routed, named, computed };
@@ -340,7 +343,7 @@ async function compose(env: RouteEnv, firstContexts: SearchResult[], firstRanked
   let contexts = firstContexts;
   let ranked = firstRanked;
   let routed = routedFirst;
-  if (!computed && routedFirst.kind !== 'timeline' && env.opts.second !== false) {
+  if (!computed && routedFirst.kind !== 'timeline' && (env.opts.second ?? env.router.secondRound !== false)) {
     const more = await secondRound(env.store, question, {
       named: env.named, contexts, facts: ranked, chain: routedFirst.kind === 'multihop' || isChainQuestion(question),
       queryVector: env.queryVector, model: env.embedder.model,

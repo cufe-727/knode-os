@@ -133,6 +133,11 @@ describe('ask with a second round', () => {
     expect(res.contexts.map((c) => c.path)).toContain('raw/docs/liwei-move.md');
     const off = await ask(store, defaultConfig(), embedder, llm, q, { queryVector: [1, 0, 0, 0], k: 1, second: false });
     expect(off.route.second).toBeUndefined();
+    // the workspace's switch, and the call over it
+    const config = defaultConfig();
+    config.retrieval.router = { ...config.retrieval.router!, secondRound: false };
+    expect((await ask(store, config, embedder, llm, q, { queryVector: [1, 0, 0, 0], k: 1 })).route.second).toBeUndefined();
+    expect((await ask(store, config, embedder, llm, q, { queryVector: [1, 0, 0, 0], k: 1, second: true })).route.second).toBeDefined();
     expect(off.contexts.map((c) => c.path)).not.toContain('raw/docs/liwei-move.md');
   });
 });

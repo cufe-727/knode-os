@@ -239,7 +239,7 @@ describe('ask with a computed set', () => {
 
   it('hands the model the computed lines and every row as a fact with its source, in one completion', async () => {
     const { llm, prompts } = recordingLlm();
-    const res = await ask(store, config, embedder, llm, 'How many incidents did Northwind Platform report?');
+    const res = await ask(store, config, embedder, llm, 'How many incidents did Northwind Platform report?', { computed: true });
     expect(prompts).toHaveLength(1);
     expect(res.route.computed).toMatchObject({ op: 'count', scope: 'Northwind Platform', items: 3 });
     expect(prompts[0]).toContain('# Computed from the claims\nScope: Northwind Platform.');
@@ -251,7 +251,7 @@ describe('ask with a computed set', () => {
 
   it('computes nothing for a question that asks for no set', async () => {
     const { llm, prompts } = recordingLlm();
-    const res = await ask(store, config, embedder, llm, 'What is Northwind Platform?');
+    const res = await ask(store, config, embedder, llm, 'What is Northwind Platform?', { computed: true });
     expect(res.computed).toBeUndefined();
     expect(res.route.computed).toBeUndefined();
     expect(prompts[0]).not.toContain('# Computed from the claims');

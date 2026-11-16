@@ -749,6 +749,13 @@ export interface AskRouterConfig {
   enumerateLimit: number;
   /** Relation hops a multi-hop answer walks at most. */
   maxHops: number;
+  /**
+   * Compute a list, count or "value as of" question's answer from the claims in code (docs/design/34 §1).
+   * Off by default until a model-backed run has checked it; absent: off.
+   */
+  computedSets?: boolean;
+  /** A second retrieval round when the first is thin (docs/design/34 §2). Absent: on. */
+  secondRound?: boolean;
 }
 
 export function defaultRerankConfig(): RerankConfig {
@@ -756,7 +763,7 @@ export function defaultRerankConfig(): RerankConfig {
 }
 
 export function defaultAskRouterConfig(): AskRouterConfig {
-  return { classifier: 'rules', enumerateLimit: 150, maxHops: 4 };
+  return { classifier: 'rules', enumerateLimit: 150, maxHops: 4, computedSets: false, secondRound: true };
 }
 
 export type DataSourceKind = 'mysql' | 'timescale' | 'duckdb' | 'http-json' | 'prometheus' | 'object';
