@@ -434,3 +434,28 @@ describe('back-reference links that no longer hold', () => {
     expect(await linked(ctx)).toBe(0);
   });
 });
+
+describe('who a back-reference credits', () => {
+  it('reads the fixer from the sentence, and 上期 only as a word', async () => {
+    const { fixerSpans, backReference } = await import('../src/graph/backrefs.js');
+    expect(fixerSpans('上周那起缓存击穿已由方杰修复，根因是参数填反了')).toContain('方杰');
+    expect(fixerSpans('方杰已修复上周发生的配置下发失败。')).toContain('方杰');
+    expect(fixerSpans('叶敏已修复2025年6月2日至6月8日发生的推送重复事故')).toContain('叶敏');
+    expect(fixerSpans("Last week's cache stampede was fixed by Fang Jie")).toContain('Fang Jie');
+    expect(fixerSpans('上周那起支付超时已修复，客户张三确认')).not.toContain('张三');
+    expect(backReference('王五称上期所的铜库存问题已解决')).toBeNull();
+    expect(backReference('上期那起缓存击穿已由方杰修复')?.term).toBe('缓存击穿');
+  });
+
+  it('links only the person who did the fixing', async () => {
+    const { linkBackReferences } = await import('../src/graph/backrefs.js');
+    const rep = (date: string, fm: string) => dated('平台组周报', date, fm);
+    const ctx = await workspace('fixer', {
+      'raw/docs/周报/平台组/w05.md': rep('2025-02-03', 'entities:\n  - { name: INC-001-T1, type: event }\nclaims:\n  - { subject: INC-001-T1, statement: INC-001-T1为P1级支付超时事故, type: event }\n'),
+      'raw/docs/周报/平台组/w06.md': rep('2025-02-10', 'entities:\n  - { name: 张三, type: person }\n  - { name: 客服部, type: organization }\nclaims:\n  - { subject: 客服部, statement: 上周那起支付超时已修复，客户张三确认, type: event }\n'),
+    });
+    const config = { review: { ...ctx.config.review, backReferences: { periodic: ['raw/docs/周报'] } } };
+    expect((await linkBackReferences(ctx.store, { config })).linked).toBe(0);
+    expect(await ctx.store.query(`SELECT 1 FROM relations WHERE tx_to IS NULL AND target_id = 'inc-001-t1'`)).toEqual([]);
+  });
+});

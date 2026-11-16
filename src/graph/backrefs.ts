@@ -32,7 +32,8 @@ import { nameCode } from './resolve.js';
  * claims there contain X and do not state it fixed; and the claim's own report
  * must not name such an event too (the fix may be this period's). Then the
  * people the claim names are linked to it (related_to, as an id'd fix line
- * links its fixer). None, or two candidates, link nothing.
+ * links its fixer) — only the person the sentence gives as the one who fixed
+ * it (fixerSpans), not anyone it names. None, or two candidates, link nothing.
  *
  * Each link is a scope of kind 'backref', keyed by the claim, a child of the
  * scope that carries the claim in its document: disposed with that document
@@ -46,7 +47,7 @@ import { nameCode } from './resolve.js';
  */
 
 /** "上周那起配置下发失败", "上周发生的登录失败事故", "last week's cache stampede": the description after the back-reference. */
-const BACKREF_ZH = /(?:上周|上一周|上个?星期|上期)(?:那起|那次|那个|那场|的|发生的|出现的|报告的)?\s*([\p{Script=Han}A-Za-z0-9]{2,20}?)(?:事故|故障|问题|事件)?(?=已|被|由|，|,|。|；|的?根因|的?原因|$)/u;
+const BACKREF_ZH = /(?:上周(?!期|末)|上一周|上个?星期|上期(?![所货]))(?:那起|那次|那个|那场|的|发生的|出现的|报告的)?\s*([\p{Script=Han}A-Za-z0-9]{2,20}?)(?:事故|故障|问题|事件)?(?=已|被|由|，|,|。|；|的?根因|的?原因|$)/u;
 const BACKREF_EN = /\blast week's ([A-Za-z][\w -]{2,40}?)\s+(?:was|has been|is)\b/i;
 const TOKEN = /[A-Za-z0-9][A-Za-z0-9._/-]*[A-Za-z0-9]/g;
 
@@ -59,6 +60,21 @@ const DESCRIBED_FIX_ZH = /([\p{Script=Han}A-Za-z0-9]{2,30}?)(?:事故|故障)(?:
 const DESCRIBED_FIX_ZH2 = /(?:修复|解决)(?:了)?([\p{Script=Han}A-Za-z0-9]{2,30}?)(?:事故|故障)/u;
 /** What a back-reference must say happened to the thing: a fix. */
 const FIXED = /修复|解决|排除|已恢复|\bfixed\b|\bresolved\b/i;
+
+/**
+ * The spans a sentence gives as whoever did the fixing: "已由方杰修复", "方杰已修复",
+ * "fixed by Fang Jie". A person counts only when one of these is their name:
+ * "上周那起支付超时已修复，客户张三确认" names 张三, but not as the fixer.
+ */
+export function fixerSpans(statement: string): string[] {
+  const text = statement.normalize('NFKC');
+  const out: string[] = [];
+  for (const m of text.matchAll(/(?:由|被)\s*([\p{Script=Han}A-Za-z·]{2,12}?)\s*(?:在[^，。,；;]{0,20}?)?(?:修复|解决|排除|处理)/gu)) out.push(m[1]);
+  for (const m of text.matchAll(/(?:^|[，,。；;\s])([\p{Script=Han}A-Za-z·]{2,12}?)\s*(?:已经|已|于[^，。,；;]{0,20}?)?(?:修复|解决|排除)了?/gu)) out.push(m[1]);
+  for (const m of text.matchAll(/\b(?:fixed|resolved)\s+by\s+([A-Z][\w.-]*(?:\s+[A-Z][\w.-]*){0,2})/g)) out.push(m[1]);
+  for (const m of text.matchAll(/\b([A-Z][\w.-]*(?:\s+[A-Z][\w.-]*){0,2})\s+(?:fixed|resolved)\b/g)) out.push(m[1]);
+  return [...new Set(out.map((x) => x.trim()))];
+}
 
 export interface BackReference {
   /** What the statement calls the earlier thing: 配置下发失败. */
@@ -320,9 +336,10 @@ export async function linkBackReferences(
       [ref.docId, [ref.subjectId, ...(ref.objectId ? [ref.objectId] : [])]],
     );
     const bare = (n: string) => n.replace(/[（(][^）)]*[）)]$/u, '').trim();
-    const filed = (id: string) => id === ref.subjectId || id === ref.objectId;
-    const said = (p: { name: string; aliases: string[] | null }) => [p.name, ...(p.aliases ?? [])].map(bare).some((n) => n.length >= 2 && ref.statement.includes(n));
-    const named = people.filter((p) => filed(p.id) || said(p));
+    // the person the sentence says did the fixing, not anyone it names
+    const spans = fixerSpans(ref.statement);
+    const fixer = (p: { name: string; aliases: string[] | null }) => [p.name, ...(p.aliases ?? [])].map(bare).some((n) => n.length >= 2 && spans.includes(n));
+    const named = people.filter((p) => fixer(p));
     if (named.length === 0) {
       trace(ref.claimId, 'names no person', ref.statement);
       continue;
