@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { defaultConfig, KnodeConfig } from '../src/config.js';
+import { askOptionsFromEnv } from '../src/eval/systems/knode.js';
 import { tier0Known } from '../src/graph/concepts.js';
 import { entityKeyKinds } from '../src/graph/normalize.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
@@ -524,6 +525,15 @@ describe('a Chinese question end to end (review item 11)', () => {
     expect(p).toMatch(/\[fact; set\] 宁德时代2025年上半年营收1789亿元 \(2025-08-01\) — raw\/docs\/r2\.md/);
     expect(p).not.toMatch(/\[fact; set\] 预计宁德时代2026年营收4500亿元/);
     expect(p).toMatch(/Left out: .*not stated as fact/);
+  });
+});
+
+describe('the evaluation can turn computed sets on (re-check item 7)', () => {
+  it('reads the two options a run passes to ask', () => {
+    expect(askOptionsFromEnv({})).toEqual({});
+    expect(askOptionsFromEnv({ KNODE_EVAL_ASK_COMPUTED: '1', KNODE_EVAL_ASK_NOW: '2025-11-07' })).toEqual({ computed: true, now: '2025-11-07' });
+    expect(askOptionsFromEnv({ KNODE_EVAL_ASK_COMPUTED: 'off' })).toEqual({ computed: false });
+    expect(() => askOptionsFromEnv({ KNODE_EVAL_ASK_NOW: 'last friday' })).toThrow(/YYYY-MM-DD/);
   });
 });
 
