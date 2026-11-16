@@ -21,7 +21,8 @@ import { enumerateClaims, typedColumns } from '../src/search/enumerate.js';
 import { parseRerankResponse, rerankResults } from '../src/search/rerank.js';
 import { classifyQuestion, questionRange, routeQuestion } from '../src/search/route.js';
 import { search } from '../src/search/search.js';
-import { chainOrder, walkRelations, walkTerms } from '../src/search/walk.js';
+import { chainOrder, stepsAsFacts, walkRelations, walkTerms } from '../src/search/walk.js';
+import { ordinalInQuestion, pickByOrder, placeEntities } from '../src/search/walk-order.js';
 import { catalogQuery } from '../src/store/catalog.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
 import type { SearchResult } from '../src/types.js';
@@ -380,6 +381,123 @@ describe('relation walk', () => {
     expect(walk.steps.filter((s) => s.hop === 1).map((s) => s.source)).toEqual(expect.arrayContaining(['钱勇']));
     // the group's six heavier incidents match as well, but the person who raised the risk still takes their own step
     expect(walk.steps.filter((s) => s.hop === 2).map((s) => `${s.source}→${s.target}`)).toContain('钱勇→INC-009-D2T1');
+  });
+});
+
+describe('ordering and meaning in the walk', () => {
+  // its own store: a division whose three groups the question names only by what they do, dated incidents of two
+  // of them, a level the week's report and the month's summary state differently, and a person with a project
+  let ws: Store;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'knode-walk-order-'));
+  const MODEL = 'fixture-walk-v1';
+  let n = 0;
+  const entity = async (id: string, name: string, type: string, vector?: number[]) => {
+    await ws.query(`INSERT INTO entities (id, name, type, mention_count, aliases, description) VALUES ($1, $2, $3, 1, '[]'::jsonb, '')`, [id, name, type]);
+    if (vector) await ws.query(`INSERT INTO entity_embeddings (entity_id, fold_sha, model, embedding) VALUES ($1, '', $2, $3::${VECTOR_TYPE})`, [id, MODEL, toVectorLiteral(vector)]);
+  };
+  /** A document of one chunk mentioning `mentions`, with one claim per [subject, statement, date]. */
+  const doc = async (content: string, mentions: string[], claims: [string, string, string | null][] = []) => {
+    const id = `o${++n}`;
+    await ws.query(`INSERT INTO documents (id, path, root, title, sha256, bytes, status) VALUES ($1, $2, 'docs', $1, $1, 10, 'indexed')`, [`d-${id}`, `raw/docs/${id}.md`]);
+    await ws.query(`INSERT INTO chunks (id, document_id, seq, content, token_count, tsv) VALUES ($1, $2, 0, $3, 3, to_tsvector('simple', $3))`, [`c-${id}`, `d-${id}`, content]);
+    for (const e of mentions) await ws.query(`INSERT INTO entity_mentions (entity_id, chunk_id, document_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, [e, `c-${id}`, `d-${id}`]);
+    for (const [subject, statement, date] of claims) {
+      await ws.query(
+        `INSERT INTO claims (id, subject_id, type, statement, status, kind, valid_from, chunk_id, evidence_count, tx_from) VALUES ($1, $2, 'event', $3, 'fact', 'fact', $4, $5, 1, now())`,
+        [`cl-${id}-${subject}`, subject, statement, date ? `${date}T00:00:00Z` : null, `c-${id}`],
+      );
+    }
+    return `d-${id}`;
+  };
+  const relate = async (source: string, target: string, description: string, docId: string, weight = 1, type = 'related_to') =>
+    ws.query(`INSERT INTO relations (id, source_id, target_id, type, description, weight, document_id) VALUES ($1, $2, $3, $4, $5, $6, $7)`, [`r${++n}`, source, target, type, description, weight, docId]);
+
+  beforeAll(async () => {
+    fs.mkdirSync(path.join(dir, '.knode'), { recursive: true });
+    ws = await Store.open(dir, 4);
+    await ws.indexing;
+    await entity('d2', '第二事业部', 'organization');
+    // what the knowledge base says of each group places it nearest the question's "管基础设施的那个组"
+    await entity('plat', '二部平台组', 'organization', [0.95, 0.31, 0, 0]);
+    await entity('pay', '二部支付组', 'organization', [0.31, 0.95, 0, 0]);
+    await entity('grow', '二部增长组', 'organization', [0.31, 0, 0.95, 0]);
+    for (const g of ['plat', 'pay', 'grow']) await relate(g, 'd2', '该组隶属于第二事业部。', await doc('组织架构', [g, 'd2']), 10, 'part_of');
+    // the platform group's incidents: two P1 of 2025, one the week calls P2 and the month's summary P1, one P1 of 2024, one P1 nothing dates
+    const incident = async (id: string, name: string, group: string, week: string | null, level: string, summary?: string) => {
+      await entity(id, name, 'event');
+      const d = await doc(`${name}（${level}）`, [id, group], [[id, `${name}事故等级为${level}。`, week]]);
+      await relate(id, group, `${name}是该组报告的事故。`, d);
+      if (summary) await doc(`月报：${name}`, [id], [[id, summary, null]]);
+    };
+    await incident('i1', 'INC-001-D2T1', 'plat', '2025-02-03', 'P1');
+    await incident('i2', 'INC-002-D2T1', 'plat', '2025-03-10', 'P2', 'INC-002-D2T1的级别为P1。');
+    await incident('i3', 'INC-003-D2T1', 'plat', '2025-04-28', 'P1');
+    await incident('i4', 'INC-099-D2T1', 'plat', '2024-11-10', 'P1');
+    await incident('i5', 'INC-005-D2T1', 'plat', null, 'P1');
+    await incident('p1', 'INC-010-D2T2', 'pay', '2025-01-06', 'P1');
+    await incident('p2', 'INC-011-D2T2', 'pay', '2025-02-10', 'P1');
+    await entity('qian', '钱勇', 'person');
+    await entity('lin', '林婷', 'person');
+    await entity('proj', '司命系统', 'project');
+    // the fix is stated in the report of its week, and restated by a later summary, which is the relation's own source
+    await doc('本周钱勇修复了INC-003-D2T1。', ['qian', 'i3'], [['qian', '钱勇修复了INC-003-D2T1。', '2025-05-05']]);
+    await relate('qian', 'i3', '钱勇修复了INC-003-D2T1。', await doc('季度回顾：钱勇修复INC-003-D2T1', ['qian', 'i3'], [['qian', '季度回顾', '2025-06-30']]));
+    await relate('lin', 'i1', '林婷修复了INC-001-D2T1。', await doc('林婷修复了INC-001-D2T1。', ['lin', 'i1']));
+    await relate('lin', 'p2', '林婷修复了INC-011-D2T2。', await doc('林婷修复了INC-011-D2T2。', ['lin', 'p2']));
+    // a person 负责 an incident (the heavier relation) and a project
+    await relate('qian', 'i1', '钱勇负责修复INC-001-D2T1。', await doc('钱勇负责修复INC-001-D2T1。', ['qian', 'i1']), 5);
+    await relate('qian', 'proj', '钱勇负责司命系统。', await doc('钱勇负责司命系统。', ['qian', 'proj']), 1);
+  });
+
+  afterAll(async () => {
+    await ws?.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('reads what a question orders: the Nth, the latest, the one before, over a period, of a severity', () => {
+    expect(ordinalInQuestion('第二事业部管基础设施的那个组今年第二起最严重一档的故障，是谁处理好的？')).toMatchObject({ kind: 'nth', n: 2, period: { unit: 'year', year: null }, severest: true, level: null });
+    expect(ordinalInQuestion('本月最近一次P1事故是谁修复的？')).toMatchObject({ kind: 'last', period: { unit: 'month' }, level: 1 });
+    expect(ordinalInQuestion('上一起事故的原因是什么？')).toMatchObject({ kind: 'previous' });
+    expect(ordinalInQuestion('Who fixed the third incident of the year?')).toMatchObject({ kind: 'nth', n: 3, period: { unit: 'year' } });
+    expect(ordinalInQuestion('2025年第十二起事故')).toMatchObject({ n: 12, period: { unit: 'year', year: 2025 } });
+    expect(ordinalInQuestion('提出风险R-13的人修复过一起由客户升级的事故')).toBeNull();
+  });
+
+  it('dates and levels a candidate by the report of the event, and says why it cannot order', async () => {
+    const placed = await placeEntities(ws, ['i1', 'i2', 'i5']);
+    // the week said P2; the month's summary, undated, said P1
+    expect(placed.get('i2')).toMatchObject({ date: '2025-03-10', level: 2 });
+    expect(placed.get('i5')).toMatchObject({ date: null, level: 1 });
+    const ask = ordinalInQuestion('今年第三起最严重一档的故障')!;
+    const pick = pickByOrder(ask, [...(await placeEntities(ws, ['i1', 'i2', 'i3', 'i4', 'i5'])).values()]);
+    expect(pick.picked).toBeNull();
+    expect(pick.note).toMatch(/not ordered: 第三起 asks for the 3rd, 2 P1 candidates are dated in 2025 \(1 have no date\)/);
+  });
+
+  it('takes the Nth of the group the question describes, by date, and walks on from it', async () => {
+    const q = '第二事业部管基础设施的那个组今年第二起最严重一档的故障，是谁处理好的？';
+    const walk = await walkRelations(ws, q, ['d2'], { maxHops: 3, queryVector: [1, 0, 0, 0], model: MODEL });
+    const hop2 = walk.steps.filter((s) => s.hop === 2);
+    // of the platform group's 2025 P1 incidents (INC-001, INC-003; INC-002 was P2 in its week, INC-099 is of 2024, INC-005 undated), the second
+    const picked = hop2.find((s) => s.source === 'INC-003-D2T1')!;
+    expect(picked.order).toMatch(/^the 2nd of 2 P1 dated in 2025, by date \(2025-04-28\); 1 without a date left out/);
+    expect(hop2.map((s) => s.source)).not.toContain('INC-001-D2T1');
+    expect(hop2.map((s) => s.source)).toContain('INC-011-D2T2');
+    expect(walk.ordering?.picks).toHaveLength(2);
+    expect(walk.steps.filter((s) => s.hop === 3).map((s) => `${s.source}→${s.target}`)).toContain('钱勇→INC-003-D2T1');
+    expect(stepsAsFacts([picked])[0].statement).toContain('[picked as the 2nd of 2 P1');
+    // the group the question describes leads: its chain's passages come first
+    expect(walk.bridges[0].trace?.bridgeEntities).toContain('二部平台组');
+    // the fix's passage is the report of its week, not the later summary the relation was read from
+    const fix = walk.bridges.find((b) => b.trace?.bridgeEntities?.includes('钱勇'))!;
+    expect(fix.content).toBe('本周钱勇修复了INC-003-D2T1。');
+  });
+
+  it('walks to the kind of thing the last sentence asks for', async () => {
+    const walk = await walkRelations(ws, '（第二事业部）钱勇名下的那个项目是在哪一周投产的？', ['qian', 'd2'], { maxHops: 1 });
+    const fromQian = walk.steps.filter((s) => s.source === '钱勇').map((s) => s.target);
+    // 名下 reads 负责 in both; the heavier relation leads to an incident, the question asks for a project
+    expect(fromQian[0]).toBe('司命系统');
   });
 });
 

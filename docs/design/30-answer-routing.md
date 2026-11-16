@@ -62,7 +62,41 @@ Every branch takes its best step and the five best of the rest join it (five on 
 
 `ask` then answers from a SAG search (design 04: chunk → entity → chunk expansion) plus those bridge passages. The top eight are the search's first four and the walk's first four, then the rest of each up to twelve: a chain's later hops are rarely what a search of the whole question finds. The walked relations are listed first among the facts ("Nimbus Freight acquired Borealis Logistics: … — raw/docs/deal.md"), with the claims about every entity reached. Still one completion: the walk needs no model, because its scoring is the question's own terms and the graph around the named entities.
 
-What the walk cannot do: pick "the Nth P1 of the year", which is an ordering and not a relation, or "the group that runs infrastructure", which matches no group's relations. It also cannot cross a rename or a link that extraction never made. Measured 2026-11-15 on a copy of the 10× reports index (no model, cached question vectors, the ~18 questions per type that have vectors): deep-hop hit@8 0.22 → 0.72 and gold recall over all contexts 0.13 → 0.26. Bridge entities named in the facts (customer codes left out) went 0.49 → 0.73, and complete chains 1 → 10 of 18. Six of the remaining eight lack a link in the index itself. There is no fixer relation for INC-001-D6T1 or INC-015-D6T3. No relation joins the R-25 / R-27 / R-39 raisers to the incidents they fixed. INC-003-D10T1 and INC-012-D10T2 share no customer. Of the two walkable ones, d10-h5r-C0 starts from R-109, whose only relation is its follower, not its raiser, and d5-h5r-C0 misses the second incident. Nonlexical-hop went 0.15 → 0.44 bridges and 0 → 5 complete chains, but hit@8 stayed 0.06: from the division alone the walk cannot tell which group or which incident is meant. Every other question type's contexts, facts and route are byte-identical. At `maxHops` 3, deep-hop gets 0.67 hit@8 and 6 of 18 chains: the customer questions need four hops.
+A first measurement (2026-11-15, the copy of the run's 10× index): deep-hop hit@8 0.22 → 0.72, complete chains 1 → 10 of 18; nonlexical-hop 0 → 5 complete chains, but hit@8 stayed at 0.06. From the division alone the walk could not tell which group or which incident was meant.
+
+### 3.1 Non-lexical hops (added 2026-11-15)
+
+A non-lexical question names only the division and describes the rest: "第一事业部管基础设施的那个组今年第二起最严重一档的故障，是谁处理好的？此人曾预警过一个隐患，眼下是谁在盯着那个隐患？". The reports never say 基础设施, 收款 or 拉新, so no term matches the group. "第二起" is an ordering over dated events, not a relation. Four additions answer it, all in the walk (`src/search/walk.ts`, `src/search/walk-order.ts`):
+
+- **An entity described, not named.** `ask` passes the question's embedding and model (`multihopAnswer`, one line). Among the relations of one type from one entity (a division's three `part_of` groups), a far end whose entity embedding (name, type, aliases, description) lies above its siblings' mean cosine to the question gains one point per standard deviation. On the benchmark the nearest group is the described one in 13 of 17 divisions, with small margins, so this is a preference, not a filter. It also orders the chains, so the described group's chain gives the first passages.
+- **An ordering step.** `ordinalInQuestion` reads "第N起/个/次…", "最近/最新…", "最早/首…", "上一起/前一次" and "the first … / the latest / the one before". It also reads the period around it ("今年 / this year", "本月 / this month", an explicit year), "最严重 / most severe" and a named level (P1, SEV2). The first hop at which one entity leads to two or more of the noun the ordinal is about (the first predicate family after it: 故障 → 事故) is ordered. Each such branch keeps the one the question names and drops the others it ordered; the step carries the note ("[picked as the 2nd of 4 P1 dated in 2025, by date (2025-04-28)]"), and so does its fact.
+  - **Dates:** a candidate's date is the earliest its own claims state, else the earliest start of its relations, else the date of the earliest document that mentions it. A document's date is its own, or the earliest its claims state.
+  - **Levels:** a candidate's level is the one its earliest claim states, dating an undated claim by its document. The reports contradict themselves: "本周新增P2事故INC-004-T1" in the week, "级别为P1" in the month's summary, so the week wins.
+  - **Periods:** "今年" is the latest year the candidates are dated in; the relative words are not read against today.
+  - **Missing dates:** a candidate with no date is left out of the order and counted in the note. When fewer remain than the position asks for, nothing is picked: the note says "not ordered: 第三起 asks for the 3rd, 2 P1 candidates are dated in 2025 (1 have no date)", and the walk goes on as if the question had not ordered.
+- **The kind of thing the question ends at.** The last clause, split at sentence ends and commas but not at a dash, may name an entity type: 项目 → project; 组 / 团队 → organization; 事故 / 故障 / 事件 → event. The words come from the ontology's type labels plus these nouns. A far end of that type then holds the cue like a term. "此人名下的那个项目" then reaches 司命系统 rather than the heavier incident the person "负责修复". A person is never cued, because nearly every chain asks 谁. Cues from every clause were measured and pull early hops toward later clauses (deep-hop 10 → 6 chains).
+- **The passage that states a hop:** of the chunks mentioning both ends, the one in the earliest dated document, the relation's own document first among equals. That is the report of the week it happened, not a monthly summary restating it. The relation's own document alone (v20 relation sources) did worse: it is often the summary.
+
+Tried and dropped, measured on the same copy:
+- The ontology's relation-type labels and synonyms (属于, 加入, 任职…) added to the scored text: no gain, one deep-hop question worse. Most relations here are `related_to`.
+- Matching the relation's wording by meaning, through the best cosine of the question to the claims that join the same two entities (70% of relations have one): deep-hop complete chains 11 → 9.
+- The predicate families (处理好 / 修复 …) stay the wording match.
+
+**Measured 2026-11-15.** Set-up: a fresh no-model rebuild of the 10× workspace from its stored extractions (`src/bench/replay-build.ts` on main 7f44c8f), given the run's own bge-m3 vectors: chunks from the run's vector cache by content, and 704 of 806 entities and 16,865 of 16,874 claims from the run's index by name and statement. Then `ask()` with no model and the cached question vectors, ~18 questions per type. hit@8 is a gold document among the first eight contexts; gold-in-contexts is gold recall over all contexts; a chain is complete when every bridge entity (customer codes left out) is named in the facts.
+
+| type | hit@8 | gold in contexts | bridges named | chains complete |
+|---|---|---|---|---|
+| deep-hop, main | 0.78 | 0.28 | 0.77 | 10 / 18 |
+| deep-hop, this change | **0.89** | **0.32** | **0.84** | **11 / 18** |
+| nonlexical-hop, main | 0.11 | 0.08 | 0.37 | 5 / 18 |
+| nonlexical-hop, this change | **0.56** | **0.27** | **0.81** | **12 / 18** |
+
+All 196 questions of the other eleven types have byte-identical contexts, facts and route. The walk alone (same process, median of 3 runs) takes ~155 ms and 13–16 statements per question, against ~20 ms and 6–7 on main. Most of the increase is the passage choice (the co-mention read and the document dates) and the meaning read per hop. The whole `ask` measured 250–285 ms against 133–185 ms, but under a machine load that also moved the unchanged types from 188 to 272 ms.
+
+Where the 13 incomplete chains stop:
+- **Extraction (8 chains).** No fix relation INC-007-D2T1—林婷, 陈平—INC-003-D3T1, INC-001-D6T1—任杰. No "raised" relation for 方艳—R-45, 汤婷—R-58 or 尹婷—R-106: the reports' extracted relations only say who follows them. No customer shared by INC-003-D4T1 and INC-012-D4T2, or by INC-003-D10T1 and INC-012-D10T2.
+- **Entity resolution (3 chains).** Incident codes of different divisions are merged: INC-017-D6T3 into INC-017-D7T3, INC-010-D10T2 into the concept 退款卡单. 九部增长组's incident list holds INC-015-D7T3 and INC-017-D7T3, so its "second P1" is the wrong one.
+- **The walk (2 chains).** The customer's second incident among its ~40 is missed in h5r-C0 and d3-h5r-C0. h5r-C0 was complete on main: there the meaning preference among the customer's many incidents outweighs the division anchor. Capping it at one point measured the same in total.
 
 ## 4. Fusion: optional rerank, current state
 

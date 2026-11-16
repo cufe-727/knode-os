@@ -282,7 +282,7 @@ async function multihopAnswer(env: RouteEnv): Promise<AskResult> {
   const named = await namedEntities(store, question);
   const [retrieved, walk] = await Promise.all([
     search(store, embedder, question, { k, mode: 'sag', heat: config.heat, sag: config.retrieval.sag, rerank: config.retrieval.rerank, queryVector, track: opts.track }),
-    walkRelations(store, question, named, { maxHops: router.maxHops }),
+    walkRelations(store, question, named, { maxHops: router.maxHops, queryVector, model: embedder.model }),
   ]);
   const seen = new Set(retrieved.map((r) => r.chunkId));
   // the passages that state the hops share the top of the context with the search: a chain's later hops are
