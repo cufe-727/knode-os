@@ -366,6 +366,20 @@ describe('the rest of the review (item 10)', () => {
   });
 });
 
+describe('a Chinese question end to end (review item 11)', () => {
+  it('puts the value as of a day, its sources and what it left out before the model, and no forecast as a fact', async () => {
+    const { llm, prompts } = recordingLlm();
+    const res = await ask(store, withRouter({ computedSets: true, computedBudgetMs: 60_000 }), embedder, llm, '截至2025年12月31日，宁德时代的营收是多少？');
+    expect(res.route.computed).toMatchObject({ op: 'value', scope: '宁德时代' });
+    const p = prompts[0];
+    expect(p).toContain('# Computed from the claims');
+    expect(p).toContain('Value as of 2025-12-31: 1789亿元');
+    expect(p).toMatch(/\[fact; set\] 宁德时代2025年上半年营收1789亿元 \(2025-08-01\) — raw\/docs\/r2\.md/);
+    expect(p).not.toMatch(/\[fact; set\] 预计宁德时代2026年营收4500亿元/);
+    expect(p).toMatch(/Left out: .*not stated as fact/);
+  });
+});
+
 describe('the switches', () => {
   it('computes no set unless the workspace or the call turns computed sets on', async () => {
     const q = '宁德时代有哪些客户？';
