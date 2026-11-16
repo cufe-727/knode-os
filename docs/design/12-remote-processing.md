@@ -194,8 +194,13 @@ processing is started, as embedding does now.
 
   **Since 2026‑11‑15 (src/search/search.ts `vectorSearch`).** The same effect starved search of sources where
   generated pages are the nearest vectors, so a search's vector statement turns on pgvector's iterative index scan
-  for itself (`hnsw.iterative_scan = relaxed_order`, with `hnsw.max_scan_tuples` set to the search's budget): the walk
-  goes on until `k` rows pass the filter. That scan exists from pgvector 0.8.0. What decides is the **library** the
+  for itself (`hnsw.iterative_scan = relaxed_order`, with `hnsw.max_scan_tuples` set to 2,000): the walk goes on
+  until `k` rows pass the filter. Since the same day it does so only where it must: one walk of the nearest 40
+  chunks serves both sides, and the walk is carried on for the sources only when those 40 hold fewer than `k` of
+  them. Carried on for each side, it made a search three to five times slower on a copy of the finance index
+  (562,563 chunks, an eighth of them generated pages, seldom among the nearest): 192 to 272 ms at the median with
+  nothing in memory, against 76 to 81 before any of this and 48 to 56 now. No server setting is involved, and
+  none needs changing. That scan exists from pgvector 0.8.0. What decides is the **library** the
   server has loaded, not `pg_extension.extversion`: knode-os asks whether the setting exists
   (`current_setting('hnsw.iterative_scan', true)`), once per store, and `serve` logs one line per workspace it opens
   saying which behaviour is in effect and why (`describeVectorScan`). knode-os never alters the extension. What an
