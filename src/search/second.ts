@@ -1,7 +1,7 @@
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { SearchResult } from '../types.js';
 import { factsForQuestion, QuestionFact } from './facts.js';
-import { keywordTerms, termCount } from './search.js';
+import { CJK_QUERY_STOP, keywordTerms, LATIN_QUERY_STOP, termCount } from './search.js';
 
 /**
  * A second retrieval round when the first is thin (docs/design/34 §2).
@@ -13,13 +13,18 @@ import { keywordTerms, termCount } from './search.js';
  * claims or passages came back gets nothing about it at all. Here, without a
  * model call:
  *
- *   the test    a chain question (route.ts `isChainQuestion`, or routed
- *               multihop): one round answered steps it asks one after another;
- *               a named entity no fact is about and no passage mentions; or
- *               half the words of the question in none of the passages and
- *               facts. In each case there must be something to look further
- *               from: the uncovered named entities, or entities the first
- *               round reached that the question does not name
+ *   the test    a named entity none of whose spellings a fact is about or
+ *               a passage mentions or writes; half a lookup's words in none
+ *               of the passages and facts; a chain question (route.ts
+ *               `isChainQuestion`, or routed multihop) missing a word, or
+ *               whose step — the entity its first round reached — has no
+ *               passage or fact of its own yet. Words are the segmenter's
+ *               (`questionWords`), less stop words, interrogatives and the
+ *               kind of answer they ask for ("哪家公司"): never pairs of
+ *               characters across a word boundary. There must be something
+ *               to look further from: the uncovered named entities, or
+ *               entities the first round reached that the question does not
+ *               name
  *   the round   one, at most: the passages that mention those entities — the
  *               ones that mention most of them and hold most of the missing
  *               words first, nearness to the question breaking ties — and the
@@ -47,8 +52,58 @@ const BRIDGES = 4;
 const CANDIDATES = 240;
 /** Mentions of the entities looked from read at most, before the candidates are ranked: a hub has thousands. */
 const POOL = 2000;
-/** Characters that make a CJK pair a piece of grammar, not a word ("的人", "复过", "那起"). */
-const FUNCTION_CHARS = /[的了过是在有和与及那这它他她其一被由把将又也都还就人个位些此该吗呢么哪谁几什]/;
+/** The word segmenter the search's bridge terms use (search/bridge.ts). */
+const SEGMENTER = new Intl.Segmenter('zh', { granularity: 'word' });
+/** Longest run of characters the segmenter cut one by one kept as one word (a name it does not know). */
+const UNKNOWN_RUN_MAX = 6;
+/** Words that ask, or point back or at now, rather than name what is asked about. */
+const ASKING = new Set([
+  '哪里', '哪儿', '哪个', '哪家', '哪位', '哪些', '哪一', '什么', '怎么', '怎样', '如何', '为什么', '为何', '多少', '几个', '是否', '现在', '目前', '当前', '如今', '后来', '此人', '这个', '那个', '情况',
+  'who', 'whom', 'whose', 'what', 'where', 'when', 'which', 'why', 'how', 'now', 'currently', 'today', 'person', 'people', 'one', 'that', 'this', 'they', 'them', 'their',
+]);
+/** An interrogative whose next word is the kind of answer asked for ("哪家公司", "which team"), not a word the passages must hold. */
+const ASKS_FOR = /^(?:哪|哪家|哪个|哪位|哪些|哪一|什么|啥|which|what)$/i;
+/** Characters of grammar: they break a run of characters the segmenter cut one by one, and a word made only of them is no word ("到了", "的人"). */
+const GRAMMAR = /^[的了过是在有和与及那这它他她其被由把将又也都还就人个位些此该吗呢么到着得地对从向给于为等之所以而且但或并]+$/;
+/** Measure characters between an interrogative and what it asks for ("哪|家|公司", "几|个|人"). */
+const MEASURE = /^[家个位名种条项些起件只台座次]$/;
+
+/** The question's words: latin words and the segmenter's CJK words, less stop words, interrogatives and what they ask for. */
+export function questionWords(question: string): string[] {
+  const out: string[] = [];
+  let skipNext = false;
+  const push = (w: string) => {
+    const lower = w.toLowerCase();
+    if (ASKS_FOR.test(lower)) { skipNext = true; return; }
+    if (skipNext) { skipNext = false; return; }
+    if (ASKING.has(lower) || CJK_QUERY_STOP.has(lower) || LATIN_QUERY_STOP.has(lower) || GRAMMAR.test(lower)) return;
+    if (/^[a-z0-9-]+$/i.test(w) ? w.length < 3 : w.length < 2) return;
+    out.push(lower);
+  };
+  for (const m of question.matchAll(/[一-鿿㐀-䶿]+|[A-Za-z][A-Za-z0-9-]*|\d+/g)) {
+    const run = m[0];
+    if (!/[一-鿿㐀-䶿]/.test(run)) { push(run); continue; }
+    // the characters the segmenter cut one by one, kept together as one word (a name it does not know) until grammar
+    let singles = '';
+    const flush = () => {
+      if (singles.length >= 2 && singles.length <= UNKNOWN_RUN_MAX) push(singles);
+      singles = '';
+    };
+    for (const { segment } of SEGMENTER.segment(run)) {
+      if (segment.length === 1) {
+        if (ASKS_FOR.test(segment)) { flush(); push(segment); continue; }
+        if (skipNext && MEASURE.test(segment)) continue;
+        if (GRAMMAR.test(segment)) { flush(); continue; }
+        singles += segment;
+        continue;
+      }
+      flush();
+      push(segment);
+    }
+    flush();
+  }
+  return [...new Set(out)];
+}
 
 export interface SecondRound {
   /** Why it ran: the named entities nothing was about, the words nothing held, the entities it looked from. */
@@ -65,10 +120,10 @@ interface FactLike { subject: string; object?: string | null; statement: string;
 export function missingTerms(question: string, names: string[], text: string): string[] {
   const hay = text.toLowerCase();
   const nameText = names.join(' ').toLowerCase();
-  return keywordTerms(question)
+  return questionWords(question)
     .filter((t) => !nameText.includes(t))
-    .filter((t) => !(/^[一-鿿]{2}$/.test(t) && FUNCTION_CHARS.test(t)))
-    .filter((t) => termCount(hay, t) === 0);
+    // a word held, or its singular ("incidents" / "incident")
+    .filter((t) => !hay.includes(t) && !(/^[a-z]{4,}s$/.test(t) && hay.includes(t.slice(0, -1))));
 }
 
 /**
@@ -113,10 +168,13 @@ export async function secondRound(
     .map((g) => g.find((r) => r.id === r.root) ?? g[0]);
   const names = namedRows.flatMap(namesOf);
   const missing = missingTerms(question, names, text);
-  // thin: a named entity came back with nothing; or words the question asks are nowhere — any of a chain's (one
-  // round took at once the steps it asks one after another), half of a lookup's
-  const thin = uncovered.length > 0 || (missing.length > 0 && (opts.chain || missing.length * 2 >= Math.max(1, keywordTerms(question).length)));
-  if (!thin) return null;
+  // thin: a named entity came back with nothing; half a lookup's words are nowhere; a chain misses a word, or its
+  // step — the entity its first round reached — has no passage or fact of its own yet (only the claim that led to it)
+  const asked0 = questionWords(question).filter((t) => !names.join(' ').toLowerCase().includes(t));
+  let thin = uncovered.length > 0 || (missing.length > 0 && (opts.chain || missing.length * 2 >= Math.max(1, asked0.length)));
+  let stepCheck = false;
+  if (!thin && opts.chain) stepCheck = true;
+  else if (!thin) return null;
 
   // what to look further from: the uncovered named entities, and the entities the first round reached — its facts
   // are about, its passages mention — that the question does not name
@@ -142,6 +200,13 @@ export async function secondRound(
     .filter((r) => r.docs > 0 && r.docs <= (missing.length ? BRIDGE_DOCS_WORDED : BRIDGE_DOCS) && !names.includes(r.name))
     .sort((a, b) => (weight.get(b.name) ?? 0) - (weight.get(a.name) ?? 0) || a.docs - b.docs || a.id.localeCompare(b.id))
     .slice(0, BRIDGES);
+  if (stepCheck) {
+    // the chain's step: the reached entity weighed most; it is covered when a passage mentions it or a fact is about it
+    const step = [...reached].filter((r) => !names.includes(r.name))
+      .sort((a, b) => (weight.get(b.name) ?? 0) - (weight.get(a.name) ?? 0) || a.id.localeCompare(b.id))[0];
+    if (!step || step.passages > 0 || facts.some((f) => f.subject === step.name)) return null;
+    thin = true;
+  }
   const common = new Set(bridges.filter((b) => b.docs > BRIDGE_DOCS).map((b) => b.id));
   // an uncovered named entity is looked from through every spelling; a hub among them, with no vector to rank its
   // passages by, only through passages holding a missing word

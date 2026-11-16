@@ -103,11 +103,19 @@ afterAll(async () => {
 
 describe('the missing words', () => {
   it('are the question\'s words no passage or fact holds, never a piece of grammar or a name it gives', () => {
-    const missing = missingTerms('提出风险R-03的人后来调到了哪个组？', ['R-03'], '方杰提出风险R-03');
-    expect(missing).toContain('调到');
-    expect(missing).not.toContain('的人');
-    expect(missing).not.toContain('提出');
-    expect(missingTerms('Which team did Fang Jie transfer to?', ['Fang Jie'], 'Fang Jie raised R-03')).toEqual(expect.arrayContaining(['team', 'transfer']));
+    const missing = missingTerms('提出风险R-03的人后来负责哪个项目的验收？', ['R-03'], '方杰提出风险R-03');
+    expect(missing).toEqual(expect.arrayContaining(['负责', '验收']));
+    // grammar, a word held, a back-pointer, what 哪个 asks for
+    for (const w of ['的人', '提出', '后来', '项目']) expect(missing).not.toContain(w);
+    expect(missingTerms('Which team did Fang Jie transfer to?', ['Fang Jie'], 'Fang Jie raised R-03')).toContain('transfer');
+  });
+
+  it('are words the segmenter cuts, not pairs of characters across a word boundary; what an interrogative asks for is no missing word', () => {
+    // "度毛" and "家公" straddle two words; 公司 is what 哪家 asks for; 哪里 / 多少 / now / where ask, they are not asked about
+    expect(missingTerms('宁德时代三季度毛利率是多少？', ['宁德时代'], '宁德时代第三季度的毛利率为24%')).toEqual([]);
+    expect(missingTerms('曾毓群是哪家公司的董事长？', ['曾毓群'], '曾毓群任宁德时代董事长')).toEqual([]);
+    expect(missingTerms('CATL的海外工厂在哪里？', ['CATL'], 'CATL的海外工厂位于匈牙利')).toEqual([]);
+    expect(missingTerms('Who raised risk R-07, and where is that person now?', ['R-07'], 'Li Wei raised risk R-07')).toEqual([]);
   });
 });
 
@@ -156,6 +164,22 @@ describe('the second round', () => {
     expect(worded!.chunks.length).toBeLessThanOrEqual(SECOND_CHUNKS);
   });
 
+  it('gives an ordinary lookup whose passages hold its words no round, however its words split into pairs', async () => {
+    const r = await secondRound(store, 'Orion三季度毛利率是多少？', {
+      named: ['orion'], contexts: [result('orion-2', 'Orion第三季度的毛利率为24%')], facts: [], chain: false,
+    });
+    expect(r).toBeNull();
+  });
+
+  it('gives a chain no round when its first round already holds the step\'s own passages and no word is missing', async () => {
+    const r = await secondRound(store, 'Who raised risk R-07, and where is that person now?', {
+      named: ['r-07'],
+      contexts: [result('raised7', 'Li Wei raised risk R-07 on the payment gateway.'), result('liwei-move', 'Li Wei moved over to the Growth group.')],
+      facts: [{ subject: 'R-07', object: 'Li Wei', statement: 'R-07 was raised by Li Wei' }], chain: true,
+    });
+    expect(r).toBeNull();
+  });
+
   it('does not run when the first round holds what the question asks about', async () => {
     const r = await secondRound(store, 'When did Orion launch?', {
       named: ['orion'], contexts: [result('orion-2', 'Orion launched in week 32.')], facts: [], chain: false,
@@ -166,20 +190,16 @@ describe('the second round', () => {
 
 describe('ask with a second round', () => {
   const llm = { enabled: false } as unknown as LlmClient;
-  it('adds what the second round found to the contexts and says why it ran; off when asked', async () => {
+  it('runs no second round for a walked chain whose first round already reached the step', async () => {
     const q = 'Who raised risk R-07, and where is that person now?';
     // routed to the walk, the first round runs the lookup route's graph search as well (docs/design/30 §3), which
-    // reaches the passage on its own; the second round still runs from Li Wei, and adds only what the first lacks
+    // reaches Li Wei's passages on its own: nothing is missing, so no round, and turning it off changes nothing
     const res = await ask(store, defaultConfig(), embedder, llm, q, { queryVector: [1, 0, 0, 0], k: 1 });
     expect(res.route.kind).toBe('multihop');
-    // it looks from the step's person (the passage this fixture's top hit adds may bring other entities to look from)
-    expect(res.route.second).toMatchObject({ from: expect.arrayContaining(['Li Wei']) });
     expect(res.contexts.map((c) => c.path)).toContain('raw/docs/liwei-move.md');
-    const second = res.route.second!.chunks;
+    expect(res.route.second).toBeUndefined();
     const off = await ask(store, defaultConfig(), embedder, llm, q, { queryVector: [1, 0, 0, 0], k: 1, second: false });
-    expect(off.route.second).toBeUndefined();
-    // what the second round added is what turning it off loses
-    expect(res.contexts.length - off.contexts.length).toBe(second);
+    expect(off.contexts.map((c) => c.path)).toEqual(res.contexts.map((c) => c.path));
   });
 
   it('adds a passage the first round lacks, from a step only a claim knew; the workspace switch and the call over it', async () => {
