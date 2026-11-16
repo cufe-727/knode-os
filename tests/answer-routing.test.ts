@@ -441,7 +441,7 @@ describe('ordering and meaning in the walk', () => {
     await entity('proj', '司命系统', 'project');
     // the fix is stated in the report of its week, and restated by a later summary, which is the relation's own source
     await doc('本周钱勇修复了INC-003-D2T1。', ['qian', 'i3'], [['qian', '钱勇修复了INC-003-D2T1。', '2025-05-05']]);
-    await relate('qian', 'i3', '钱勇修复了INC-003-D2T1。', await doc('季度回顾：钱勇修复INC-003-D2T1', ['qian', 'i3'], [['qian', '季度回顾', '2025-06-30']]));
+    await relate('qian', 'i3', '钱勇修复了INC-003-D2T1。', await doc('季度回顾：钱勇修复INC-003-D2T1', ['qian', 'i3'], [['qian', '季度回顾', '2025-05-30']]));
     await relate('lin', 'i1', '林婷修复了INC-001-D2T1。', await doc('林婷修复了INC-001-D2T1。', ['lin', 'i1']));
     await relate('lin', 'p2', '林婷修复了INC-011-D2T2。', await doc('林婷修复了INC-011-D2T2。', ['lin', 'p2']));
     // a person 负责 an incident (the heavier relation) and a project
@@ -490,7 +490,7 @@ describe('ordering and meaning in the walk', () => {
     expect(walk.ordering?.picks.some((p) => p.startsWith('二部平台组: INC-003-D2T1 — the 2nd of 2 P1'))).toBe(true);
     // the group the question describes leads: its chain's passages come first
     expect(walk.bridges[0].trace?.bridgeEntities).toContain('二部平台组');
-    // the fix's passage is the report of its week, not the later summary the relation was read from
+    // the fix's passage is the report of its week, not the summary the relation was read from 25 days later
     const fix = walk.bridges.find((b) => b.trace?.bridgeEntities?.includes('钱勇'))!;
     expect(fix.content).toBe('本周钱勇修复了INC-003-D2T1。');
   });

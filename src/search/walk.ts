@@ -55,6 +55,8 @@ export interface WalkStep {
   type: string;
   description: string;
   path: string | null;
+  /** The passage the relation was read from, where the store records it. */
+  chunkId?: string | null;
   validFrom: string | null;
   validTo: string | null;
   /** The scores of the relations on the way here, this one's included: a step deep on a well-matched branch scores most. */
@@ -404,7 +406,9 @@ export async function walkRelations(
       if (ordered.length > 0) {
         orderedHop = hop;
         if (ordinal.period && ordinal.period.year === null && !present) present = await presentOf(store, asOfDate(question) ?? null);
-        const placed = await placeEntities(store, [...new Set(ordered.flatMap(([, pool]) => pool.map((c) => c.farId)))], { spellings, latest: ordinal.kind !== 'nth' });
+        // an entity with more relations than can be ordered makes no pick: its candidates are not placed
+        const orderable = ordered.filter(([nearId]) => (counts.get(nearId) ?? 0) <= ORDER_MAX);
+        const placed = await placeEntities(store, [...new Set(orderable.flatMap(([, pool]) => pool.map((c) => c.farId)))], { spellings, latest: ordinal.kind !== 'nth' });
         const top = Math.max(0, ...candidates.map((c) => c.score));
         for (const [nearId, pool] of ordered) {
           const nearName = pool[0].r.source_id === nearId ? pool[0].r.source : pool[0].r.target;
@@ -462,7 +466,7 @@ export async function walkRelations(
       const total = (pathScore.get(nearId) ?? 0) + score;
       out.steps.push({
         hop, relationId: r.id, source: r.source, sourceId: r.source_id, target: r.target, targetId: r.target_id,
-        type: r.type, description: r.description, path: r.path, validFrom: toDateString(r.valid_from), validTo: toDateString(r.valid_to), score: total,
+        type: r.type, description: r.description, path: r.path, chunkId: r.chunk_id, validFrom: toDateString(r.valid_from), validTo: toDateString(r.valid_to), score: total,
         parent: reachedBy.get(nearId) ?? null,
         ...(order ? { order } : {}),
       });
@@ -517,52 +521,90 @@ export function chainOrder(steps: WalkStep[]): number[] {
   return out;
 }
 
+/** A relation's evidence documents read at most when choosing the passage that states it. */
+const EVIDENCE_READ = 20;
+/** Chunks mentioning both ends read at most per step, from the end mentioned less. */
+const COMENTION_READ = 200;
+/** How long before its first source a report of the same two entities may be the one that states the hop. */
+const LEAD_DAYS = 45;
+
 /**
- * For each step, the passage that states it: of the chunks that mention both ends, the one in the earliest
- * dated document (the report of the week it happened, not a later summary restating it; a document's date is
- * its own or the earliest its claims state), the relation's own document first among equals; else a chunk of the
- * relation's own document that mentions either end. The best chain's first.
+ * For each step, the passage that states it, near the relation's own sources: the document it was read from and
+ * those its evidence names (at most `EVIDENCE_READ`); the earliest of them dates it. Of the chunks that mention both ends
+ * (at most `COMENTION_READ`, read from the end mentioned less), the one in the earliest document dated within
+ * `LEAD_DAYS` before that source is taken: the report of the week it happened, which a monthly summary the
+ * relation was read from restates. A co-mention long before the relation's first source, on a knowledge base
+ * that has mentioned both for years, is not. Else a chunk of that earliest source mentioning both ends, or either;
+ * else the chunk the relation was read from. A document's date is its own, or the day its claims state most often.
+ * Every read is bounded per step. The best chain's first.
  */
 async function bridgePassages(store: Store, steps: WalkStep[]): Promise<SearchResult[]> {
   if (steps.length === 0) return [];
-  // every chunk where a step's two ends are mentioned together, and the relation's own document's chunks that mention either
-  const found = await store.query<{ i: number; chunk_id: string; document_id: string; path: string; both: boolean }>(
-    `SELECT pair.i, m1.chunk_id, m1.document_id, d.path, true AS both
-     FROM unnest($1::text[], $2::text[]) WITH ORDINALITY AS pair(a, b, i)
-     JOIN entity_mentions m1 ON m1.entity_id = pair.a
-     JOIN entity_mentions m2 ON m2.chunk_id = m1.chunk_id AND m2.entity_id = pair.b
-     JOIN documents d ON d.id = m1.document_id
-     UNION ALL
-     SELECT pair.i, x.chunk_id, x.document_id, x.path, false FROM unnest($1::text[], $2::text[], $3::text[]) WITH ORDINALITY AS pair(a, b, p, i)
-     CROSS JOIN LATERAL (
-       SELECT m.chunk_id, m.document_id, d.path FROM documents d JOIN entity_mentions m ON m.document_id = d.id AND m.entity_id IN (pair.a, pair.b)
-       WHERE d.path = pair.p ORDER BY m.chunk_id LIMIT 1) x`,
-    [steps.map((s) => s.sourceId), steps.map((s) => s.targetId), steps.map((s) => s.path ?? '')],
-  );
-  // a document's date: its own, or the earliest its claims state
-  const dates = await documentDates(store, [...new Set(found.map((f) => f.document_id))]);
-  const choice = new Map<number, string>();
-  for (const [i, step] of steps.entries()) {
-    const mine = found.filter((f) => Number(f.i) === i + 1);
-    const both = mine.filter((f) => f.both);
-    const pool = both.length ? both : mine;
-    pool.sort((x, y) => {
-      const dx = dates.get(x.document_id) ?? null;
-      const dy = dates.get(y.document_id) ?? null;
-      if (dx !== dy) return dx === null ? 1 : dy === null ? -1 : dx < dy ? -1 : 1;
-      const ox = x.path === step.path ? 0 : 1;
-      const oy = y.path === step.path ? 0 : 1;
-      return ox - oy || (x.chunk_id < y.chunk_id ? -1 : 1);
-    });
-    if (pool[0]) choice.set(i, pool[0].chunk_id);
+  const [sources, together] = await Promise.all([
+    store.query<{ i: number; document_id: string }>(
+      `SELECT pair.i, x.document_id FROM unnest($1::text[]) WITH ORDINALITY AS pair(rid, i)
+       CROSS JOIN LATERAL (
+         (SELECT r.document_id FROM relations r WHERE r.id = pair.rid AND r.document_id IS NOT NULL)
+         UNION
+         (SELECT d.id FROM evidence ev JOIN scopes s ON s.id = ev.scope_id JOIN documents d ON d.path = s.key
+          WHERE ev.kind = 'relation' AND ev.target_id = pair.rid AND ev.tx_to IS NULL LIMIT $2)) x`,
+      [steps.map((s) => s.relationId), EVIDENCE_READ],
+    ),
+    store.query<{ i: number; chunk_id: string; document_id: string }>(
+      `SELECT pair.i, x.chunk_id, x.document_id FROM unnest($1::text[], $2::text[]) WITH ORDINALITY AS pair(a, b, i)
+       CROSS JOIN LATERAL (
+         SELECT CASE WHEN (SELECT count(*) FROM (SELECT 1 FROM entity_mentions WHERE entity_id = pair.a LIMIT 5000) ca)
+                       <= (SELECT count(*) FROM (SELECT 1 FROM entity_mentions WHERE entity_id = pair.b LIMIT 5000) cb)
+                     THEN pair.a ELSE pair.b END AS rare,
+                CASE WHEN (SELECT count(*) FROM (SELECT 1 FROM entity_mentions WHERE entity_id = pair.a LIMIT 5000) ca)
+                       <= (SELECT count(*) FROM (SELECT 1 FROM entity_mentions WHERE entity_id = pair.b LIMIT 5000) cb)
+                     THEN pair.b ELSE pair.a END AS other) e
+       CROSS JOIN LATERAL (
+         SELECT m1.chunk_id, m1.document_id FROM entity_mentions m1
+         JOIN entity_mentions m2 ON m2.chunk_id = m1.chunk_id AND m2.entity_id = e.other
+         WHERE m1.entity_id = e.rare LIMIT $3) x`,
+      [steps.map((s) => s.sourceId), steps.map((s) => s.targetId), COMENTION_READ],
+    ),
+  ]);
+  const dates = await documentDates(store, [...new Set([...sources.map((r) => r.document_id), ...together.map((r) => r.document_id)])]);
+  const dayOf = (d: string) => Date.parse(`${d}T00:00:00Z`) / 86_400_000;
+  const choice = new Map<number, { doc: string | null; chunk: string | null }>();
+  for (let i = 0; i < steps.length; i++) {
+    const mine = sources.filter((r) => Number(r.i) === i + 1).map((r) => r.document_id);
+    const first = mine.sort((x, y) => {
+      const dx = dates.get(x) ?? null;
+      const dy = dates.get(y) ?? null;
+      return dx === dy ? (x < y ? -1 : 1) : dx === null ? 1 : dy === null ? -1 : dx < dy ? -1 : 1;
+    })[0] ?? null;
+    const since = first && dates.get(first) ? dayOf(dates.get(first)!) - LEAD_DAYS : null;
+    const near = together
+      .filter((r) => Number(r.i) === i + 1)
+      .map((r) => ({ ...r, at: dates.get(r.document_id) ?? null }))
+      .filter((r) => r.at && since !== null && dayOf(r.at) >= since && r.at <= dates.get(first!)!)
+      .sort((x, y) => (x.at! < y.at! ? -1 : x.at! > y.at! ? 1 : x.chunk_id < y.chunk_id ? -1 : 1))[0];
+    choice.set(i, near ? { doc: null, chunk: near.chunk_id } : { doc: first, chunk: null });
   }
-  const chunkIds = [...new Set(choice.values())];
-  const chunks = chunkIds.length === 0 ? [] : await store.query<{ chunk_id: string; document_id: string; path: string; title: string | null; content: string; doc_date: string | Date | null }>(
-    `SELECT c.id AS chunk_id, c.document_id, d.path, d.title, c.content, d.doc_date FROM chunks c JOIN documents d ON d.id = c.document_id WHERE c.id = ANY($1::text[])`,
-    [chunkIds],
+  const rows = await store.query<{ i: number; chunk_id: string; document_id: string; path: string; title: string | null; content: string; doc_date: string | Date | null }>(
+    `SELECT pair.i, c.id AS chunk_id, c.document_id, d.path, d.title, c.content, d.doc_date
+     FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[]) WITH ORDINALITY AS pair(a, b, doc, pick, own, i)
+     CROSS JOIN LATERAL (
+       SELECT y.chunk_id FROM (
+         (SELECT ch.id AS chunk_id, 0 AS rank FROM chunks ch WHERE ch.id = NULLIF(pair.pick, ''))
+         UNION ALL
+         (SELECT m1.chunk_id, 1 FROM entity_mentions m1
+          JOIN entity_mentions m2 ON m2.chunk_id = m1.chunk_id AND m2.entity_id = pair.b
+          WHERE m1.document_id = NULLIF(pair.doc, '') AND m1.entity_id = pair.a ORDER BY m1.chunk_id LIMIT 1)
+         UNION ALL
+         (SELECT m.chunk_id, 2 FROM entity_mentions m
+          WHERE m.document_id = NULLIF(pair.doc, '') AND m.entity_id IN (pair.a, pair.b) ORDER BY m.chunk_id LIMIT 1)
+         UNION ALL
+         (SELECT ch.id, 3 FROM chunks ch WHERE ch.id = NULLIF(pair.own, ''))
+       ) y ORDER BY y.rank LIMIT 1
+     ) x
+     JOIN chunks c ON c.id = x.chunk_id
+     JOIN documents d ON d.id = c.document_id`,
+    [steps.map((s) => s.sourceId), steps.map((s) => s.targetId), steps.map((_, i) => choice.get(i)?.doc ?? ''), steps.map((_, i) => choice.get(i)?.chunk ?? ''), steps.map((s) => s.chunkId ?? '')],
   );
-  const byChunk = new Map(chunks.map((c) => [c.chunk_id, c]));
-  const rows = [...choice.entries()].flatMap(([i, id]) => (byChunk.has(id) ? [{ i: i + 1, ...byChunk.get(id)! }] : []));
   const byStep = new Map(rows.map((r) => [Number(r.i) - 1, r]));
   const seen = new Set<string>();
   const out: SearchResult[] = [];

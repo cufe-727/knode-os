@@ -115,6 +115,19 @@ beforeAll(async () => {
   await doc('旗舰一号 2026 款发布', ['sail', 'pold'], '2026-09-01', [['pold', '旗舰一号2026款于9月发布', '2026-09-01']]);
   await doc('旗舰一号参加展会', ['pold'], '2020-01-01', [['pold', '旗舰一号参加展会', '2020-01-01']]);
   await relate('sail', 'pnew', '远航科技发布新品二号。', await doc('远航科技发布新品二号', ['sail', 'pnew'], '2024-03-01', [['pnew', '新品二号发布', '2024-03-01']]), 3);
+  // two entities mentioned together in an old note, and a relation between them read from a report years later
+  await entity('ann', '安娜', 'person');
+  await entity('orbit', '轨道计划', 'project');
+  await doc('2019年的会议纪要：安娜与轨道计划都被提到。', ['ann', 'orbit'], '2019-03-01');
+  await relate('ann', 'orbit', '安娜负责轨道计划。', await doc('2024年第12周：安娜开始负责轨道计划。', ['ann', 'orbit'], '2024-03-18'));
+  // a hub mentioned with one of its neighbours in 600 chunks
+  await entity('hub', '中枢平台');
+  await entity('spoke', '辐条服务', 'product');
+  await store.query(`INSERT INTO documents (id, path, root, title, sha256, bytes, status, doc_date)
+    SELECT 'dh' || i, 'raw/docs/hub' || i || '.md', 'docs', 'hub' || i, 'shahub' || i, 10, 'indexed', timestamptz '2025-01-01T00:00:00Z' + i * interval '1 day' FROM generate_series(0, 599) i`);
+  await store.query(`INSERT INTO chunks (id, document_id, seq, content, token_count) SELECT 'ch' || i, 'dh' || i, 0, '中枢平台调用辐条服务', 3 FROM generate_series(0, 599) i`);
+  await store.query(`INSERT INTO entity_mentions (entity_id, chunk_id, document_id) SELECT e, 'ch' || i, 'dh' || i FROM generate_series(0, 599) i, unnest(ARRAY['hub', 'spoke']) e`);
+  await relate('hub', 'spoke', '中枢平台依赖辐条服务。', { doc: 'dh599', chunk: 'ch599' });
 });
 
 afterAll(async () => {
@@ -186,5 +199,29 @@ describe('the ordering step', () => {
     expect(line?.statement).toMatch(/第二起 .*INC-OLD-oldb.*the 2nd of 2 dated in 2025, by date \(2025-06-09\)/);
     // the relation stays a fact of the source; the pick is the walk's, said apart from it
     expect(stepsAsFacts(await walkRelations(store, '清算组2025年第二起事故是谁修复的？', ['clear'], { maxHops: 1 }).then((w) => w.steps)).every((f) => !f.statement.includes('picked'))).toBe(true);
+  });
+});
+
+describe('the passage that states a hop', () => {
+  it('is read from the relation\'s own source, not from an old note that mentions both ends', async () => {
+    const walk = await walkRelations(store, '安娜负责的项目是什么？那个项目的负责人还负责什么', ['ann'], { maxHops: 1 });
+    expect(walk.steps.map((s) => s.target)).toEqual(['轨道计划']);
+    expect(walk.bridges[0].content).toBe('2024年第12周：安娜开始负责轨道计划。');
+  });
+
+  it('reads a bounded number of rows for a hub mentioned in hundreds of chunks', async () => {
+    const rows: number[] = [];
+    const q0 = store.query.bind(store);
+    const spy = Object.assign(Object.create(Object.getPrototypeOf(store)), store, {
+      query: async (sql: string, params?: unknown[]) => {
+        const r = await q0(sql, params as never[]);
+        rows.push(r.length);
+        return r;
+      },
+    }) as Store;
+    const walk = await walkRelations(spy, '中枢平台依赖什么？它的负责人是谁', ['hub'], { maxHops: 1 });
+    expect(walk.steps.map((s) => s.target)).toEqual(['辐条服务']);
+    expect(walk.bridges[0].chunkId).toBe('ch599');
+    expect(Math.max(...rows)).toBeLessThanOrEqual(250);
   });
 });

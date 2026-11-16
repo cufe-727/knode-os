@@ -107,7 +107,8 @@ export function ordinalInQuestion(question: string): OrdinalAsk | null {
  * day the question says it is asked as of ("截至2025年5月21日", "as of
  * 2025-05-21"), else the date of the knowledge base's latest source up to
  * today. A source's date is its own, or else the earliest date its claims
- * state: the week a report covers, not the launch it plans for next year. On a
+ * state: the week a report covers, not the launch it plans for next year (the
+ * earliest, not the most stated, so one scan serves every document). On a
  * knowledge base kept current that is this year; on one whose sources stop in
  * an earlier year it is that year, and the note says so.
  */
@@ -231,16 +232,26 @@ export async function placeEntities(store: Store, ids: string[], event: { spelli
   return out;
 }
 
-/** Each document's date: its own, or else the earliest date its live claims state. */
+/**
+ * Each document's date: its own, or else the day its live claims state most often (the earlier on a tie): the
+ * week a report covers, not the old events a monthly summary restates nor the launch a report plans.
+ */
 export async function documentDates(store: Store, ids: string[]): Promise<Map<string, string | null>> {
   const out = new Map<string, string | null>();
   if (ids.length === 0) return out;
-  const rows = await store.query<{ id: string; at: string | Date | null }>(
-    `SELECT d.id, COALESCE(d.doc_date, min(COALESCE(c.event_at, c.valid_from))) AS at
-     FROM documents d LEFT JOIN chunks ch ON ch.document_id = d.id LEFT JOIN claims c ON c.chunk_id = ch.id AND c.tx_to IS NULL
-     WHERE d.id = ANY($1::text[]) GROUP BY d.id, d.doc_date`,
-    [ids],
-  );
+  const [own, stated] = await Promise.all([
+    store.query<{ id: string; at: string | Date | null }>(`SELECT id, doc_date AS at FROM documents WHERE id = ANY($1::text[])`, [ids]),
+    store.query<{ id: string; at: string | Date | null }>(
+      `SELECT DISTINCT ON (x.id) x.id, x.day AS at FROM (
+         SELECT ch.document_id AS id, date_trunc('day', COALESCE(c.event_at, c.valid_from) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS day, count(*) AS n
+         FROM chunks ch JOIN claims c ON c.chunk_id = ch.id AND c.tx_to IS NULL AND COALESCE(c.event_at, c.valid_from) IS NOT NULL
+         WHERE ch.document_id = ANY($1::text[]) GROUP BY 1, 2) x
+       ORDER BY x.id, x.n DESC, x.day`,
+      [ids],
+    ),
+  ]);
+  const byClaims = new Map(stated.map((r) => [r.id, toDateString(r.at)]));
+  const rows = own.map((r) => ({ id: r.id, at: r.at ?? byClaims.get(r.id) ?? null }));
   for (const r of rows) out.set(r.id, toDateString(r.at));
   return out;
 }
