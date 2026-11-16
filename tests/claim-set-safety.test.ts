@@ -123,6 +123,8 @@ beforeAll(async () => {
     await addDoc(`wk-${from}`, `宁德时代周报 ${from}`, d(to), `本周出货量${v}GWh`, ['catl']);
     next = await addClaim(`wk-${from}`, 'catl', `宁德时代本周出货量${v}GWh`, { attribute: '出货量', num: v, unit: 'GWh', at: d(from), from: d(from), to: d(to), supersededBy: next });
   }
+  // a reading of the attribute whose figure was never recorded as a number
+  await addClaim('wk-2025-03-17', 'catl', '宁德时代本周出货量与上周持平', { attribute: '出货量', text: '持平', at: d('2025-03-17'), from: d('2025-03-17'), to: d('2025-03-21') });
 });
 
 afterAll(async () => {
@@ -337,6 +339,30 @@ describe('lookups stay lookups (review item 9)', () => {
     expect(r('What did CATL announce on 2025-11-07?')?.op).not.toBe('value');
     expect(r('截至2025年11月7日，平台组的订单库连接池上限是多少？')).toMatchObject({ op: 'value', asOf: '2025-11-07' });
     expect(r('What was the pool limit of Northwind Platform as of 2025-03-01?')).toMatchObject({ op: 'value' });
+  });
+});
+
+describe('the rest of the review (item 10)', () => {
+  it('says how many claims of the attribute had no number to compute with', async () => {
+    const max = await set('宁德时代的最高周出货量是多少？', ['catl']);
+    expect(max!.lines.join('\n')).toMatch(/1 of the attribute with no numeric value recorded/);
+  });
+
+  it('says a set read from fewer documents than its scope has is capped', async () => {
+    const s = await computeClaimSet(store, '宁德时代有哪些客户？', classifyQuestion('宁德时代有哪些客户？'), ['catl'], { budgetMs: 60_000, docsCap: 1 });
+    expect(s?.capped).toBe(true);
+    expect(s!.lines[0]).toContain('may be incomplete');
+  });
+
+  it('reads a company-wide question by the attributes it names, with no scan of every statement', async () => {
+    const seen: string[] = [];
+    const query = store.query.bind(store);
+    const spied = Object.assign(Object.create(Object.getPrototypeOf(store)), store, {
+      query: async <T>(sql: string, p?: unknown[]) => { seen.push(sql); return query<T>(sql, p); },
+    }) as Store;
+    const q = '全公司一共有多少条营收记录？';
+    await computeClaimSet(spied, q, classifyQuestion(q), [], { budgetMs: 60_000 });
+    expect(seen.some((sql) => /ILIKE/i.test(sql))).toBe(false);
   });
 });
 

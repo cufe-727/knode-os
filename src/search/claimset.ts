@@ -639,6 +639,8 @@ export async function computeClaimSet(
     budgetMs?: number;
     /** Told why nothing was computed, when nothing is. */
     skipped?: (why: string) => void;
+    /** Documents of a scope read at most (default `SCOPE_DOCS_CAP`); past them the set says it may be incomplete. */
+    docsCap?: number;
   } = {},
 ): Promise<ComputedSet | null> {
   const started = Date.now();
@@ -670,6 +672,7 @@ export async function computeClaimSet(
   // the documents in scope: those whose own organisation (the one most of their claims are about) is a member
   let docsInScope: string[] = [];
   let docsCapped = false;
+  const docsCap = Math.max(1, opts.docsCap ?? SCOPE_DOCS_CAP);
   if (scoped) {
     // short statements over id arrays, each through its index (see docsOf)
     const own = await store.query<{ id: string }>(
@@ -679,10 +682,10 @@ export async function computeClaimSet(
       ? await store.query<{ scope_id: string }>(`SELECT DISTINCT scope_id FROM evidence WHERE kind = 'claim' AND tx_to IS NULL AND target_id = ANY($1::text[])`, [own.map((r) => r.id)])
       : [];
     const mine = scopeIds.length
-      ? await store.query<{ key: string }>(`SELECT DISTINCT key FROM scopes WHERE id = ANY($1::text[]) AND kind = ANY($2::text[]) LIMIT ${SCOPE_DOCS_CAP + 1}`, [scopeIds.map((r) => r.scope_id), SOURCE_SCOPES])
+      ? await store.query<{ key: string }>(`SELECT DISTINCT key FROM scopes WHERE id = ANY($1::text[]) AND kind = ANY($2::text[]) ORDER BY key LIMIT ${docsCap + 1}`, [scopeIds.map((r) => r.scope_id), SOURCE_SCOPES])
       : [];
-    docsCapped = mine.length > SCOPE_DOCS_CAP;
-    if (docsCapped) mine.length = SCOPE_DOCS_CAP;
+    docsCapped = mine.length > docsCap;
+    if (docsCapped) mine.length = docsCap;
     await learn(mine.map((r) => r.key));
     docsInScope = mine.map((r) => r.key).filter((k) => members.has(docs.get(k)?.home ?? ''));
   }
@@ -732,19 +735,23 @@ export async function computeClaimSet(
     );
     matchedAttrs = matchAttributes(new Set(cands.map((c) => c.attribute).filter((a): a is string => Boolean(a))), rest);
   } else {
-    // the whole knowledge base: only the claims of the attributes the question names, or holding its words
+    // the whole knowledge base: only the claims of the attributes the question names (read off the partial index on
+    // attributed live claims) or about an entity it names — never a scan of every statement for its words
     const keys = await store.query<{ attribute: string }>(
-      `SELECT DISTINCT ${col('attribute', 'text')} AS attribute FROM claims cl WHERE cl.tx_to IS NULL AND ${col('attribute', 'text')} IS NOT NULL LIMIT 20000`,
+      `SELECT DISTINCT attribute FROM claims WHERE tx_to IS NULL AND attribute IS NOT NULL LIMIT 20000`,
     );
     matchedAttrs = matchAttributes(new Set(keys.map((k) => k.attribute)), rest);
-    const words = fragments(rest).filter((f) => f.length >= 2).slice(0, 8);
+    if (matchedAttrs.size === 0 && namedWhat.size === 0) return skip('a company-wide question names no attribute');
+    if (late()) return skip('over its time budget');
     cands = await store.query<Cand>(
-      `${select}
+      `WITH ids AS MATERIALIZED (
+         SELECT id FROM claims WHERE tx_to IS NULL AND attribute = ANY($1::text[])
+         UNION SELECT id FROM claims WHERE tx_to IS NULL AND (subject_id = ANY($2::text[]) OR object_id = ANY($2::text[]))
+       )
+       ${select} JOIN ids ON ids.id = cl.id
        WHERE cl.tx_to IS NULL AND cl.canonical_id IS NULL
-         AND (${col('attribute', 'text')} = ANY($1::text[]) OR cl.statement ILIKE ANY($2::text[])
-              OR cl.subject_id = ANY($3::text[]) OR cl.object_id = ANY($3::text[]))
        LIMIT ${SET_SCAN_CAP + 1}`,
-      [[...matchedAttrs], words.map((w) => `%${w.replace(/[%_\\]/g, '\\$&')}%`), [...namedWhat]],
+      [[...matchedAttrs], await spellingsOf(store, [...namedWhat])],
     );
   }
   // more claims, or more documents, than were read: the set may be incomplete, and says so

@@ -213,10 +213,12 @@ describe('computing the set from the claims', () => {
     expect(people[0]).toMatch(/^- Alice Chen \(2: INC-1, INC-7\)/);
   });
 
-  it('counts over the whole knowledge base when the question says so', async () => {
-    const s = await set('How many P1 incidents were there company-wide?', []);
+  it('counts over the whole knowledge base when the question says so, by an attribute it names', async () => {
+    const s = await set('How many incidents of severity P1 were there company-wide?', []);
     expect(s).toMatchObject({ scope: 'the whole knowledge base', answer: 4 });
-    expect(await set('How many P1 incidents were there?', [])).toBeNull();
+    expect(await set('How many incidents of severity P1 were there?', [])).toBeNull();
+    // naming no attribute, a company-wide question is not read off every statement
+    expect(await set('How many P1 incidents were there company-wide?', [])).toBeNull();
   });
 });
 
