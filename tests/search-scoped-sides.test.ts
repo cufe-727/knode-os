@@ -6,7 +6,7 @@ import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { DatabaseConfig } from '../src/config.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
-import { NEAREST_OF_ALL, nearestFor, scopedRows, search, searchExplained, SIDE_ROWS_MAX } from '../src/search/search.js';
+import { NEAREST_OF_ALL, nearestFor, SCOPED_ROWS_MAX, scopedRows, search, searchExplained, SIDE_ROWS_MAX } from '../src/search/search.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
 import { resolveScopeFilter } from '../src/store/resolver.js';
 
@@ -192,10 +192,23 @@ describe.each(BACKENDS)('scoped searches on %s', (backend) => {
     });
 
     it('walks on for its pages past nearer sources, as a search for the kind does', async () => {
-      // the question among the 500 reports of raw/docs/near: the nearest forty chunks of all hold no page
-      const byKind = await found({ kinds: ['view'], queryVector: AMONG_NEAR });
-      expect(byKind).toHaveLength(8);
-      const bySource = await found({ sources: ['wiki'], queryVector: AMONG_NEAR });
+      // the question among the 500 reports of raw/docs/near: the nearest forty chunks of all hold no page.
+      // Either search sends the walk for the pages alone, with the narrowed search's rows to walk (how many
+      // pages a walk comes on within them depends on how the index was built: 3,000 lie among 45,850)
+      const sent: string[] = [];
+      const watched = Object.create(store) as Store;
+      watched.query = ((sql: string, params?: unknown[]) => {
+        if (sql.includes('<=>')) sent.push(sql);
+        return store.query(sql, params);
+      }) as typeof store.query;
+      const byKind = await found({ kinds: ['view'], queryVector: AMONG_NEAR, on: watched });
+      const bySource = await found({ sources: ['wiki'], queryVector: AMONG_NEAR, on: watched });
+      expect(sent).toHaveLength(2);
+      for (const sql of sent) {
+        expect(sql).toContain('true AS generated, true AS walked');
+        expect(sql).toContain(`set_config('hnsw.max_scan_tuples', '2967', true)`);
+        expect(sql).not.toContain('UNION ALL');
+      }
       expect(bySource).toEqual(byKind);
       expect(bySource.every((id) => id.startsWith('p'))).toBe(true);
     });
@@ -304,11 +317,81 @@ describe.each(BACKENDS)('scoped searches on %s', (backend) => {
       }
     });
 
+    it('holds a narrowed search to one budget of rows, for both its sides and for reading and walking alike', async () => {
+      // the budget: as before on an index this size, and 10,000 rows at the most on any
+      expect(scopedRows(24, 45_850)).toBe(2967);
+      expect([24, 60].map((k) => scopedRows(k, 566_914))).toEqual([SCOPED_ROWS_MAX, SCOPED_ROWS_MAX]);
+      expect(SCOPED_ROWS_MAX).toBe(10_000);
+      const limitOf = (sql: string) => Number(/set_config\('hnsw.max_scan_tuples', '(\d+)'/.exec(sql)?.[1]);
+      // a folder that is read (2,500 chunks) beside pages that are not (3,000): the walk has what is left
+      let sent = await sentBy(() => found({ sources: ['raw/docs/far', 'wiki'] }));
+      expect(sent).toHaveLength(1);
+      expect(limitOf(sent[0])).toBe(2967 - 2500);
+      // both sides too large to read (31,000 reports, 3,000 pages): two walks, half the budget each
+      sent = await sentBy(() => found({ sources: ['raw/docs/main', 'wiki'], queryVector: AMONG_REPORTS }));
+      expect(sent).toHaveLength(1);
+      expect(limitOf(sent[0])).toBe(Math.floor(2967 / 2));
+      // one side walked alone has it all
+      sent = await sentBy(() => found({ sources: ['raw/docs/main'], queryVector: AMONG_REPORTS }));
+      expect(limitOf(sent[0])).toBe(2967);
+    });
+
+    it('walks the index for a side too large to read, whatever the planner makes of the filter', async () => {
+      // 3,200 chunks of 45,850: a filter the planner may judge narrow enough to rank without the index, which
+      // is a read of the side — on the finance copy it read 34,000 chunks of four folders that way. The walk
+      // is a step of its own, 2,967 rows of the index at the most, and the statement can do no more.
+      const sent: { sql: string; params?: unknown[] }[] = [];
+      const watched = Object.create(store) as Store;
+      watched.query = ((sql: string, params?: unknown[]) => {
+        if (sql.includes('<=>')) sent.push({ sql, params });
+        return store.query(sql, params);
+      }) as typeof store.query;
+      for (const dir of ['raw/docs/behind', 'raw/docs/deep', 'raw/docs/main']) {
+        sent.length = 0;
+        await found({ sources: [dir], on: watched });
+        expect(sent).toHaveLength(1);
+        const plan = (await store.query<{ 'QUERY PLAN': string }>(`EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) ${sent[0].sql}`, sent[0].params)).map((r) => r['QUERY PLAN']);
+        const walk = plan.filter((line) => line.includes('Index Scan using embeddings_hnsw_idx'));
+        expect(walk).toHaveLength(1);
+        expect(Number(/actual rows=(\d+)/.exec(walk[0])![1])).toBeLessThanOrEqual(2967);
+        // and nothing reads the side's vectors another way: only those of the rows returned, 24 at the most
+        expect(plan.some((line) => line.includes('Seq Scan on embeddings'))).toBe(false);
+        const byKey = plan.filter((line) => line.includes('embeddings_pkey'));
+        expect(byKey).toHaveLength(1);
+        expect(Number(/loops=(\d+)/.exec(byKey[0])?.[1] ?? 0)).toBeLessThanOrEqual(24);
+      }
+    });
+
+    it('does not count again, within the minute, a side it found too large to read or empty', async () => {
+      const counts: string[] = [];
+      const counting = Object.create(store) as Store;
+      counting.query = ((sql: string, params?: unknown[]) => {
+        if (/SELECT count\(\*\)::int FROM \(\s*SELECT 1 FROM documents d/.test(sql)) counts.push(sql);
+        return store.query(sql, params);
+      }) as typeof store.query;
+      const filter = resolveScopeFilter({ sources: ['raw/docs/behind'] });
+      for (let i = 0; i < 3; i++) await search(counting, embedder, 'chunk', { k: 8, mode: 'vector', track: false, current: false, queryVector: AMONG_FRONT, filter });
+      // 3,200 chunks of sources, past the 2,967 a narrowed search reads, and no page: both counted by the
+      // first search, in one statement, and by no other
+      expect(counts).toHaveLength(1);
+      expect(counts[0]).toContain(' AS n1');
+      // a folder small enough to read is counted by each search, its documents and then their chunks: what
+      // it holds decides what is read. Its pages, of which there are none, are counted by the first alone.
+      counts.length = 0;
+      for (let i = 0; i < 2; i++) await search(counting, embedder, 'chunk', { k: 8, mode: 'vector', track: false, current: false, queryVector: AMONG_FRONT, filter: resolveScopeFilter({ sources: ['raw/docs/near'] }) });
+      expect(counts).toHaveLength(4);
+      expect(counts.map((sql) => sql.includes(' AS n1'))).toEqual([true, false, false, false]);
+    });
+
     it('gives each side of a scoped search its candidates', async () => {
-      // the folder is read; the pages are the ones among the nearest chunks the filter leaves
+      // the folder is read, exactly; the pages are the ones among the nearest chunks the filter leaves that
+      // the walk reaches with what the folder left of the budget (467 rows: on most builds of this index it
+      // starts among the pages, and they take their quarter of the 8)
       const ids = await found({ sources: ['raw/docs/far', 'wiki'] });
-      expect(ids.filter((id) => id.startsWith('f'))).toEqual((await exact('raw/docs/far', AMONG_PAGES, 8)).slice(0, 6));
-      expect(ids.filter((id) => id.startsWith('p'))).toHaveLength(2);
+      const pages = ids.filter((id) => id.startsWith('p'));
+      expect(ids).toHaveLength(8);
+      expect(pages.length).toBeLessThanOrEqual(2);
+      expect(ids.filter((id) => id.startsWith('f'))).toEqual((await exact('raw/docs/far', AMONG_PAGES, 8)).slice(0, 8 - pages.length));
     });
 
     it('leaves a search of everything as it was: 2,000 rows a side at most', async () => {
