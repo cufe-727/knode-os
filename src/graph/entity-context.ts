@@ -1048,37 +1048,52 @@ async function mergeCodesIntoCarriers(store: Store, stats: EntityContextStats, p
     after ? [step, after] : [step],
   );
   await store.setMeta(CODE_MERGE_META, named.length < step ? {} : { after: named.at(-1)!.id });
+  // the cursor has moved past the slice: an entity that throws is reported and left for the next pass, the rest go on
   for (const e of named) {
-    const c = codeOf(e.name);
-    if (!c) continue;
-    let into: string | undefined;
-    const labelled = byLabel.get(c.value);
-    if (labelled) {
-      if (labelled.length !== 1) continue;
-      into = labelled[0];
-    } else {
-      const carriers = await store.query<{ id: string; name: string; type: string; aliases: string[] | null }>(
-        `SELECT DISTINCT x.id, x.name, x.type, x.aliases FROM entity_alias_keys k JOIN entities x ON x.id = k.entity_id
-         WHERE k.alias_key = $1 AND k.kind = 'exact' AND x.id <> $2 AND x.tx_to IS NULL AND x.canonical_id IS NULL ORDER BY x.id`,
-        [nameKey(e.name).key, e.id],
-      );
-      // not a carrier named by a code, nor one that carries another identifier of the same series (a title every incident has)
-      const fit = carriers.filter((x) => typesCompatible(e.type, x.type) && !codeOf(x.name) && !(x.aliases ?? []).some((a) => namesApartByCode(a, e.name)));
-      if (carriers.length !== 1 || fit.length !== 1) continue;
-      into = fit[0].id;
-    }
-    if (!into || into === e.id) continue;
-    if (await refusedByPerson(store, e.id, into)) continue;
-    const reason = labelled ? `编号即拆分标签：${e.name} 是拆分出的实体 ${into} 的编号` : `编号即别名：${e.name} 只有 ${into} 以它为别名`;
     try {
-      const res = await applyMerge(store, { entityId: e.id, canonicalId: into, reason, actor: 'entity-context' });
-      if (res.outcome === 'merged') {
-        stats.merged++;
-        progress(`entities: merged ${e.name} into ${into} — ${reason}`);
-      }
+      await mergeCodeIntoCarrier(store, stats, progress, e, byLabel);
     } catch (err) {
-      progress(`entities: code merge ${e.name} → ${into} failed: ${err instanceof Error ? err.message : err}`);
+      progress(`entities: code merge of ${e.name} skipped until the next pass: ${err instanceof Error ? err.message : err}`);
     }
+  }
+}
+
+async function mergeCodeIntoCarrier(
+  store: Store,
+  stats: EntityContextStats,
+  progress: (msg: string) => void,
+  e: { id: string; name: string; type: string },
+  byLabel: Map<string, string[]>,
+): Promise<void> {
+  const c = codeOf(e.name);
+  if (!c) return;
+  let into: string | undefined;
+  const labelled = byLabel.get(c.value);
+  if (labelled) {
+    if (labelled.length !== 1) return;
+    into = labelled[0];
+  } else {
+    const carriers = await store.query<{ id: string; name: string; type: string; aliases: string[] | null }>(
+      `SELECT DISTINCT x.id, x.name, x.type, x.aliases FROM entity_alias_keys k JOIN entities x ON x.id = k.entity_id
+       WHERE k.alias_key = $1 AND k.kind = 'exact' AND x.id <> $2 AND x.tx_to IS NULL AND x.canonical_id IS NULL ORDER BY x.id`,
+      [nameKey(e.name).key, e.id],
+    );
+    // not a carrier named by a code, nor one that carries another identifier of the same series (a title every incident has)
+    const fit = carriers.filter((x) => typesCompatible(e.type, x.type) && !codeOf(x.name) && !(x.aliases ?? []).some((a) => namesApartByCode(a, e.name)));
+    if (carriers.length !== 1 || fit.length !== 1) return;
+    into = fit[0].id;
+  }
+  if (!into || into === e.id) return;
+  if (await refusedByPerson(store, e.id, into)) return;
+  const reason = labelled ? `编号即拆分标签：${e.name} 是拆分出的实体 ${into} 的编号` : `编号即别名：${e.name} 只有 ${into} 以它为别名`;
+  try {
+    const res = await applyMerge(store, { entityId: e.id, canonicalId: into, reason, actor: 'entity-context' });
+    if (res.outcome === 'merged') {
+      stats.merged++;
+      progress(`entities: merged ${e.name} into ${into} — ${reason}`);
+    }
+  } catch (err) {
+    progress(`entities: code merge ${e.name} → ${into} failed: ${err instanceof Error ? err.message : err}`);
   }
 }
 

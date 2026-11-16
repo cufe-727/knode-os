@@ -388,13 +388,23 @@ What the rules are now:
   subject (its name without a split's suffix, a tail of it, its code, the
   aliases of an entity named by a code; 配置值 / 取值 only for a subject that
   carries a code). Never across a qualifier, and never by a shared head word
-  alone (零售价格 / 批发价格). The canonical key is chosen by rule: the synonym
-  head, else the subject's name, else the shortest key that no other member
-  only extends by a neutral word (指数, not 指). On 484 finance subjects the
+  alone (零售价格 / 批发价格). A group goes by its most used key, as stored
+  mappings always have, so that an upgrade rewrites as few as it can: a tie
+  goes to a name the group is already stored under, then to code point; a
+  group with a key of a synonym group goes by its head (负责人, 状态, 级别),
+  since owner and state series are read on it. On 484 finance subjects the
   original rule put 296 pairs of keys together, this one 246: the 51 pairs no
-  longer together all cross a qualifier.
+  longer together all cross a qualifier. Against the deployed names, 34 of
+  its 1,835 keys (43 claims) end under another name: 29 kept apart across a
+  qualifier, 3 regrouped, 2 by the synonym head (资金面状态 / 状态 → 状态).
+  Naming a group by its shortest key instead would have renamed 167.
 - **Owner and state claims with no object** are read for what they are about
-  ("云业务由张三负责" → 云业务), so two businesses' owners are two series.
+  ("云业务由张三负责" → 云业务), so two businesses' owners are two series. The
+  adverb before 由 (改由, 现由, 交由, 转由, 仍由) is part of the marker; a lead
+  phrase (自2025年3月起, 经评审, 经董事会决定) and a bracketed gloss of the
+  subject (R-03（支付超时）) are not the thing; with the subject written in the
+  clause, the thing is what follows it. In the active voice ("张三负责云业务",
+  the owner being the claim's value) the thing is what follows the verb.
 - **Identifiers.** Only identifiers of one numbered series (letters, a
   separator, a counter: INC-001-T1, R-07, GPT-4) with another counter or two
   different tails are kept apart (INC-006 and INC-006-T1 are not); codes that
@@ -420,7 +430,8 @@ What the rules are now:
   `review.backReferences` lists periodic-report folders (`periodic`) or asks to
   `detect` series; only claims that state a fix take part, only an
   identified, unfixed event of the previous report is linked, and the run is
-  incremental; only the person the sentence gives as the fixer is linked. A
+  incremental; only the people the sentence gives as fixers are linked
+  (each one of a list; for 协助, the one helped). A
   link is a child scope of the scope carrying the fix claim: disposed with
   that document, with its trust and acl, its document and passage as the
   relation's source; an incremental run also disposes it when the earlier
@@ -432,7 +443,14 @@ What the rules are now:
   'code_merge_pass'). Scaled from the 10× build (17,222 claims: keys 64 ms,
   supersession by attribute ~210 ms, name splits + code merge 1.9 s), a whole
   run on finance would be roughly 6 s + 20 s + a minute; a slice is a few
-  seconds and a pass takes about six refines. Not measured on finance.
+  seconds and a pass takes about six refines. Not measured on finance. A
+  claim-state slice that throws is tried again subject by subject in the same
+  run; subjects that still throw are left for the next pass and recorded in
+  meta 'claim_state_skipped'. When every subject throws (the store's trouble,
+  not the slice's), the cursor stays for up to three runs in a row, then the
+  slice is let go and recorded the same way. A code-named entity whose merge
+  throws is reported and left for the next pass; the rest of its slice goes
+  on.
 
 10× benchmark, fresh no-model rebuild + refine's model-free steps
 (`review.identity: "context"`; link step with the reports folder marked, or

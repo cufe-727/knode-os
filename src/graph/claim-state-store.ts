@@ -307,6 +307,11 @@ export async function seriesSubjects(store: Store, claims: string[]): Promise<st
 /** Keyed claims one refine re-reads keys and supersession for (refreshClaimStateStep). */
 export const CLAIM_STATE_STEP_CLAIMS = 200_000;
 const STEP_META = 'claim_state_pass';
+const SKIPPED_META = 'claim_state_skipped';
+/** Runs in a row a slice whose every subject throws is retried before it is let go (refreshClaimStateStep). */
+export const CLAIM_STATE_SLICE_TRIES = 3;
+/** How many skipped subjects meta 'claim_state_skipped' keeps, the latest. */
+export const CLAIM_STATE_SKIPPED_KEPT = 200;
 
 /**
  * One bounded slice of what refine keeps current about claim state: the
@@ -318,10 +323,23 @@ const STEP_META = 'claim_state_pass';
  * about six), then starts again. What an ingest pass touched is kept current
  * at once, apart from this (supersedeForClaims). Returns what the slice did
  * and whether it ended a pass.
+ *
+ * A slice that throws is not retried forever. It is tried again subject by
+ * subject at once: the subjects that still throw are left out, recorded in
+ * meta 'claim_state_skipped' (root, error, when; the latest
+ * CLAIM_STATE_SKIPPED_KEPT), and the cursor moves on; the next pass tries them
+ * again. When every subject throws, the trouble is not the slice's (the store,
+ * say): the cursor stays and the error is raised, up to
+ * CLAIM_STATE_SLICE_TRIES runs in a row; then the slice is let go and
+ * recorded the same way. `apply` stands in for the slice's work in tests.
  */
-export async function refreshClaimStateStep(store: Store, opts: { budget?: number } = {}): Promise<{ subjects: number; claims: number; keys: number; superseded: number; passDone: boolean }> {
+export async function refreshClaimStateStep(
+  store: Store,
+  opts: { budget?: number; apply?: (subjects: string[]) => Promise<{ keys: number; superseded: number }> } = {},
+): Promise<{ subjects: number; claims: number; keys: number; superseded: number; skipped: number; passDone: boolean }> {
   const budget = Math.max(1, opts.budget ?? CLAIM_STATE_STEP_CLAIMS);
-  const after = (await store.getMeta<{ after?: string }>(STEP_META))?.after;
+  const pass = (await store.getMeta<{ after?: string; failures?: number }>(STEP_META)) ?? {};
+  const after = pass.after;
   const roots = await store.query<{ root: string; n: number }>(
     `SELECT COALESCE(se.canonical_id, c.subject_id) AS root, count(*)::int AS n
      FROM claims c JOIN entities se ON se.id = c.subject_id
@@ -337,20 +355,50 @@ export async function refreshClaimStateStep(store: Store, opts: { budget?: numbe
     claims += r.n;
   }
   const passDone = take.length === roots.length;
+  const apply = opts.apply ?? (async (subjects: string[]) => {
+    const k = await refreshAttributeKeys(store, { subjects });
+    return { keys: k.mapped + k.dropped, superseded: await supersedeByAttribute(store, { subjects }) };
+  });
+  const subjectsOf = async (group: string[]) => {
+    const members = await store.query<{ id: string }>(`SELECT id FROM entities WHERE id = ANY($1::text[]) OR canonical_id = ANY($1::text[])`, [group]);
+    return [...new Set([...group, ...members.map((m) => m.id)])];
+  };
   let keys = 0;
   let superseded = 0;
+  const failed: { root: string; error: string }[] = [];
   if (take.length > 0) {
-    const members = await store.query<{ id: string }>(
-      `SELECT id FROM entities WHERE id = ANY($1::text[]) OR canonical_id = ANY($1::text[])`,
-      [take],
-    );
-    const subjects = [...new Set([...take, ...members.map((m) => m.id)])];
-    const k = await refreshAttributeKeys(store, { subjects });
-    keys = k.mapped + k.dropped;
-    superseded = await supersedeByAttribute(store, { subjects });
+    try {
+      const r = await apply(await subjectsOf(take));
+      keys += r.keys;
+      superseded += r.superseded;
+    } catch (err) {
+      // which of the slice's subjects is it: each alone
+      let lastError = err;
+      for (const root of take) {
+        try {
+          const r = await apply(await subjectsOf([root]));
+          keys += r.keys;
+          superseded += r.superseded;
+        } catch (e) {
+          lastError = e;
+          failed.push({ root, error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+      const failures = (pass.failures ?? 0) + 1;
+      if (failed.length === take.length && failures < CLAIM_STATE_SLICE_TRIES) {
+        await store.setMeta(STEP_META, { ...(after ? { after } : {}), failures });
+        throw lastError;
+      }
+    }
+  }
+  if (failed.length > 0) {
+    const at = new Date().toISOString();
+    const before = (await store.getMeta<{ root: string; error: string; at: string }[]>(SKIPPED_META)) ?? [];
+    const kept = [...before.filter((b) => !failed.some((f) => f.root === b.root)), ...failed.map((f) => ({ ...f, at }))];
+    await store.setMeta(SKIPPED_META, kept.slice(-CLAIM_STATE_SKIPPED_KEPT));
   }
   await store.setMeta(STEP_META, passDone ? {} : { after: take.at(-1) });
-  return { subjects: take.length, claims, keys, superseded, passDone };
+  return { subjects: take.length, claims, keys, superseded, skipped: failed.length, passDone };
 }
 
 /** Refine's claim-state step: read what is unread, unify keys, then mark supersession. */

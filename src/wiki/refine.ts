@@ -141,7 +141,7 @@ export async function refineWiki(
     // keys and supersession by attribute, a bounded slice of the subjects a run (refreshClaimStateStep)
     const step = await refreshClaimStateStep(store);
     stats.claimStateRead = state;
-    if (state || step.keys || step.superseded) progress(`claim state: ${state} claims read; ${step.subjects} subjects (${step.claims} keyed claims): ${step.keys} attribute keys changed, ${step.superseded} supersession marks${step.passDone ? ', pass done' : ''}`);
+    if (state || step.keys || step.superseded || step.skipped) progress(`claim state: ${state} claims read; ${step.subjects} subjects (${step.claims} keyed claims): ${step.keys} attribute keys changed, ${step.superseded} supersession marks${step.skipped ? `, ${step.skipped} subjects skipped (meta claim_state_skipped)` : ''}${step.passDone ? ', pass done' : ''}`);
   } catch (err) {
     progress(`claim state failed: ${err instanceof Error ? err.message : err}`);
   }

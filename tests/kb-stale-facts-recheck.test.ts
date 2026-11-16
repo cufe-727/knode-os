@@ -191,3 +191,49 @@ describe('a bare identifier no incident carries', () => {
     }
   });
 });
+
+describe('a refine slice that fails', () => {
+  const projects = ['甲项目', '乙项目', '丙项目', '丁项目'];
+  const docs: Record<string, string> = {};
+  for (const [k, date] of [[1, '2025-03-03'], [2, '2025-03-10']] as const) {
+    docs[`raw/docs/w${k}.md`] = dated(`周报${k}`, date, `entities:\n${projects.map((p) => `  - { name: ${p}, type: project }`).join('\n')}\nclaims:\n${projects.map((p, i) => `  - { subject: ${p}, statement: ${p}进度为${10 * k + i}%, type: other }`).join('\n')}\n`);
+  }
+
+  it('skips the subject that fails every time and records it, and the pass goes on', async () => {
+    const { refreshClaimStateStep } = await import('../src/graph/claim-state-store.js');
+    const ctx = await workspace('slice-fails', docs);
+    // one subject whose slice throws however often it is tried
+    const apply = async (subjects: string[]) => {
+      if (subjects.includes('乙项目')) throw new Error('bad subject');
+      return { keys: 0, superseded: 0 };
+    };
+    const done: string[] = [];
+    for (let i = 0; i < 6; i++) {
+      try {
+        const r = await refreshClaimStateStep(ctx.store, { budget: 4, apply });
+        if (r.passDone) { done.push('pass'); break; }
+      } catch { done.push('failed'); }
+    }
+    expect(done.at(-1)).toBe('pass');
+    expect(done.filter((d) => d === 'failed').length).toBeLessThanOrEqual(3);
+    const skipped = await ctx.store.getMeta<{ root: string; error: string }[]>('claim_state_skipped');
+    expect(skipped?.map((s) => s.root)).toEqual(['乙项目']);
+    expect(skipped?.[0].error).toMatch(/bad subject/);
+  });
+
+  it('retries a failure that is not the slice\'s, a bounded number of times', async () => {
+    const { refreshClaimStateStep } = await import('../src/graph/claim-state-store.js');
+    const ctx = await workspace('slice-down', docs);
+    let calls = 0;
+    const apply = async () => { calls++; throw new Error('database gone'); };
+    const outcomes: string[] = [];
+    for (let i = 0; i < 6; i++) {
+      try { outcomes.push((await refreshClaimStateStep(ctx.store, { budget: 4, apply })).passDone ? 'pass' : 'step'); } catch { outcomes.push('failed'); }
+    }
+    // every subject failing is the store's trouble: the slice (two subjects) is retried, then let go and recorded, never retried forever
+    expect(outcomes).toEqual(['failed', 'failed', 'step', 'failed', 'failed', 'pass']);
+    expect(calls).toBe(18);
+    const skipped = await ctx.store.getMeta<{ root: string }[]>('claim_state_skipped');
+    expect(skipped?.map((s) => s.root)).toEqual(['丁项目', '丙项目', '乙项目', '甲项目'].sort((a, b) => (a < b ? -1 : 1)));
+  });
+});
