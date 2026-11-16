@@ -1,7 +1,7 @@
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../store/db.js';
 import { SearchResult } from '../types.js';
 import { factsForQuestion, QuestionFact } from './facts.js';
-import { CJK_QUERY_STOP, keywordTerms, LATIN_QUERY_STOP, termCount } from './search.js';
+import { chunksForTerms, CJK_QUERY_STOP, keywordTerms, LATIN_QUERY_STOP, termCount } from './search.js';
 
 /**
  * A second retrieval round when the first is thin (docs/design/34 §2).
@@ -50,8 +50,10 @@ export const BRIDGE_DOCS_WORDED = 80;
 const BRIDGES = 4;
 /** Passages read as candidates at most, the best first (nearest the question, else holding most missing words). */
 const CANDIDATES = 240;
-/** Mentions of the entities looked from read at most, before the candidates are ranked: a hub has thousands. */
+/** Mentions of the entities looked from read at most, besides the ranked ones below: a hub has thousands. */
 const POOL = 2000;
+/** Passages nearest the question read off the vector index, and passages holding a missing word read off the keyword index, before they are kept to the entities' own: a hub's best passages are ranked before any cut. */
+const RANKED_POOL = 400;
 /** The word segmenter the search's bridge terms use (search/bridge.ts). */
 const SEGMENTER = new Intl.Segmenter('zh', { granularity: 'word' });
 /** Longest run of characters the segmenter cut one by one kept as one word (a name it does not know). */
@@ -221,13 +223,29 @@ export async function secondRound(
   const from = [...uncoveredIds, ...bridges.map((b) => b.id)];
   if (from.length === 0) return null;
 
-  // the passages that mention them, most of them first, then the missing words, then nearness
+  // the passages that mention them, most of them first, then nearness, then the missing words. A hub's mentions are
+  // more than any pool: its passages nearest the question (the vector index) and those holding a missing word (the
+  // keyword index) are read first, ranked, and only then kept to the entities' own; a bounded pool of the rest after
   const shown = contexts.map((c) => c.chunkId);
+  const ranked = new Set<string>();
+  if (withVector) {
+    for (const r of await q<{ chunk_id: string }>(
+      `SELECT chunk_id FROM embeddings WHERE model = $2 ORDER BY embedding <=> $1::${VECTOR_TYPE} LIMIT ${RANKED_POOL}`,
+      [toVectorLiteral(opts.queryVector!), opts.model],
+    )) ranked.add(r.chunk_id);
+  }
+  if (missing.length) {
+    statements++;
+    const byTerms = await chunksForTerms(store, missing.slice(0, 6), missing.slice(0, 6).map(() => 1), Math.min(6, missing.length), { exclude: shown, perTerm: Math.ceil(RANKED_POOL / 3) }).catch(() => []);
+    for (const r of byTerms) ranked.add(r.chunk_id);
+  }
   const words = missing.slice(0, 6).map((t) => `%${t.replace(/[%_\\]/g, '\\$&')}%`);
   const wordsSql = words.length ? words.map((_, i) => `(c.content ILIKE $${withVector ? 6 + i : 4 + i})::int`).join(' + ') : '0';
   const cands = await q<{ chunk_id: string; document_id: string; path: string; title: string | null; content: string; doc_date: string | Date | null; hits: number; ents: string[]; sim: number | null; words: number }>(
     `WITH m AS MATERIALIZED (
-       SELECT chunk_id, entity_id FROM entity_mentions WHERE entity_id = ANY($1::text[]) AND NOT chunk_id = ANY($2::text[]) LIMIT ${POOL}
+       (SELECT chunk_id, entity_id FROM entity_mentions WHERE entity_id = ANY($1::text[]) AND chunk_id = ANY($${withVector ? 6 + words.length : 4 + words.length}::text[]) AND NOT chunk_id = ANY($2::text[]))
+       UNION
+       (SELECT chunk_id, entity_id FROM entity_mentions WHERE entity_id = ANY($1::text[]) AND NOT chunk_id = ANY($2::text[]) LIMIT ${POOL})
      ), hit AS (
        SELECT chunk_id, count(DISTINCT entity_id)::int AS hits, array_agg(DISTINCT entity_id) AS ents FROM m GROUP BY 1
      ), scored AS (
@@ -238,7 +256,7 @@ export async function secondRound(
        WHERE d.status = 'indexed'
      )
      SELECT * FROM scored ORDER BY hits DESC, ${withVector ? 'sim DESC NULLS LAST, ' : ''}words DESC, chunk_id LIMIT $3`,
-    withVector ? [from, shown, CANDIDATES, toVectorLiteral(opts.queryVector!), opts.model, ...words] : [from, shown, CANDIDATES, ...words],
+    withVector ? [from, shown, CANDIDATES, toVectorLiteral(opts.queryVector!), opts.model, ...words, [...ranked]] : [from, shown, CANDIDATES, ...words, [...ranked]],
   );
   const scored = cands.map((c) => {
     const words = missing.filter((t) => termCount(c.content.toLowerCase(), t) > 0).length;

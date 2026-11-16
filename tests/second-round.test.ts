@@ -188,6 +188,27 @@ describe('the second round', () => {
   });
 });
 
+describe('a hub larger than the mention pool', () => {
+  beforeAll(async () => {
+    // 2,500 passages mention Vega before the two that matter: one nearest the question, one naming its chairman
+    await addEntity('vega', 'Vega', 'organization');
+    await store.query(`INSERT INTO documents (id, path, root, title, sha256, bytes, status) SELECT 'vega-' || i, 'raw/docs/vega-' || i || '.md', 'docs', 'vega-' || i, 'sha-vega-' || i, 10, 'indexed' FROM generate_series(1, 2500) i`);
+    await store.query(`INSERT INTO chunks (id, document_id, seq, content, token_count, tsv) SELECT 'c-vega-' || i, 'vega-' || i, 0, 'Vega weekly note ' || i || ': shipments as planned.', 3, to_tsvector('simple', 'vega weekly note') FROM generate_series(1, 2500) i`);
+    await store.query(`INSERT INTO embeddings (chunk_id, model, embedding) SELECT 'c-vega-' || i, $1, $2::${VECTOR_TYPE} FROM generate_series(1, 2500) i`, [embedder.model, toVectorLiteral([1, 0, 0, 0])]);
+    await store.query(`INSERT INTO scopes (id, kind, key, sha, status, applied_at) SELECT 's-vega-' || i, 'doc', 'raw/docs/vega-' || i || '.md', 'sha-vega-' || i, 'active', now() FROM generate_series(1, 2500) i`);
+    await store.query(`INSERT INTO entity_mentions (entity_id, chunk_id, document_id, scope_id) SELECT 'vega', 'c-vega-' || i, 'vega-' || i, 's-vega-' || i FROM generate_series(1, 2500) i`);
+    await addDoc('vega-zz-near', 'Vega board minutes.', ['vega'], [0, 0, 1, 0]);
+    await addDoc('vega-zz-chair', 'The chairman of Vega is Lin Qiao.', ['vega']);
+  });
+
+  it('ranks the hub\'s passages by the question before cutting: the nearest, else the one holding its missing word', async () => {
+    const nearest = await secondRound(store, 'Who is the chairman of Vega?', { named: ['vega'], contexts: [], facts: [], chain: false, queryVector: [0, 0, 1, 0], model: embedder.model });
+    expect(nearest!.chunks[0].path).toBe('raw/docs/vega-zz-near.md');
+    const worded = await secondRound(store, 'Who is the chairman of Vega?', { named: ['vega'], contexts: [], facts: [], chain: false });
+    expect(worded!.chunks.map((c) => c.path)).toContain('raw/docs/vega-zz-chair.md');
+  });
+});
+
 describe('ask with a second round', () => {
   const llm = { enabled: false } as unknown as LlmClient;
   it('runs no second round for a walked chain whose first round already reached the step', async () => {
