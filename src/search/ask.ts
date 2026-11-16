@@ -8,7 +8,7 @@ import { EXCERPT_CHARS, excerptsForQuestion, isListQuestion } from './excerpts.j
 import { factsForQuestion, namedEntities, namedSurface, QuestionFact } from './facts.js';
 import { search, SearchMode } from './search.js';
 import { EnumeratedClaim, Enumeration, enumerateClaims, typesInQuestion } from './enumerate.js';
-import { ComputedSet, computeClaimSet } from './claimset.js';
+import { ComputedSet, computeClaimSet, SET_BUDGET_MS } from './claimset.js';
 import { secondRound } from './second.js';
 import { isChainQuestion, QuestionKind, QuestionRoute, questionRange, routeQuestion } from './route.js';
 import { stepsAsFacts, walkRelations } from './walk.js';
@@ -44,6 +44,8 @@ export interface AskRoute {
   };
   /** For a question asking for a set, a count or a value as of a date: what the claims gave (docs/design/34 §1). */
   computed?: { op: string; scope: string; matched: number; items: number; rows: number; ms: number };
+  /** A set the question asks for that was not computed because its time budget ran out: the answer may be incomplete. */
+  computedSkipped?: { why: string; budgetMs: number; ms: number };
   /** When the first round was thin: what the second found, and why it ran (docs/design/34 §2). */
   second?: { chunks: number; facts: number; from: string[]; uncoveredNamed: string[]; missingTerms: string[]; statements: number; ms: number };
 }
@@ -60,6 +62,26 @@ Rules:
 /** The rule an enumerated answer adds: the facts are the whole match, and the counts are over it. */
 const ENUMERATED_RULE = `
 - Known facts marked "enumerated" are every claim the knowledge base holds about what the question names (in the period it names): answer a list with every relevant item, merging the same item stated by several sources; count distinct items or events, not lines; the "Counts" section is computed over all matching claims, including any not listed. A fact marked "replaced later" was true until a newer fact replaced it: use it for history, not as the current state.`;
+
+/**
+ * A set left uncomputed past its time budget. On PGlite (WASM on this thread) no timer fires while a statement runs,
+ * so the budget is overrun by the statement under way when it passes; on PostgreSQL the wait ends at the budget
+ * and the statement finishes on the server, unwaited.
+ */
+interface SpentBudget { budgetMs?: number; ms?: number }
+const OVER_BUDGET_GAP = 'The set the question asks for was not computed from the claims (its time budget ran out): the answer may be incomplete.';
+const renderOverBudget = (s: Required<SpentBudget>) =>
+  `\n\n# Computed from the claims\nNot computed: its time budget of ${s.budgetMs} ms ran out (after ${s.ms} ms). The facts above were not checked to hold every item or reading the question asks for: say that the answer may be incomplete.`;
+
+/** Compute the set a question asks for, noting in `spent` when its time budget ran out. */
+function computeSet(store: Store, question: string, routed: Pick<QuestionRoute, 'kind' | 'range'>, named: string[], now: string | undefined, router: ReturnType<typeof defaultAskRouterConfig>, spent: SpentBudget): Promise<ComputedSet | null> {
+  const started = Date.now();
+  const budgetMs = router.computedBudgetMs ?? SET_BUDGET_MS;
+  return computeClaimSet(store, question, routed, named, {
+    now, budgetMs,
+    skipped: (why) => { if (why === 'over its time budget') Object.assign(spent, { budgetMs, ms: Date.now() - started }); },
+  }).catch(() => null);
+}
 
 /** The rule a computed set adds: its counts and values were computed in code over every matching claim. */
 const COMPUTED_RULE = `
@@ -187,10 +209,11 @@ export async function ask(
   // a set, a count or a value as of a date is computed from the claims, whichever route answers the rest
   const named = await namedEntities(store, question);
   const computing = opts.computed ?? router.computedSets === true;
+  const spent: SpentBudget = {};
   const computed = computing && (routed.kind === 'list' || routed.kind === 'aggregate' || routed.kind === 'lookup')
-    ? await computeClaimSet(store, question, routed, named, { now: opts.now, budgetMs: router.computedBudgetMs }).catch(() => null)
+    ? await computeSet(store, question, routed, named, opts.now, router, spent)
     : null;
-  const env: RouteEnv = { store, config, embedder, llm, question, opts, queryVector, router, routed, named, computed };
+  const env: RouteEnv = { store, config, embedder, llm, question, opts, queryVector, router, routed, named, computed, spent };
 
   if (routed.kind === 'list' || routed.kind === 'aggregate' || routed.kind === 'timeline') {
     const enumerated = await enumeratedAnswer(env);
@@ -215,6 +238,8 @@ interface RouteEnv {
   named: string[];
   /** The set the claims gave, when the question asks for one. */
   computed: ComputedSet | null;
+  /** Filled when a set was asked for and its time budget ran out. */
+  spent: SpentBudget;
 }
 
 const routeOf = (r: QuestionRoute, extra: Partial<AskRoute> = {}): AskRoute => ({ kind: r.kind, by: r.by, range: r.range, ...extra });
@@ -339,7 +364,7 @@ async function multihopAnswer(env: RouteEnv): Promise<AskResult> {
     // a walked question gets a computed set too, under the same switch, reference day and time budget as any other
     env.computed ? Promise.resolve(env.computed)
       : (opts.computed ?? router.computedSets === true)
-        ? computeClaimSet(store, question, { kind: 'lookup', range: env.routed.range }, named, { now: opts.now, budgetMs: router.computedBudgetMs }).catch(() => null)
+        ? computeSet(store, question, { kind: 'lookup', range: env.routed.range }, named, opts.now, router, env.spent)
         : Promise.resolve(null),
   ]);
   const seen = new Set(retrieved.map((r) => r.chunkId));
@@ -400,10 +425,13 @@ async function compose(env: RouteEnv, firstContexts: SearchResult[], firstRanked
   const inSet = new Set(setRows.map((f) => f.id));
   // a computed set's rows count toward the enumerate limit: the facts listed stay within it
   const facts = [...setRows, ...ranked.filter((f) => !inSet.has(f.id))].slice(0, computed ? Math.max(env.router.enumerateLimit, setRows.length) : undefined);
-  const extra = `${counts}${computed ? renderComputed(computed) : ''}`;
+  // a set asked for and left uncomputed for time is said, in the prompt, the route and the gaps
+  const overBudget = !computed && env.spent.ms !== undefined ? (env.spent as Required<SpentBudget>) : null;
+  const extra = `${counts}${computed ? renderComputed(computed) : overBudget ? renderOverBudget(overBudget) : ''}`;
   const route: AskRoute = computed
     ? { ...routed, computed: { op: computed.op, scope: computed.scope, matched: computed.matched, items: computed.items, rows: setRows.length, ms: computed.ms } }
-    : routed;
+    : overBudget ? { ...routed, computedSkipped: { why: 'over its time budget', ...overBudget } } : routed;
+  const budgetGap = overBudget ? [OVER_BUDGET_GAP] : [];
   const system = `${ASK_SYSTEM}${route.enumerated ? ENUMERATED_RULE : ''}${computed ? COMPUTED_RULE : ''}`;
   // what a reference number stands for: the chunks first, then the facts
   const refs = [
@@ -415,7 +443,7 @@ async function compose(env: RouteEnv, firstContexts: SearchResult[], firstRanked
     return {
       answer: 'The Judge stage has no model (Settings → Ingest, or extraction.judgeLlm in knode.config.json) — returning retrieved context only.',
       citations: contexts.map((c, i) => ({ ref: i + 1, path: c.path, chunkId: c.chunkId })),
-      gaps: [],
+      gaps: budgetGap,
       contexts,
       facts,
       route,
@@ -452,7 +480,7 @@ async function compose(env: RouteEnv, firstContexts: SearchResult[], firstRanked
     answer,
     // a fact whose source is no longer known has nothing to cite
     citations: cited.filter((n) => refs[n - 1].path).map((n) => ({ ref: n, ...refs[n - 1] })),
-    gaps,
+    gaps: [...budgetGap, ...gaps],
     contexts,
     facts,
     route,

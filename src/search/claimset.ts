@@ -738,8 +738,12 @@ function withDeadline(store: Store, deadline: number): Store {
       clearTimeout(timer);
     }
   };
-  return Object.assign(Object.create(store) as Store, { query });
+  const bounded = Object.assign(Object.create(store) as Store, { query });
+  unbounded.set(bounded, store);
+  return bounded;
 }
+/** The store a deadline-bound one reads: what is cached per store (the claims' columns) is cached on it. */
+const unbounded = new WeakMap<Store, Store>();
 
 export async function computeClaimSet(
   store: Store,
@@ -783,7 +787,8 @@ async function computeWithin(
   const late = () => Date.now() - started >= budget;
   const read = readSetQuestion(question, routed, opts.now ?? todayIso());
   if (!read || read.unreadPeriod) return skip('no set asked, or a period no rule reads');
-  const typed = await typedColumns(store);
+  // the claims' columns, read once per store: a read that ran out of time would be cached as a store without claim state
+  const typed = await typedColumns(unbounded.get(store) ?? store);
   if (!typed.attribute || !typed.effective) return skip('the store has no claim state'); // a store before claim state: nothing to compute over
   // a merged spelling is its survivor: as scope, as what is asked about, and as the subject of a claim filed under it
   const survivorOf = await survivorsOf(store, named);

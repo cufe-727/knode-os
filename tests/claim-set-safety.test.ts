@@ -589,6 +589,19 @@ describe('round three (C1-C7)', () => {
     expect(await set('瑞声光学的最低净利润是多少？', ['rsy'])).toBeNull();
   });
 
+  it('C7: an answer whose set ran out of time says it may be incomplete', async () => {
+    const { llm, prompts } = recordingLlm();
+    const res = await ask(store, withRouter({ computedBudgetMs: 0 }), embedder, llm, '宁德时代有哪些客户？', { computed: true });
+    expect(res.computed).toBeUndefined();
+    expect(res.route.computedSkipped).toMatchObject({ why: 'over its time budget', budgetMs: 0 });
+    expect(prompts[0]).toMatch(/# Computed from the claims\nNot computed: its time budget of 0 ms ran out/);
+    expect(res.gaps.join('\n')).toMatch(/may be incomplete/);
+    // a set computed in time, or none asked, says nothing of the kind
+    const fine = await ask(store, withRouter({ computedBudgetMs: 60_000 }), embedder, recordingLlm().llm, '宁德时代有哪些客户？', { computed: true });
+    expect(fine.route.computedSkipped).toBeUndefined();
+    expect(fine.gaps.join('\n')).not.toMatch(/may be incomplete/);
+  });
+
   it('C4: reads 前三季度 and a year-to-date window as a running total, not the third quarter', async () => {
     expect(periodOf({ statement: '青藤科技2025年前三季度营收330亿元' })).toMatchObject({ gran: 'ytd', key: '2025-09' });
     expect(periodOf({ statement: 'x', valid_from: '2025-01-01', valid_to: '2025-09-30' })).toMatchObject({ gran: 'ytd', key: '2025-09' });
