@@ -68,27 +68,33 @@ describe('reading a claim as attribute + value', () => {
     expect(keyQualifiers('支付成功率')).toBe('');
     expect(keyQualifiers('支付成功率环比变化')).toBe(keyQualifiers('支付成功率环比'));
     expect(keyQualifiers('初始间隔')).toBe('初始');
+    expect(keyQualifiers('目标价')).toBe('计划');
     const m = unifyAttributeKeys([
       { attribute: '支付成功率', count: 40, units: ['%'] },
       { attribute: '支付成功率环比变化', count: 30, units: ['%'] },
       { attribute: '支付成功率环比', count: 9, units: ['%'] },
-    ]);
-    expect(m.has('支付成功率环比变化')).toBe(false);
-    expect(m.get('支付成功率环比')?.canonical).toBe('支付成功率环比变化');
+      { attribute: '股价', count: 5, units: ['元'] },
+      { attribute: '目标价', count: 9, units: ['元'] },
+      { attribute: '营收', count: 9, units: ['亿元'] },
+      { attribute: '营收指引', count: 3, units: ['亿元'] },
+    ], ['贵州茅台']);
+    // only the two spellings of one week-on-week change are one key; a target is not the price, guidance not revenue
+    expect([...m.entries()].map(([k, v]) => `${k}→${v.canonical}`)).toEqual(['支付成功率环比变化→支付成功率环比']);
   });
 
   it('makes the keys that name a setting itself one key, and its first value another', () => {
     const spellings = subjectSpellingsOf('对账批次间隔（第一事业部支付组 · T2-C2）', ['T2-C2', '批次间隔']);
-    expect(spellings).toEqual(expect.arrayContaining(['对账批次间隔', 'T2-C2', '批次间隔']));
+    // the name, the name without the split's suffix, the code — not the other aliases
+    expect(spellings.sort()).toEqual(['T2-C2', '对账批次间隔', '对账批次间隔（第一事业部支付组 · T2-C2）'].sort());
     expect(namesSubject('间隔', spellings)).toBe(true);
+    expect(namesSubject('批次间隔', spellings)).toBe(true);
     expect(namesSubject('配置值', spellings)).toBe(true);
     expect(namesSubject('在岗人数', spellings)).toBe(false);
     // the head of a name is its end: 增长 does not name 增长组
     expect(namesSubject('增长', ['增长组'])).toBe(false);
-    // the same head as a name that is a measure: 连接上限 is the value of 订单库连接池上限
-    expect(namesSubject('连接上限', ['订单库连接池上限'])).toBe(true);
-    expect(namesSubject('支付成功率', ['第一事业部支付组'])).toBe(false);
-    expect(namesSubject('在岗人数', ['第一事业部平台组'])).toBe(false);
+    // one head word is not one measure, and a value word names nothing of a subject without a code
+    expect(namesSubject('连接上限', ['订单库连接池上限'])).toBe(false);
+    expect(namesSubject('配置值', ['某基金'])).toBe(false);
     const m = unifyAttributeKeys([
       { attribute: '初始间隔', count: 14, units: ['分钟'] },
       { attribute: '间隔', count: 9, units: ['分钟'] },
@@ -96,6 +102,7 @@ describe('reading a claim as attribute + value', () => {
       { attribute: '批次间隔', count: 1, units: ['分钟'] },
       { attribute: '初始对账批次间隔', count: 3, units: ['分钟'] },
     ], spellings);
+    // canonical by rule: the shortest key that names the setting, whatever the counts
     expect(m.get('配置值')?.canonical).toBe('间隔');
     expect(m.get('批次间隔')?.canonical).toBe('间隔');
     expect(m.has('间隔')).toBe(false);
@@ -108,7 +115,9 @@ describe('reading a claim as attribute + value', () => {
       { attribute: '事故级别', count: 3, units: [''] },
       { attribute: '事故等级', count: 2, units: [''] },
     ]);
-    expect(m.get('事故等级')?.canonical).toBe('事故级别');
+    expect(m.size).toBe(1);
+    // a qualified state is not the state
+    expect(unifyAttributeKeys([{ attribute: '审批状态', count: 9, units: [''] }, { attribute: '状态', count: 3, units: [''] }]).size).toBe(0);
   });
 
   it('reads one week however a value spells it', () => {

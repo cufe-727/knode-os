@@ -113,3 +113,34 @@ claims:
     expect(seriesRelation({ ...base, object: 'b', value_text: '已完成', eff: '2025-06-16' }, { ...base, object: 'b', value_text: '已完成', eff: '2025-06-16' })).toBe('same');
   });
 });
+
+describe('attribute keys of real subjects', () => {
+  const pairs = async (uses: [string, number, string][], name: string, aliases: string[] = []) => {
+    const { unifyAttributeKeys, subjectSpellingsOf } = await import('../src/graph/claim-state.js');
+    const m = unifyAttributeKeys(uses.map(([attribute, count, u]) => ({ attribute, count, units: [u] })), subjectSpellingsOf(name, aliases));
+    return [...m.entries()].map(([k, v]) => `${k}→${v.canonical}`).sort();
+  };
+
+  it('keeps measures of one head word apart', async () => {
+    expect(await pairs([['批发价格', 10, '元'], ['零售价格', 8, '元'], ['出厂价格', 3, '元']], '猪肉价格')).toEqual([]);
+    expect(await pairs([['现货价格', 10, '万元'], ['期货价格', 8, '万元']], '碳酸锂价格')).toEqual([]);
+    expect(await pairs([['存款利率', 5, '%'], ['贷款利率', 9, '%'], ['按揭利率', 2, '%']], '贷款市场报价利率', ['贷款利率'])).toEqual([]);
+    expect(await pairs([['持股比例', 5, '%'], ['质押比例', 4, '%'], ['减持比例', 3, '%']], '大股东持股比例')).toEqual([]);
+    expect(await pairs([['基准利率', 5, '%'], ['利率', 3, '%']], '美联储', ['联邦基金利率', 'Fed'])).toEqual([]);
+  });
+
+  it('keeps a key that contains another apart, and value words apart under a subject without a code', async () => {
+    expect(await pairs([['股价', 5, '美元'], ['基准情景终点股价', 2, '美元']], '英伟达')).toEqual([]);
+    expect(await pairs([['首席执行官', 5, ''], ['临时首席执行官', 2, '']], '英伟达')).toEqual([]);
+    expect(await pairs([['h股 年内相对收益', 2, '%'], ['a股 年内相对收益', 2, '%']], '银行')).toEqual([]);
+    expect(await pairs([['配置', 5, '%'], ['仓位', 9, '%'], ['当前值', 2, '%'], ['设置', 1, '%']], '某基金')).toEqual([]);
+  });
+
+  it('still joins one measure spelled two ways, and the keys that name a coded setting', async () => {
+    expect(await pairs([['周活跃用户', 10, '万'], ['周活跃用户数', 3, '万']], '增长组')).toEqual(['周活跃用户数→周活跃用户']);
+    expect(await pairs([['批次间隔', 1, '分钟'], ['间隔', 9, '分钟'], ['配置值', 1, '分钟'], ['初始间隔', 14, '分钟']], '对账批次间隔（第一事业部支付组 · T2-C2）', ['T2-C2']))
+      .toEqual(['批次间隔→间隔', '配置值→间隔']);
+    // an entity named by its code: its name is among its aliases
+    expect(await pairs([['阈值', 1, '毫秒'], ['超时阈值', 1, '毫秒'], ['配置值', 1, '毫秒']], 'T1-C3', ['核心接口超时阈值', '超时线'])).toEqual(['超时阈值→阈值', '配置值→阈值']);
+  });
+});
