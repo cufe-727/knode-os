@@ -380,18 +380,24 @@ What the rules are now:
   (负责人 = 廖欣 with 廖欣 as object), or a person named on a 状态 / 阶段 line
   (who handles it). The duplicate audit settles two claims as `same` by rule
   only toward one object (`seriesObject`, `seriesRelation`).
-- **Key unification.** Two keys of one unit and the same qualifiers are one
-  only when a synonym group holds both, when they differ by 的 / spaces / a
-  neutral last word (数, 数量, 水平; the change word after 环比 / 同比), or when
-  both name the subject: its name without a split's suffix, a tail of it, its
-  code, the aliases of an entity named by a code, and 配置值 / 取值 only for a
-  subject that carries a code. Containment, bigram similarity and a shared
-  head word no longer join keys (股价 / 基准情景终点股价, 零售价格 / 批发价格).
-  The canonical key is chosen by rule: the synonym head, else the subject's
-  name, else the shortest key. On 484 finance subjects with two or more keys
-  this joins 11 keys (main's rule joined 176).
+- **Key unification.** Keys of one unit and the same qualifiers (环比 / 同比 /
+  变化, 初始, 计划 / 目标 / 指引, 平均, 累计, 峰值 / 最高, 最低) join as claim
+  state always joined them — one contains the other, or their bigrams mostly
+  agree (归母净利润 / 净利润, 销售毛利率 / 毛利率, 市盈率TTM / 市盈率) — and also
+  through a synonym group, a pure wording difference, or by both naming the
+  subject (its name without a split's suffix, a tail of it, its code, the
+  aliases of an entity named by a code; 配置值 / 取值 only for a subject that
+  carries a code). Never across a qualifier, and never by a shared head word
+  alone (零售价格 / 批发价格). The canonical key is chosen by rule: the synonym
+  head, else the subject's name, else the shortest key that no other member
+  only extends by a neutral word (指数, not 指). On 484 finance subjects the
+  original rule put 296 pairs of keys together, this one 246: the 51 pairs no
+  longer together all cross a qualifier.
+- **Owner and state claims with no object** are read for what they are about
+  ("云业务由张三负责" → 云业务), so two businesses' owners are two series.
 - **Identifiers.** Only identifiers of one numbered series (letters, a
-  separator, a counter: INC-001-T1, R-07, GPT-4) are kept apart; codes that
+  separator, a counter: INC-001-T1, R-07, GPT-4) with another counter or two
+  different tails are kept apart (INC-006 and INC-006-T1 are not); codes that
   run letters into digits (H100, CU2501, FY24) and a prefix in front
   (vivoX100, SHFE.CU2501) are not. A series identifier resolves by itself
   alone, and an entity named by one is reached only by an identifier it
@@ -402,19 +408,29 @@ What the rules are now:
   `review.backReferences` lists periodic-report folders (`periodic`) or asks to
   `detect` series; only claims that state a fix take part, only an
   identified, unfixed event of the previous report is linked, and the run is
-  incremental. A link is a child scope of the scope carrying the fix claim:
-  disposed with that document, with its trust and acl, its document and
-  passage as the relation's source.
+  incremental; only the person the sentence gives as the fixer is linked. A
+  link is a child scope of the scope carrying the fix claim: disposed with
+  that document, with its trust and acl, its document and passage as the
+  relation's source; an incremental run also disposes it when the earlier
+  report it was resolved from changes or goes, and the step turned off
+  disposes every link.
+- **Bounds.** Refine keeps keys and supersession by attribute current in
+  slices of 200,000 keyed claims (cursor in meta 'claim_state_pass') and reads
+  5,000 code-named entities a run for the code merge (cursor in meta
+  'code_merge_pass'). Scaled from the 10× build (17,222 claims: keys 64 ms,
+  supersession by attribute ~210 ms, name splits + code merge 1.9 s), a whole
+  run on finance would be roughly 6 s + 20 s + a minute; a slice is a few
+  seconds and a pass takes about six refines. Not measured on finance.
 
 10× benchmark, fresh no-model rebuild + refine's model-free steps
 (`review.identity: "context"`; link step with the reports folder marked, or
 with `detect`, same result): settings whose current value is the script's
-50 of 90 (65 with the head-word rule, which the review showed joins different
-measures on real text), risk state 120 of 120, risk owner 120 of 120,
+56 of 90 (65 with the head-word rule, which the review showed joins different
+measures on real text), risk state 119 of 120, risk owner 120 of 120,
 incidents with an entity of their own 210 of 210, fix claims crediting
 another person 0, id-less fixes linked 74 of 75 with 0 wrong links, stated
-renames one entity 25 of 25, series with more than one current value 58 of
-1,066 (all with an undated monthly-summary value).
+renames one entity 25 of 25, series with more than one current value 66 of
+1,060 (all with an undated monthly-summary value).
 
 ### What an existing workspace sees, without anyone asking
 
@@ -430,17 +446,21 @@ renames one entity 25 of 25, series with more than one current value 58 of
   the workspace set `review.backReferences`.
 
 **At its next refine** (the nightly pass, or `knode-os refine`):
-- `claim_attribute_keys` is rewritten whole by the new rule. Stored keys move
-  through the mapping; no claim is read again and `CLAIM_STATE_VERSION` is
-  unchanged. Keys main had joined by containment or bigrams fall apart again
-  (on finance: 176 joins become 11), so some series split into the measures
-  they were.
-- Supersession is marked again over every series: owners and states toward
-  different objects become current side by side again; owners and states
-  read under 跟进人 / 风险状态 / 处理状态 join their 负责人 / 状态 series.
-- An entity named only by a code merges into the one entity that answers to
-  that code, if there is exactly one (reversible, logged with its reason; not
-  made again after a person undoes it). In a workspace on `"name"` this is new.
+- For the next slice of subjects (200,000 keyed claims, after a cursor), the
+  attribute keys are rewritten by the rule above and supersession by attribute
+  is marked again. Stored keys move through the mapping; no claim is read
+  again and `CLAIM_STATE_VERSION` is unchanged. Keys that crossed a qualifier
+  fall apart (环比涨幅 / 同比涨幅); owners and states toward different
+  objects, or about different things, become current side by side; owners and
+  states read under 跟进人 / 风险状态 / 处理状态 join their 负责人 / 状态
+  series. Other subjects follow in later refines.
+- For the next 5,000 code-named entities, one named only by a code merges into
+  the one entity that answers to that code, if there is exactly one
+  (reversible, logged with its reason; not made again after a person undoes
+  it). In a workspace on `"name"` this is new.
+- Entities split by the prefix rule of 7a299bf (x100 beside vivox100) do not
+  exist in a live workspace: that rule was never deployed, and under the
+  deployed rules both arrival orders end as one entity. Nothing rejoins them.
 - The back-reference step does nothing unless `review.backReferences` is set.
   With it set, its first run reads every document (no cursor yet), later runs
   only what was applied since.
