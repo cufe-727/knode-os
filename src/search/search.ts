@@ -849,9 +849,10 @@ async function vectorSearch(
   if (held.remembered && sizesOf(held).sources === 0 && sizesOf(held).generated === 0) held = await sideSizes(store, sides, readMax, asOf, filter, true);
   /**
    * How a side is ranked: its vectors read; the index walked on for it (the sources, and the pages
-   * where the search has no sources to return: it asked for pages, or its filter leaves none — a
-   * search of `wiki`, of `wiki/entities`); or its chunks among the nearest of all the search may
-   * return, without walking on for them (pages beside sources).
+   * where the search has no sources to return — it asked for pages, or its filter leaves none: a
+   * search of `wiki`, of `wiki/entities` — or where the caller named the sides); or its chunks among
+   * the nearest of all the search may return, without walking on for them (pages beside sources in a
+   * search that names no side).
    *
    * Each side is judged on its own. One that holds `readMax` chunks at the most is read, exactly; a
    * larger one is walked for, `budget` rows of the index at the most, half each where both sides are
@@ -864,7 +865,15 @@ async function vectorSearch(
    */
   const size = (generated: boolean) => sizesOf(held)[generated ? 'generated' : 'sources'];
   const sources: 'none' | 'read' | 'walk' = size(false) === 0 ? 'none' : size(false) <= readMax ? 'read' : 'walk';
-  const pages: 'none' | 'read' | 'near' | 'walk' = size(true) === 0 ? 'none' : size(true) <= readMax ? 'read' : sources === 'none' ? 'walk' : 'near';
+  // Pages too many to read, beside sources. Where the caller named the sides — kinds, or places — the
+  // pages are theirs to have: they are walked for on their own, as the sources are, and a walk that ends
+  // short is said. Taken as the pages among the nearest chunks, 6,000 pages a caller had named beside
+  // 36,000 walked sources were none, with nothing said, where the same pages beside sources few enough
+  // to read are read and get their share. A search narrowed only by a date, a trust tier or an actor
+  // names no side: its pages are those among the nearest, as in a search of everything — a walk of their
+  // own for pages that are seldom near is what made every search several times slower.
+  const namesSides = Boolean(filter?.kinds || filter?.sources);
+  const pages: 'none' | 'read' | 'near' | 'walk' = size(true) === 0 ? 'none' : size(true) <= readMax ? 'read' : sources === 'none' || namesSides ? 'walk' : 'near';
   const walks = Number(sources === 'walk') + Number(pages === 'walk' || pages === 'near');
   const walkMax = narrowed ? Math.floor(budget / Math.max(1, walks)) : SIDE_ROWS_MAX;
   if (sources === 'none' && pages === 'none') return [];

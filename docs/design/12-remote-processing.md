@@ -211,7 +211,9 @@ processing is started, as embedding does now.
   of everything spends on a side are not its bound. Its measure is √(8 · k · chunks) rows, 10,000 at the most (the
   finance index is at that limit). Each side is judged on its own: one that holds half as many chunks again at the
   most (`scopedReadRows`: 15,000 there) is ranked by reading its vectors, a larger one by walking the index for the
-  measure's rows, half each where both sides are walked. The two were equal for a day, and a folder a little over
+  measure's rows, half each where both sides are walked. Where the caller named the sides (`kinds`, `sources`) the
+  pages are walked for on their own as the sources are; in a search narrowed only by a date, a trust tier or an
+  actor they are the pages among the nearest chunks, as in a search of everything. The two were equal for a day, and a folder a little over
   them and away from the question (12,383 chunks) was walked for 10,000 rows in most of a second and came back
   short for 17 questions of 30, where reading it takes 153,000 blocks and a tenth of a second. (For a day the two sides shared one budget, the smaller read first: a folder read beside pages left
   the pages a walk of a few hundred rows that found none and said nothing.) Each walk is a step of its own in the

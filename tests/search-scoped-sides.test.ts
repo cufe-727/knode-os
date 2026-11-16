@@ -134,6 +134,12 @@ describe.each(BACKENDS)('scoped searches on %s', (backend) => {
        SELECT 'sc-' || id, 'doc', path, 'x', 'applied', '2020-01-01T00:00:00Z', 'trusted' FROM documents WHERE path LIKE 'raw/docs/far/%'`,
     );
     await store.query(`UPDATE documents SET scope_id = 'sc-' || id WHERE path LIKE 'raw/docs/far/%'`);
+    // and the timelines came in 2025, quarantined and for one reader: as of 2031 the folder and they are live
+    await store.query(
+      `INSERT INTO scopes (id, kind, key, sha, status, applied_at, trust, acl)
+       SELECT 'sc-' || id, 'doc', path, 'x', 'applied', '2025-01-01T00:00:00Z', 'quarantined', '["archivist"]'::jsonb FROM documents WHERE path LIKE 'wiki/timelines/%'`,
+    );
+    await store.query(`UPDATE documents SET scope_id = 'sc-' || id WHERE path LIKE 'wiki/timelines/%'`);
     await store.query(`ANALYZE`);
   }, 240_000);
 
@@ -475,15 +481,54 @@ describe.each(BACKENDS)('scoped searches on %s', (backend) => {
       expect(results.every((r) => r.chunkId.startsWith('m'))).toBe(true);
     });
 
+    it('walks for the pages a caller named, on their own, beside sources that are walked for', async () => {
+      // 30,400 reports and the timelines, both walked for (the timelines as if they were too many to read),
+      // from among the reports: the nearest chunks the filter leaves are all reports. Taken as the pages
+      // among those, the timelines were none, and nothing said the 600 of them had not been looked for —
+      // where the same search with reports few enough to read reads the timelines and gives them their share.
+      const sent: string[] = [];
+      const watched = Object.create(store) as Store;
+      watched.query = ((sql: string, params?: unknown[]) => {
+        if (sql.includes('<=>')) sent.push(sql);
+        return store.query(sql, params);
+      }) as typeof store.query;
+      const { channels } = await searchExplained(watched, embedder, 'chunk', {
+        k: 8, mode: 'vector', track: false, current: false, queryVector: AMONG_REPORTS, exactSide: 0, filter: resolveScopeFilter({ sources: ['raw/docs/main', 'wiki/timelines'] }),
+      });
+      // each side has a walk of its own, half the rows each, and no side is the leavings of the other's
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).not.toContain('near AS');
+      expect(sent[0]).toContain('false AS generated, true AS walked');
+      expect(sent[0]).toContain('true AS generated, true AS walked');
+      expect(sent[0].match(/LIMIT 1483\b/g)).toHaveLength(2);
+      // the pages' walk either comes on the 24 asked for or the channel says it did not (which, of 600 pages
+      // among 45,850 chunks, depends on how the index was built): never none of them and nothing said
+      const partial = channels.vector?.partial;
+      expect(channels.vector?.hits === 48 || /of the 24 pages asked for/.test(partial ?? '')).toBe(true);
+      expect((channels.vector?.hits ?? 0) < 48).toBe(partial !== undefined);
+      // asked for by kind, the same
+      sent.length = 0;
+      await searchExplained(watched, embedder, 'chunk', { k: 8, mode: 'vector', track: false, current: false, queryVector: AMONG_REPORTS, exactSide: 0, filter: resolveScopeFilter({ kinds: ['doc', 'view'] }) });
+      expect(sent[0]).not.toContain('near AS');
+      // A search narrowed by a date, a trust tier or an actor names no side: its pages are the pages among
+      // the nearest chunks, as in a search of everything (a walk of their own for pages that are seldom
+      // near is what made a search three to five times slower). As of 2031 a folder and the timelines are live.
+      sent.length = 0;
+      await searchExplained(watched, embedder, 'chunk', { k: 8, mode: 'vector', track: false, current: false, queryVector: AMONG_REPORTS, exactSide: 0, asOf: '2031-01-01T00:00:00Z' });
+      await searchExplained(watched, embedder, 'chunk', { k: 8, mode: 'vector', track: false, current: false, queryVector: AMONG_REPORTS, exactSide: 0 });
+      for (const sql of sent) expect(sql).toContain('near AS');
+    });
+
     it('says so when the walk that looks for pages beside the sources ran out', async () => {
-      // sources and pages both too many to read (here they are not, and no side is read): the pages are those
-      // among the nearest forty chunks the filter leaves, and a walk that ends before it has forty has not
-      // shown there are none
+      // A search as of a date, which names no side: sources and pages both too many to read (here they are
+      // not, and no side is read). The pages are those among the nearest forty chunks the date leaves, and a
+      // walk that ends before it has forty has not shown there are none
       const { on, sent } = walksFindNothing();
       const { channels } = await searchExplained(on, embedder, 'chunk', {
-        k: 8, mode: 'vector', track: false, current: false, queryVector: AMONG_REPORTS, exactSide: 0, filter: resolveScopeFilter({ sources: ['raw/docs/far', 'wiki'] }),
+        k: 8, mode: 'vector', track: false, current: false, queryVector: AMONG_REPORTS, exactSide: 0, asOf: '2031-01-01T00:00:00Z',
       });
       expect(sent).toHaveLength(1);
+      expect(sent[0]).toContain('near AS');
       expect(channels.vector?.partial).toMatch(/ended at its limit of 1483 rows with 0 of the 24 sources asked for and 0 of the 24 pages asked for/);
     });
   });
