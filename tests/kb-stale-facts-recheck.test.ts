@@ -272,3 +272,29 @@ describe('owner changes worded in ways the clause reading does not cover', () =>
     expect(settleSeriesObjects([row('云业务由张三负责', '云业务'), row('由李四负责', '')])).toEqual(['~云业务', '']);
   });
 });
+
+describe('a name earlier in the sentence than the fix', () => {
+  it('is not a fixer: a list is the names joined inside the fixer phrase', async () => {
+    const { fixerSpans } = await import('../src/graph/backrefs.js');
+    expect(fixerSpans('客户 张三，由方杰修复')).toEqual(['方杰']);
+    expect(fixerSpans('上周那起支付超时影响了客户张三，由方杰和李明修复')).toEqual(['方杰', '李明']);
+    expect(fixerSpans("Last week's payment timeout hit Zhang San, and Fang Jie fixed it")).toEqual(['Fang Jie']);
+    expect(fixerSpans("Last week's payment timeout hit Zhang San, Fang Jie and Li Ming fixed it")).not.toContain('Zhang San');
+    // lists inside the phrase still read whole
+    expect(fixerSpans("Last week's cache stampede was fixed by Fang Jie, Li Ming and Wang Wu")).toEqual(['Fang Jie', 'Li Ming', 'Wang Wu']);
+    expect(fixerSpans('Fang Jie and Li Ming fixed last week\'s cache stampede')).toEqual(['Fang Jie', 'Li Ming']);
+  });
+
+  it('is not linked', async () => {
+    const { linkBackReferences } = await import('../src/graph/backrefs.js');
+    const rep = (date: string, fm: string) => dated('平台组周报', date, fm);
+    const ctx = await workspace('bystander', {
+      'raw/docs/周报/平台组/w05.md': rep('2025-02-03', 'entities:\n  - { name: INC-001-T1, type: event }\nclaims:\n  - { subject: INC-001-T1, statement: INC-001-T1为P1级支付超时事故, type: event }\n'),
+      'raw/docs/周报/平台组/w06.md': rep('2025-02-10', 'entities:\n  - { name: 张三, type: person }\n  - { name: 方杰, type: person }\nclaims:\n  - { subject: 方杰, object: 张三, statement: 上周那起支付超时已修复，报告人 张三，由方杰修复, type: event }\n'),
+    });
+    const config = { review: { ...ctx.config.review, backReferences: { periodic: ['raw/docs/周报'] } } };
+    expect((await linkBackReferences(ctx.store, { config })).linked).toBe(1);
+    const sources = await ctx.store.query<{ source_id: string }>(`SELECT source_id FROM relations WHERE tx_to IS NULL AND target_id = 'inc-001-t1'`);
+    expect(sources.map((r) => r.source_id)).toEqual(['方杰']);
+  });
+});

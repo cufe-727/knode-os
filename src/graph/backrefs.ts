@@ -69,22 +69,24 @@ const FIXED = /修复|解决|排除|已恢复|\bfixed\b|\bresolved\b/i;
 export function fixerSpans(statement: string): string[] {
   const text = statement.normalize('NFKC');
   const out: string[] = [];
-  // a list of names ("方杰、李明", "方杰和李明", "Fang Jie and Li Ming"): each of them
-  const NAMES_ZH = '[\\p{Script=Han}A-Za-z·]{2,12}?(?:\\s*(?:、|,|，|和|与|及|以及|跟)\\s*[\\p{Script=Han}A-Za-z·]{2,12}?)*';
+  // a list of names joined inside the fixer phrase ("由方杰、李明修复", "fixed by Fang Jie and Li Ming"): each of them.
+  // A comma joins clauses, not fixers ("客户 张三，由方杰修复"), except in a list after "fixed by".
+  const NAMES_ZH = '[\\p{Script=Han}A-Za-z·]{2,12}?(?:\\s*(?:、|和|与|及|以及|跟)\\s*[\\p{Script=Han}A-Za-z·]{2,12}?)*';
   const NAME_EN = '[A-Z][\\w.-]*(?:\\s+[A-Z][\\w.-]*){0,2}';
-  const NAMES_EN = `${NAME_EN}(?:\\s*(?:,|,?\\s*and|&)\\s*${NAME_EN})*`;
+  const NAMES_BY_EN = `${NAME_EN}(?:\\s*(?:,|,?\\s*and|&)\\s*${NAME_EN})*`;
+  const NAMES_EN = `${NAME_EN}(?:\\s+(?:and|&)\\s+${NAME_EN})*`;
   const each = (list: string) => {
     // "李明协助方杰": the one helped did the fixing
     const helped = /(?:协助|配合|帮助|支持)(.+)$/u.exec(list);
-    const names = (helped ? helped[1] : list).split(/\s*(?:、|,|，|和|与|及|以及|跟|&|\band\b)\s*/u);
+    const names = (helped ? helped[1] : list).split(/\s*(?:、|,|和|与|及|以及|跟|&|\band\b)\s*/u);
     for (const n of names) {
-      const name = n.replace(/(?:共同|一起|联合|合力|等人?)$/u, '').trim();
+      const name = n.replace(/^(?:由|被)/u, '').replace(/(?:共同|一起|联合|合力|等人?)$/u, '').trim();
       if (name.length >= 2) out.push(name);
     }
   };
   for (const m of text.matchAll(new RegExp(`(?:由|被)\\s*(${NAMES_ZH})\\s*(?:共同|一起|联合|合力)?\\s*(?:在[^，。,；;]{0,20}?)?(?:修复|解决|排除|处理)`, 'gu'))) each(m[1]);
   for (const m of text.matchAll(new RegExp(`(?:^|[，,。；;\\s])(${NAMES_ZH})\\s*(?:共同|一起|联合|合力)?\\s*(?:已经|已|于[^，。,；;]{0,20}?)?(?:修复|解决|排除)了?`, 'gu'))) each(m[1]);
-  for (const m of text.matchAll(new RegExp(`\\b(?:fixed|resolved)\\s+by\\s+(${NAMES_EN})`, 'g'))) each(m[1]);
+  for (const m of text.matchAll(new RegExp(`\\b(?:fixed|resolved)\\s+by\\s+(${NAMES_BY_EN})`, 'g'))) each(m[1]);
   for (const m of text.matchAll(new RegExp(`\\b(${NAMES_EN})\\s+(?:fixed|resolved)\\b`, 'g'))) each(m[1]);
   return [...new Set(out)];
 }
