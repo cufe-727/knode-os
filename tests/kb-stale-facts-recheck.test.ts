@@ -138,3 +138,39 @@ describe('the name a group of keys goes by', () => {
     expect(await ctx.store.query(`SELECT attribute, canonical FROM claim_attribute_keys`)).toEqual([{ attribute: '净利润', canonical: '归母净利润' }]);
   });
 });
+
+describe('several fixers, or one with help', () => {
+  it('reads every fixer a list names, and for 协助 the one who fixed', async () => {
+    const { fixerSpans } = await import('../src/graph/backrefs.js');
+    const has = (s: string, names: string[], not: string[] = []) => {
+      const spans = fixerSpans(s);
+      for (const n of names) expect(spans, `${s}: ${n}`).toContain(n);
+      for (const n of not) expect(spans, `${s}: not ${n}`).not.toContain(n);
+    };
+    has('上周那起缓存击穿已由方杰、李明修复', ['方杰', '李明']);
+    has('上周那起缓存击穿已由方杰和李明修复', ['方杰', '李明']);
+    has('上周那起缓存击穿已由方杰与李明共同修复', ['方杰', '李明']);
+    has('方杰、李明已修复上周的缓存击穿', ['方杰', '李明']);
+    has('上周那起缓存击穿由李明协助方杰修复', ['方杰'], ['李明']);
+    has('上周那起缓存击穿在李明协助下由方杰修复', ['方杰'], ['李明']);
+    has("Last week's cache stampede was fixed by Fang Jie and Li Ming", ['Fang Jie', 'Li Ming']);
+    has("Last week's cache stampede was fixed by Fang Jie, Li Ming and Wang Wu", ['Fang Jie', 'Li Ming', 'Wang Wu']);
+    has('上周那起支付超时已修复，客户张三和李四确认', [], ['张三', '李四']);
+  });
+
+  it('links each of them', async () => {
+    const { linkBackReferences } = await import('../src/graph/backrefs.js');
+    const rep = (date: string, fm: string) => dated('平台组周报', date, fm);
+    const ctx = await workspace('fixers', {
+      'raw/docs/周报/平台组/w05.md': rep('2025-02-03', 'entities:\n  - { name: INC-001-T1, type: event }\nclaims:\n  - { subject: INC-001-T1, statement: INC-001-T1为P1级缓存击穿事故, type: event }\n'),
+      'raw/docs/周报/平台组/w06.md': rep('2025-02-10', 'entities:\n  - { name: 方杰, type: person }\n  - { name: 李明, type: person }\nclaims:\n  - { subject: 方杰, object: 李明, statement: 上周那起缓存击穿已由方杰和李明修复, type: event }\n'),
+    });
+    const config = { review: { ...ctx.config.review, backReferences: { periodic: ['raw/docs/周报'] } } };
+    // one relation a fixer, under one link
+    expect((await linkBackReferences(ctx.store, { config })).linked).toBe(2);
+    const [scope] = await ctx.store.query<{ meta: { people: string[] } }>(`SELECT meta FROM scopes WHERE kind = 'backref' AND status = 'active'`);
+    expect(scope.meta.people).toEqual(['方杰', '李明']);
+    const sources = await ctx.store.query<{ source_id: string }>(`SELECT source_id FROM relations WHERE tx_to IS NULL AND target_id = 'inc-001-t1' ORDER BY source_id COLLATE "C"`);
+    expect(sources.map((r) => r.source_id).sort()).toEqual(['方杰', '李明']);
+  });
+});
