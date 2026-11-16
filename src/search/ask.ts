@@ -319,6 +319,9 @@ async function enumeratedAnswer(env: RouteEnv): Promise<AskResult | null> {
   }), heading);
 }
 
+/** Entities the walk reached that a chain's computed set may be scoped to, at most. */
+const CHAIN_SET_SCOPES = 8;
+
 /**
  * Multi-hop: SAG search, and a bounded walk over the named entities' relations with the passages stating each
  * hop, beside what the lookup route would have found for the same question (the set the claims compute, the
@@ -332,16 +335,27 @@ async function multihopAnswer(env: RouteEnv): Promise<AskResult> {
   // mode answers, whose hybrid search falls back to the keyword and graph channels as the lookup route's does
   const asked = opts.mode ?? 'hybrid';
   const mode: SearchMode = asked === 'keyword' ? 'keyword' : queryVector ? 'sag' : 'hybrid';
-  const [retrieved, walk, graph, computed] = await Promise.all([
+  const chain = isChainQuestion(question);
+  const [retrieved, walk, graph, setFirst] = await Promise.all([
     search(store, embedder, question, { k, mode, heat: config.heat, sag: config.retrieval.sag, rerank: config.retrieval.rerank, queryVector, track: opts.track }),
     walkRelations(store, question, named, { maxHops: router.maxHops, queryVector, model: embedder.model }),
     graphSearch(store, question, { depth: 2, chunkLimit: 4, heat: config.heat, track: opts.track }),
-    // a walked question gets a computed set too, under the same switch, reference day and time budget as any other
+    // a walked question gets a computed set too, under the same switch, reference day and time budget as any other;
+    // a chain's waits for the walk (below)
     env.computed ? Promise.resolve(env.computed)
-      : (opts.computed ?? router.computedSets === true)
+      : (opts.computed ?? router.computedSets === true) && !chain
         ? computeClaimSet(store, question, { kind: 'lookup', range: env.routed.range }, named, { now: opts.now, budgetMs: router.computedBudgetMs }).catch(() => null)
         : Promise.resolve(null),
   ]);
+  // a chain ("平台组的INC-001是谁修复的？此人还修复过哪些事故？") asks for the set of what it finds, not of what it names
+  // first: its set is computed over the entities the walk reached, and kept only when it is scoped to one of them
+  let computed = setFirst;
+  if (chain && !env.computed && (opts.computed ?? router.computedSets === true)) {
+    const found = walk.reached.filter((id) => !named.includes(id)).slice(0, CHAIN_SET_SCOPES);
+    const set = found.length ? await computeClaimSet(store, question, { kind: 'lookup', range: env.routed.range }, found, { now: opts.now, budgetMs: router.computedBudgetMs }).catch(() => null) : null;
+    const names = set ? new Set((await store.query<{ name: string }>(`SELECT name FROM entities WHERE id = ANY($1::text[])`, [found])).map((r) => r.name)) : new Set<string>();
+    computed = set && set.scope && names.has(set.scope) ? set : null;
+  }
   const seen = new Set(retrieved.map((r) => r.chunkId));
   // the passages that state the hops share the top of the context with the search: a chain's later hops are
   // rarely what a search of the whole question finds; the graph search's chunks come after both
