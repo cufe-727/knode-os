@@ -143,6 +143,15 @@ beforeAll(async () => {
     await entity(id, `双子${id}组`, 'organization', [...v]);
     await relate(id, 'duo', '该组隶属于双子事业部。', await doc('组织架构', [id, 'duo']), 10, 'part_of');
   }
+  // an acquisition announced in its own report, the two companies named together in a market recap three weeks before,
+  // and a relation the store holds no source for
+  await entity('hc', '海川资本');
+  await entity('yh', '远航科技');
+  await doc('市场回顾：本周海川资本与远航科技股价均上涨。', ['hc', 'yh'], '2026-05-01');
+  await relate('hc', 'yh', '海川资本收购了远航科技。', await doc('公告：海川资本宣布收购远航科技全部股权。', ['hc', 'yh'], '2026-05-22'), 1, 'acquired');
+  await entity('nosrc', '无源合作方');
+  await doc('行业会议上，海川资本与无源合作方同台。', ['hc', 'nosrc'], '2026-04-01');
+  await store.query(`INSERT INTO relations (id, source_id, target_id, type, description, weight) VALUES ('r-nosrc', 'hc', 'nosrc', 'partner_of', '海川资本与无源合作方合作。', 1)`);
 });
 
 afterAll(async () => {
@@ -218,6 +227,21 @@ describe('the ordering step', () => {
 });
 
 describe('the passage that states a hop', () => {
+  it('is the relation\'s own recorded passage, not a recap that names both ends weeks before', async () => {
+    const walk = await walkRelations(store, '海川资本收购了哪家公司？那家公司的创始人是谁', ['hc'], { maxHops: 1 });
+    const step = walk.steps.findIndex((s) => s.target === '远航科技');
+    expect(step).toBeGreaterThanOrEqual(0);
+    const passage = walk.bridges.find((b) => b.trace?.bridgeEntities?.includes('远航科技'))!;
+    expect(passage.content).toBe('公告：海川资本宣布收购远航科技全部股权。');
+  });
+
+  it('says so when it can only show a passage that mentions both ends, for a relation with no recorded source', async () => {
+    const walk = await walkRelations(store, '海川资本和谁合作？合作方的负责人是谁', ['hc'], { maxHops: 1 });
+    const passage = walk.bridges.find((b) => b.trace?.bridgeEntities?.includes('无源合作方'))!;
+    expect(passage.trace?.coMention).toBe(true);
+    expect(passage.content).toMatch(/^\(mentions 海川资本 and 无源合作方; not the source of "海川资本 partner of 无源合作方"\) /);
+  });
+
   it('is read from the relation\'s own source, not from an old note that mentions both ends', async () => {
     const walk = await walkRelations(store, '安娜负责的项目是什么？那个项目的负责人还负责什么', ['ann'], { maxHops: 1 });
     expect(walk.steps.map((s) => s.target)).toEqual(['轨道计划']);

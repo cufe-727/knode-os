@@ -4,7 +4,7 @@ import { toDateString } from '../store/temporal.js';
 import { ClaimItem, SearchResult } from '../types.js';
 import { keywordTerms, termCount } from './search.js';
 import { asOfDate } from './claimset.js';
-import { documentDates, OrdinalAsk, ordinalInQuestion, pickByOrder, placeEntities, presentOf } from './walk-order.js';
+import { OrdinalAsk, ordinalInQuestion, pickByOrder, placeEntities, presentOf } from './walk-order.js';
 
 /**
  * The multi-hop route of `ask` (docs/design/30 §3): resolve → relations →
@@ -556,89 +556,43 @@ export function chainOrder(steps: WalkStep[]): number[] {
   return out;
 }
 
-/** A relation's evidence documents read at most when choosing the passage that states it. */
-const EVIDENCE_READ = 20;
-/** Chunks mentioning both ends read at most per step, from the end mentioned less. */
-const COMENTION_READ = 200;
-/** How long before its first source a report of the same two entities may be the one that states the hop. */
-const LEAD_DAYS = 45;
-
 /**
- * For each step, the passage that states it, near the relation's own sources: the document it was read from and
- * those its evidence names (at most `EVIDENCE_READ`); the earliest of them dates it. Of the chunks that mention both ends
- * (at most `COMENTION_READ`, read from the end mentioned less), the one in the earliest document dated within
- * `LEAD_DAYS` before that source is taken: the report of the week it happened, which a monthly summary the
- * relation was read from restates. A co-mention long before the relation's first source, on a knowledge base
- * that has mentioned both for years, is not. Else a chunk of that earliest source mentioning both ends, or either;
- * else the chunk the relation was read from. A document's date is its own, or the day its claims state most often.
- * Every read is bounded per step. The best chain's first.
+ * For each step, the passage that states it: the chunk the relation was read from (relations record it since v20);
+ * else a passage of its source document (the one it was read from, or else the first its evidence names) that
+ * mentions both ends, or either. Only a relation with no recorded source falls back to a chunk that merely
+ * mentions both ends, and that passage says so: on a knowledge base where two names appear together daily, a
+ * co-mention is no statement of the relation. One bounded read per step; no document needs a date.
  */
 async function bridgePassages(store: Store, steps: WalkStep[]): Promise<SearchResult[]> {
   if (steps.length === 0) return [];
-  const [sources, together] = await Promise.all([
-    store.query<{ i: number; document_id: string }>(
-      `SELECT pair.i, x.document_id FROM unnest($1::text[]) WITH ORDINALITY AS pair(rid, i)
-       CROSS JOIN LATERAL (
-         (SELECT r.document_id FROM relations r WHERE r.id = pair.rid AND r.document_id IS NOT NULL)
-         UNION
-         (SELECT d.id FROM evidence ev JOIN scopes s ON s.id = ev.scope_id JOIN documents d ON d.path = s.key
-          WHERE ev.kind = 'relation' AND ev.target_id = pair.rid AND ev.tx_to IS NULL LIMIT $2)) x`,
-      [steps.map((s) => s.relationId), EVIDENCE_READ],
-    ),
-    store.query<{ i: number; chunk_id: string; document_id: string }>(
-      `SELECT pair.i, x.chunk_id, x.document_id FROM unnest($1::text[], $2::text[]) WITH ORDINALITY AS pair(a, b, i)
-       CROSS JOIN LATERAL (
-         SELECT CASE WHEN (SELECT count(*) FROM (SELECT 1 FROM entity_mentions WHERE entity_id = pair.a LIMIT 5000) ca)
-                       <= (SELECT count(*) FROM (SELECT 1 FROM entity_mentions WHERE entity_id = pair.b LIMIT 5000) cb)
-                     THEN pair.a ELSE pair.b END AS rare,
-                CASE WHEN (SELECT count(*) FROM (SELECT 1 FROM entity_mentions WHERE entity_id = pair.a LIMIT 5000) ca)
-                       <= (SELECT count(*) FROM (SELECT 1 FROM entity_mentions WHERE entity_id = pair.b LIMIT 5000) cb)
-                     THEN pair.b ELSE pair.a END AS other) e
-       CROSS JOIN LATERAL (
-         SELECT m1.chunk_id, m1.document_id FROM entity_mentions m1
-         JOIN entity_mentions m2 ON m2.chunk_id = m1.chunk_id AND m2.entity_id = e.other
-         WHERE m1.entity_id = e.rare LIMIT $3) x`,
-      [steps.map((s) => s.sourceId), steps.map((s) => s.targetId), COMENTION_READ],
-    ),
-  ]);
-  const dates = await documentDates(store, [...new Set([...sources.map((r) => r.document_id), ...together.map((r) => r.document_id)])]);
-  const dayOf = (d: string) => Date.parse(`${d}T00:00:00Z`) / 86_400_000;
-  const choice = new Map<number, { doc: string | null; chunk: string | null }>();
-  for (let i = 0; i < steps.length; i++) {
-    const mine = sources.filter((r) => Number(r.i) === i + 1).map((r) => r.document_id);
-    const first = mine.sort((x, y) => {
-      const dx = dates.get(x) ?? null;
-      const dy = dates.get(y) ?? null;
-      return dx === dy ? (x < y ? -1 : 1) : dx === null ? 1 : dy === null ? -1 : dx < dy ? -1 : 1;
-    })[0] ?? null;
-    const since = first && dates.get(first) ? dayOf(dates.get(first)!) - LEAD_DAYS : null;
-    const near = together
-      .filter((r) => Number(r.i) === i + 1)
-      .map((r) => ({ ...r, at: dates.get(r.document_id) ?? null }))
-      .filter((r) => r.at && since !== null && dayOf(r.at) >= since && r.at <= dates.get(first!)!)
-      .sort((x, y) => (x.at! < y.at! ? -1 : x.at! > y.at! ? 1 : x.chunk_id < y.chunk_id ? -1 : 1))[0];
-    choice.set(i, near ? { doc: null, chunk: near.chunk_id } : { doc: first, chunk: null });
-  }
-  const rows = await store.query<{ i: number; chunk_id: string; document_id: string; path: string; title: string | null; content: string; doc_date: string | Date | null }>(
-    `SELECT pair.i, c.id AS chunk_id, c.document_id, d.path, d.title, c.content, d.doc_date
-     FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[]) WITH ORDINALITY AS pair(a, b, doc, pick, own, i)
+  const rows = await store.query<{ i: number; rank: number; chunk_id: string; document_id: string; path: string; title: string | null; content: string; doc_date: string | Date | null }>(
+    `SELECT pair.i, x.rank, c.id AS chunk_id, c.document_id, d.path, d.title, c.content, d.doc_date
+     FROM unnest($1::text[], $2::text[], $3::text[]) WITH ORDINALITY AS pair(rid, a, b, i)
+     JOIN relations r ON r.id = pair.rid
      CROSS JOIN LATERAL (
-       SELECT y.chunk_id FROM (
-         (SELECT ch.id AS chunk_id, 0 AS rank FROM chunks ch WHERE ch.id = NULLIF(pair.pick, ''))
+       SELECT COALESCE(r.document_id, (
+         SELECT dd.id FROM evidence ev JOIN scopes s ON s.id = ev.scope_id JOIN documents dd ON dd.path = s.key
+         WHERE ev.kind = 'relation' AND ev.target_id = r.id AND ev.tx_to IS NULL ORDER BY ev.tx_from, dd.id LIMIT 1)) AS doc
+     ) src
+     CROSS JOIN LATERAL (
+       SELECT y.chunk_id, y.rank FROM (
+         (SELECT ch.id AS chunk_id, 0 AS rank FROM chunks ch WHERE ch.id = r.chunk_id)
          UNION ALL
          (SELECT m1.chunk_id, 1 FROM entity_mentions m1
           JOIN entity_mentions m2 ON m2.chunk_id = m1.chunk_id AND m2.entity_id = pair.b
-          WHERE m1.document_id = NULLIF(pair.doc, '') AND m1.entity_id = pair.a ORDER BY m1.chunk_id LIMIT 1)
+          WHERE m1.document_id = src.doc AND m1.entity_id = pair.a ORDER BY m1.chunk_id LIMIT 1)
          UNION ALL
-         (SELECT m.chunk_id, 2 FROM entity_mentions m
-          WHERE m.document_id = NULLIF(pair.doc, '') AND m.entity_id IN (pair.a, pair.b) ORDER BY m.chunk_id LIMIT 1)
+         (SELECT m.chunk_id, 2 FROM entity_mentions m WHERE m.document_id = src.doc AND m.entity_id IN (pair.a, pair.b)
+          ORDER BY m.chunk_id LIMIT 1)
          UNION ALL
-         (SELECT ch.id, 3 FROM chunks ch WHERE ch.id = NULLIF(pair.own, ''))
+         (SELECT m1.chunk_id, 3 FROM entity_mentions m1
+          JOIN entity_mentions m2 ON m2.chunk_id = m1.chunk_id AND m2.entity_id = pair.b
+          WHERE m1.entity_id = pair.a AND src.doc IS NULL LIMIT 1)
        ) y ORDER BY y.rank LIMIT 1
      ) x
      JOIN chunks c ON c.id = x.chunk_id
      JOIN documents d ON d.id = c.document_id`,
-    [steps.map((s) => s.sourceId), steps.map((s) => s.targetId), steps.map((_, i) => choice.get(i)?.doc ?? ''), steps.map((_, i) => choice.get(i)?.chunk ?? ''), steps.map((s) => s.chunkId ?? '')],
+    [steps.map((s) => s.relationId), steps.map((s) => s.sourceId), steps.map((s) => s.targetId)],
   );
   const byStep = new Map(rows.map((r) => [Number(r.i) - 1, r]));
   const seen = new Set<string>();
@@ -648,10 +602,12 @@ async function bridgePassages(store: Store, steps: WalkStep[]): Promise<SearchRe
     if (!r || seen.has(r.chunk_id)) continue;
     seen.add(r.chunk_id);
     const step = steps[i];
+    const coMention = Number(r.rank) === 3;
     out.push({
-      chunkId: r.chunk_id, documentId: r.document_id, path: r.path, title: r.title, content: r.content,
+      chunkId: r.chunk_id, documentId: r.document_id, path: r.path, title: r.title,
+      content: coMention ? `(mentions ${step.source} and ${step.target}; not the source of "${step.source} ${step.type.replace(/_/g, ' ')} ${step.target}") ${r.content}` : r.content,
       docDate: toDateString(r.doc_date), score: 0, signals: { structural: step.hop },
-      trace: { route: 'sag', hop: step.hop, bridgeEntities: [step.source, step.target] },
+      trace: { route: 'sag', hop: step.hop, bridgeEntities: [step.source, step.target], ...(coMention ? { coMention: true } : {}) },
     });
   }
   return out;

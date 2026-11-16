@@ -490,9 +490,10 @@ describe('ordering and meaning in the walk', () => {
     expect(walk.ordering?.picks.some((p) => p.startsWith('二部平台组: INC-003-D2T1 — the 2nd of 2 P1'))).toBe(true);
     // the group the question describes leads: its chain's passages come first
     expect(walk.bridges[0].trace?.bridgeEntities).toContain('二部平台组');
-    // the fix's passage is the report of its week, not the summary the relation was read from 25 days later
+    // the fix's passage is the one the relation was read from (here a later summary), not another chunk naming both
     const fix = walk.bridges.find((b) => b.trace?.bridgeEntities?.includes('钱勇'))!;
-    expect(fix.content).toBe('本周钱勇修复了INC-003-D2T1。');
+    expect(fix.content).toBe('季度回顾：钱勇修复INC-003-D2T1');
+    expect(fix.trace?.coMention).toBeUndefined();
   });
 
   it('owes the described group to the question\'s meaning: none without a vector, another with another vector', async () => {
