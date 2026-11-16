@@ -117,18 +117,22 @@ const ANCHOR_FANOUT = 60;
 /**
  * Predicates the question and the relation descriptions word differently:
  * when the question holds any spelling of a family, the relation may hold any
- * other. Verbs and the nouns relations are named by, not domain words.
+ * other. Only spellings that mean the same in general: escalating is not
+ * complaining, releasing is not going live or delivering, a hint is not
+ * raising, joining is not a transfer. A knowledge base's own synonyms belong
+ * to its vocabulary, not here.
  */
 const PREDICATE_FAMILIES: string[][] = [
-  ['修复', '修好', '处理好', '处理', '解决', '搞定', '排除', 'fixed', 'fix', 'resolved', 'resolve', 'repaired'],
+  ['修复', '修好', '处理好', '处理', '解决', '搞定', 'fixed', 'fix', 'resolved', 'resolve', 'repaired'],
   ['负责', '名下', '盯着', '跟进', '主导', '牵头', '在管', '主管', 'owner', 'owns', 'owned', 'responsible', 'in charge', 'leads'],
-  ['接手', '接管', '交接', 'took over', 'take over', 'taken over', 'inherited'],
-  ['提出', '预警', '提了', '提示', '上报', 'raised', 'flagged', 'warned'],
+  ['接手', '接管', 'took over', 'take over', 'taken over', 'inherited'],
+  ['提出', '预警', '提了', 'raised', 'flagged', 'warned'],
   ['风险', '隐患', 'risk', 'hazard'],
   ['事故', '故障', '宕机', 'incident', 'outage'],
-  ['上线', '投产', '发布', '交付', '落地', 'launched', 'launch', 'released', 'shipped', 'went live', 'go-live'],
-  ['调到', '调入', '调往', '调去', '转到', '转岗', '加入', 'transferred', 'moved to', 'joined'],
-  ['升级', '投诉', 'escalated', 'escalation', 'complained'],
+  ['上线', '投产', 'went live', 'go-live', 'go live'],
+  ['发布', 'released', 'release'],
+  ['调到', '调入', '调往', '调去', '转到', '转岗', 'transferred', 'moved to'],
+  ['升级', 'escalated', 'escalation'],
   ['客户', 'customer', 'client'],
   ['成员', '组员', 'member'],
 ];
@@ -182,13 +186,17 @@ export function walkTerms(question: string, namedNames: string[] = []): { terms:
     let rest = last;
     let used = 0;
     for (const w of [...words].sort((x, y) => y.length - x.length)) {
-      used += occurrences(rest, w);
-      rest = rest.split(w).join(' ');
+      const word = TEAM_WORD.has(w) ? new RegExp(`(?<=[个那这该本此各哪每一两几同另])${w}(?![合织件成建装])`, 'g') : null;
+      used += word ? (rest.match(word) ?? []).length : occurrences(rest, w);
+      rest = word ? rest.replace(word, ' ') : rest.split(w).join(' ');
     }
     if (used > 0) budget.set(`type:${type}`, used);
   }
   return { terms: [...terms.values()], budget };
 }
+
+/** 组 names a team only as a word ("那个组", "另一个组"), not inside 组合, 组织, 组件 or 投资组合. */
+const TEAM_WORD = new Set(['组']);
 
 /** Question nouns that name an entity type beside the ontology's own labels: 组 asks for a team, 故障 for an event. */
 const TYPE_NOUNS: Record<string, string[]> = {

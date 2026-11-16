@@ -7,7 +7,7 @@ import { entityKeyKinds } from '../src/graph/normalize.js';
 import type { EmbeddingProvider } from '../src/ingest/embeddings.js';
 import type { LlmClient } from '../src/llm/client.js';
 import { ask } from '../src/search/ask.js';
-import { stepsAsFacts, walkRelations } from '../src/search/walk.js';
+import { stepsAsFacts, walkRelations, walkTerms } from '../src/search/walk.js';
 import { ordinalInQuestion } from '../src/search/walk-order.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
 
@@ -266,5 +266,27 @@ describe('the meaning signal', () => {
     const near = walk.steps.find((s) => s.target === '星河产品0号');
     const other = walk.steps.find((s) => s.target !== '星河产品0号' && s.target !== '审计署');
     expect(near === undefined || near.score === other?.score).toBe(true);
+  });
+});
+
+describe('the walk\'s vocabulary', () => {
+  const texts = (q: string) => walkTerms(q).terms.map((t) => t.text);
+
+  it('widens a predicate only to spellings that mean the same in general', () => {
+    // escalating is not complaining, releasing is not going live or delivering, a hint is not raising, joining is not a transfer
+    expect(texts('客户升级了哪起事故？')).not.toContain('投诉');
+    expect(texts('这款产品什么时候发布的？')).not.toEqual(expect.arrayContaining(['上线']));
+    expect(texts('这款产品什么时候发布的？')).not.toContain('交付');
+    expect(texts('系统什么时候上线的？')).toContain('投产');
+    expect(texts('谁提示过这个风险？')).not.toContain('提出');
+    expect(texts('他后来加入了哪个团队？')).not.toContain('调入');
+    expect(texts('事故是谁处理好的？')).toContain('修复');
+  });
+
+  it('reads 组 as a team only where it is a word', () => {
+    expect(walkTerms('他管理的投资组合表现如何').budget.has('type:organization')).toBe(false);
+    expect(walkTerms('这个组件由谁维护').budget.has('type:organization')).toBe(false);
+    expect(walkTerms('他后来调到了哪个组').budget.has('type:organization')).toBe(true);
+    expect(walkTerms('他后来调到了哪个团队').budget.has('type:organization')).toBe(true);
   });
 });
