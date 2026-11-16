@@ -221,6 +221,21 @@ describe('a refine slice that fails', () => {
     expect(skipped?.[0].error).toMatch(/bad subject/);
   });
 
+  it('drops a skipped subject from the record once it succeeds', async () => {
+    const { refreshClaimStateStep } = await import('../src/graph/claim-state-store.js');
+    const ctx = await workspace('slice-recovers', docs);
+    let broken = true;
+    const apply = async (subjects: string[]) => {
+      if (broken && subjects.includes('乙项目')) throw new Error('bad subject');
+      return { keys: 0, superseded: 0 };
+    };
+    for (let i = 0; i < 4; i++) if ((await refreshClaimStateStep(ctx.store, { budget: 4, apply })).passDone) break;
+    expect((await ctx.store.getMeta<{ root: string }[]>('claim_state_skipped'))?.map((s) => s.root)).toEqual(['乙项目']);
+    broken = false;
+    for (let i = 0; i < 4; i++) if ((await refreshClaimStateStep(ctx.store, { budget: 4, apply })).passDone) break;
+    expect(await ctx.store.getMeta('claim_state_skipped')).toEqual([]);
+  });
+
   it('retries a failure that is not the slice\'s, a bounded number of times', async () => {
     const { refreshClaimStateStep } = await import('../src/graph/claim-state-store.js');
     const ctx = await workspace('slice-down', docs);

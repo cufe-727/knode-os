@@ -349,7 +349,7 @@ export const CLAIM_STATE_SKIPPED_KEPT = 200;
  * subject at once: the subjects that still throw are left out, recorded in
  * meta 'claim_state_skipped' (root, error, when; the latest
  * CLAIM_STATE_SKIPPED_KEPT), and the cursor moves on; the next pass tries them
- * again. When every subject throws, the trouble is not the slice's (the store,
+ * again, and one that goes through then leaves the record. When every subject throws, the trouble is not the slice's (the store,
  * say): the cursor stays and the error is raised, up to
  * CLAIM_STATE_SLICE_TRIES runs in a row; then the slice is let go and
  * recorded the same way. `apply` stands in for the slice's work in tests.
@@ -412,10 +412,11 @@ export async function refreshClaimStateStep(
       }
     }
   }
-  if (failed.length > 0) {
+  // the record holds what is skipped now: a subject that went through this time leaves it
+  const before = take.length > 0 ? (await store.getMeta<{ root: string; error: string; at: string }[]>(SKIPPED_META)) ?? [] : [];
+  if (failed.length > 0 || before.some((b) => take.includes(b.root))) {
     const at = new Date().toISOString();
-    const before = (await store.getMeta<{ root: string; error: string; at: string }[]>(SKIPPED_META)) ?? [];
-    const kept = [...before.filter((b) => !failed.some((f) => f.root === b.root)), ...failed.map((f) => ({ ...f, at }))];
+    const kept = [...before.filter((b) => !take.includes(b.root)), ...failed.map((f) => ({ ...f, at }))];
     await store.setMeta(SKIPPED_META, kept.slice(-CLAIM_STATE_SKIPPED_KEPT));
   }
   await store.setMeta(STEP_META, passDone ? {} : { after: take.at(-1) });

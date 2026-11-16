@@ -405,6 +405,19 @@ What the rules are now:
   subject (R-03（支付超时）) are not the thing; with the subject written in the
   clause, the thing is what follows it. In the active voice ("张三负责云业务",
   the owner being the claim's value) the thing is what follows the verb.
+  Clause reading will keep missing wordings, so a subject's owner and state
+  claims are then settled together (`settleSeriesObjects`): one read as about
+  nothing, or about something no other claim is about, goes to the series of
+  the one known thing its statement names (an object another claim carries,
+  or another claim's reading; the longest when one contains another); two or
+  none, as read. "由李四负责" names nothing and stays the subject's own owner.
+  Two owners named together ("张三、李四共同负责云业务") are two current owners of
+  one thing: one day, two values, neither supersedes the other. On finance's
+  stored extractions (read only; 522 owner or state claims on 345 subjects,
+  mostly "市场由量化主导" commentary) 321 claims are alone in their series on
+  main, 429 here: of the 108 more, 63 carry an object of their own (the
+  first review's rule), 41 are read as about something no other claim is,
+  and 5 about nothing beside claims that are about something.
 - **Identifiers.** Only identifiers of one numbered series (letters, a
   separator, a counter: INC-001-T1, R-07, GPT-4) with another counter or two
   different tails are kept apart (INC-006 and INC-006-T1 are not); codes that
@@ -436,7 +449,9 @@ What the rules are now:
   that document, with its trust and acl, its document and passage as the
   relation's source; an incremental run also disposes it when the earlier
   report it was resolved from changes or goes, and the step turned off
-  disposes every link.
+  disposes every link. A list of fixers is the names joined inside the fixer
+  phrase (、 和 与 及, "and"; commas only after "fixed by"): a name earlier
+  in the sentence is not a fixer.
 - **Bounds.** Refine keeps keys and supersession by attribute current in
   slices of 200,000 keyed claims (cursor in meta 'claim_state_pass') and reads
   5,000 code-named entities a run for the code merge (cursor in meta
@@ -446,7 +461,7 @@ What the rules are now:
   seconds and a pass takes about six refines. Not measured on finance. A
   claim-state slice that throws is tried again subject by subject in the same
   run; subjects that still throw are left for the next pass and recorded in
-  meta 'claim_state_skipped'. When every subject throws (the store's trouble,
+  meta 'claim_state_skipped' until they go through. When every subject throws (the store's trouble,
   not the slice's), the cursor stays for up to three runs in a row, then the
   slice is let go and recorded the same way. A code-named entity whose merge
   throws is reported and left for the next pass; the rest of its slice goes
