@@ -3,6 +3,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { defaultConfig, KnodeConfig } from '../src/config.js';
+import { recordAskOptions } from '../src/eval/run.js';
+import type { RunMeta } from '../src/eval/runstore.js';
 import { askOptionsFromEnv } from '../src/eval/systems/knode.js';
 import { tier0Known } from '../src/graph/concepts.js';
 import { entityKeyKinds } from '../src/graph/normalize.js';
@@ -551,6 +553,25 @@ describe('the evaluation can turn computed sets on (re-check item 7)', () => {
     expect(askOptionsFromEnv({ KNODE_EVAL_ASK_COMPUTED: '1', KNODE_EVAL_ASK_NOW: '2025-11-07' })).toEqual({ computed: true, now: '2025-11-07' });
     expect(askOptionsFromEnv({ KNODE_EVAL_ASK_COMPUTED: 'off' })).toEqual({ computed: false });
     expect(() => askOptionsFromEnv({ KNODE_EVAL_ASK_NOW: 'last friday' })).toThrow(/YYYY-MM-DD/);
+  });
+
+  it('takes an empty setting for unset, a clear word for on or off, and refuses anything else', () => {
+    expect(askOptionsFromEnv({ KNODE_EVAL_ASK_COMPUTED: '', KNODE_EVAL_ASK_NOW: '' })).toEqual({});
+    expect(askOptionsFromEnv({ KNODE_EVAL_ASK_COMPUTED: 'enabled' })).toEqual({ computed: true });
+    expect(askOptionsFromEnv({ KNODE_EVAL_ASK_COMPUTED: 'disabled' })).toEqual({ computed: false });
+    expect(() => askOptionsFromEnv({ KNODE_EVAL_ASK_COMPUTED: 'maybe' })).toThrow(/KNODE_EVAL_ASK_COMPUTED/);
+    expect(() => askOptionsFromEnv({ KNODE_EVAL_ASK_NOW: '2025-13-45' })).toThrow(/not a day/);
+    expect(() => askOptionsFromEnv({ KNODE_EVAL_ASK_NOW: '2025-02-30' })).toThrow(/not a day/);
+  });
+
+  it('records the two settings in the run\'s metadata when the run asks knode-ask', () => {
+    const meta = {} as RunMeta;
+    recordAskOptions(meta, ['knode-ask', 'rag-hybrid'], { KNODE_EVAL_ASK_COMPUTED: '1', KNODE_EVAL_ASK_NOW: '2025-11-07' });
+    expect(meta.askOptions).toEqual({ computed: true, now: '2025-11-07' });
+    recordAskOptions(meta, ['knode-ask'], {});
+    expect(meta.askOptions).toEqual({});
+    recordAskOptions(meta, ['rag-hybrid'], { KNODE_EVAL_ASK_COMPUTED: '1' });
+    expect(meta.askOptions).toBeUndefined();
   });
 });
 

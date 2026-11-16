@@ -561,13 +561,21 @@ function knodeSystem(id: string, label: string, kind: SystemUnderTest['kind'], a
  * (`KNODE_EVAL_ASK_NOW=YYYY-MM-DD`: a pack's own "today", 2025-11-07 for the 10x reports pack).
  */
 export function askOptionsFromEnv(env: NodeJS.ProcessEnv = process.env): { computed?: boolean; now?: string } {
-  const computed = env.KNODE_EVAL_ASK_COMPUTED;
-  const now = env.KNODE_EVAL_ASK_NOW;
-  if (now !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(now)) throw new Error(`KNODE_EVAL_ASK_NOW must be a day (YYYY-MM-DD), not "${now}"`);
-  return {
-    ...(computed !== undefined && computed !== '' ? { computed: /^(1|true|yes|on)$/i.test(computed) } : {}),
-    ...(now ? { now } : {}),
-  };
+  // empty is unset, as for any setting
+  const computed = env.KNODE_EVAL_ASK_COMPUTED?.trim() || undefined;
+  const now = env.KNODE_EVAL_ASK_NOW?.trim() || undefined;
+  let on: boolean | undefined;
+  if (computed !== undefined) {
+    if (/^(1|true|yes|on|enabled?)$/i.test(computed)) on = true;
+    else if (/^(0|false|no|off|disabled?)$/i.test(computed)) on = false;
+    else throw new Error(`KNODE_EVAL_ASK_COMPUTED must be on or off (1 / true / yes / on / enabled, or 0 / false / no / off / disabled), not "${computed}"`);
+  }
+  if (now !== undefined) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(now);
+    const day = m ? new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))) : null;
+    if (!m || !day || day.toISOString().slice(0, 10) !== now) throw new Error(`KNODE_EVAL_ASK_NOW must be a day (YYYY-MM-DD); "${now}" is not a day`);
+  }
+  return { ...(on !== undefined ? { computed: on } : {}), ...(now ? { now } : {}) };
 }
 
 export function knodeAsk(options: { computed?: boolean; now?: string } = askOptionsFromEnv()): SystemUnderTest {
