@@ -235,27 +235,51 @@ describe.each(BACKENDS)('scoped searches on %s', (backend) => {
       expect(sent[0]).toContain(`set_config('hnsw.max_scan_tuples', '2967', true)`);
     });
 
-    it('reads a side the walk found nothing of, rather than answer with nothing', async () => {
-      // 3,500 chunks, more than are read at once, behind every other chunk of the index. Whether the walk comes
-      // on any of them within its limit depends on how the index was built; the search has its 8 either way
-      for (const mode of ['vector', 'hybrid'] as const) {
-        const ids = await found({ sources: ['raw/docs/deep'], mode });
-        expect(ids).toHaveLength(8);
-        expect(ids.every((id) => id.startsWith('e'))).toBe(true);
+    it('returns what the walk found of a side too large to read, and says the channel is partial', async () => {
+      const partialOf = async (on: Store, scope: { sources?: string[]; kinds?: string[] }, queryVector: number[], mode: 'vector' | 'hybrid' = 'vector') =>
+        searchExplained(on, embedder, 'chunk', { k: 8, mode, track: false, current: false, queryVector, filter: resolveScopeFilter(scope) });
+      // A walk that comes back with nothing, whatever index it walked (which rows a walk reaches within its
+      // limit depends on how the index was built, so here the store answers for it): the statements that walk
+      // the index return no row, every other statement is the store's own.
+      const vectorStatements: string[] = [];
+      const unreached = Object.create(store) as Store;
+      unreached.query = ((sql: string, params?: unknown[]) => {
+        if (!sql.includes('<=>')) return store.query(sql, params);
+        vectorStatements.push(sql);
+        return sql.includes('ORDER BY e.embedding <=>') ? Promise.resolve([]) : store.query(sql, params);
+      }) as typeof store.query;
+      // Two folders too large for a narrowed search to read: 3,500 chunks, and 31,000. Nothing is read after
+      // the walk: the first so-many chunks of a folder are not its nearest, and a search answered from them
+      // looked as well ranked as any other.
+      for (const [dir, n] of [['raw/docs/deep', 3500], ['raw/docs/main', 31000]] as const) {
+        expect(n).toBeGreaterThan(scopedRows(24, 45_850));
+        vectorStatements.length = 0;
+        const { results, channels } = await partialOf(unreached, { sources: [dir] }, AMONG_PAGES);
+        expect(vectorStatements).toHaveLength(1);
+        expect(results).toEqual([]);
+        expect(channels.vector).toMatchObject({ hits: 0, partial: expect.stringMatching(/ended at its limit of 2967 rows with 0 of the 24 sources asked for/) });
       }
-      // On a library that walks no further than its first rows the walk finds none of them, every time: the
-      // nearest forty of the index are pages. The folder is read in a second statement, as far as four times
-      // the walk's limit, and the answer is the folder's nearest.
-      const old = withoutIterativeScan();
-      const sent = await sentBy(async () => {
-        expect(await found({ sources: ['raw/docs/deep'], on: old })).toEqual(await exact('raw/docs/deep', AMONG_PAGES, 8));
-      });
-      expect(sent).toHaveLength(2);
-      expect(sent[0]).not.toContain('hnsw.iterative_scan');
-      expect(sent[1]).toContain(`LIMIT ${4 * 2967}`);
-      // and the pages, asked for by kind from among the reports: 3,000 of them behind 31,000 reports
-      expect(await found({ kinds: ['view'], queryVector: AMONG_REPORTS, on: old })).toEqual(await exact('wiki/entities', AMONG_REPORTS, 8));
-      expect(await found({ kinds: ['view'], queryVector: AMONG_REPORTS })).toHaveLength(8);
+      // a hybrid search goes on with its other channels, and carries the mark
+      const hybrid = await partialOf(unreached, { sources: ['raw/docs/deep'] }, AMONG_PAGES, 'hybrid');
+      expect(hybrid.results).toHaveLength(8);
+      expect(hybrid.results.every((r) => r.chunkId.startsWith('e'))).toBe(true);
+      expect(hybrid.channels.vector?.partial).toBeDefined();
+      // On the index itself, with a library that walks on or one that does not: whatever the walk returns is
+      // the folder's, in one statement, and short of what was asked the channel says so. A side that is read,
+      // or a walk that found what was asked for, is not partial.
+      for (const on of [store, withoutIterativeScan()]) {
+        for (const [dir, letter] of [['raw/docs/deep', 'e'], ['raw/docs/main', 'm']] as const) {
+          const sent = await sentBy(async () => {
+            const { results, channels } = await partialOf(on, { sources: [dir] }, AMONG_PAGES);
+            expect(results.every((r) => r.chunkId.startsWith(letter))).toBe(true);
+            expect(channels.vector?.partial === undefined).toBe((channels.vector?.hits ?? 0) >= 24);
+          });
+          expect(sent).toHaveLength(1);
+        }
+        expect((await partialOf(on, { sources: ['raw/docs/far'] }, AMONG_PAGES)).channels.vector).toMatchObject({ hits: 24 });
+        expect((await partialOf(on, { sources: ['raw/docs/far'] }, AMONG_PAGES)).channels.vector?.partial).toBeUndefined();
+      }
+      expect((await partialOf(store, { sources: ['raw/docs/main'] }, AMONG_REPORTS)).channels.vector?.partial).toBeUndefined();
     });
 
     it('gives each side of a scoped search its candidates', async () => {

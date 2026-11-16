@@ -62,7 +62,15 @@ export interface SearchChannel {
   ms: number;
   /** Set when the channel could not answer (an embedding provider out of quota); hybrid search goes on without it. */
   error?: string;
+  /**
+   * Set when the channel returned fewer candidates than it was asked for though more exist: what stopped
+   * it, and how many it has. The rows it did return are its best, in order — only the list is short.
+   */
+  partial?: string;
 }
+
+/** A channel's candidates, with what cut the list short when something did (`SearchChannel.partial`). */
+type Recall = RankedChunk[] & { partial?: string };
 
 export type SearchChannelName = 'vector' | 'keyword' | 'graph';
 
@@ -501,7 +509,7 @@ export async function describeVectorScan(store: Store): Promise<string> {
   const catalog = scan.catalog ? `pgvector ${scan.catalog} in the catalog` : 'no pgvector version in the catalog';
   if (!scan.iterative) {
     return `vector search: one walk of the index per search (${catalog}; the library on this server has no hnsw.iterative_scan, which pgvector has from 0.8.0). `
-      + 'A search for the sources among nearer generated pages gets what the nearest 40 rows hold; a search narrowed to kinds or places reads the side those rows hold nothing of. '
+      + 'A search for the sources among nearer generated pages gets what the nearest 40 rows hold; a narrowed search reads a side small enough to read and otherwise gets what those rows hold of it, its vector channel marked partial. '
       + 'To change it: install pgvector 0.8.0 or later on the database server, restart it, then run ALTER EXTENSION vector UPDATE in the database.';
   }
   const behind = versionBefore(scan.catalog, 0, 8)
@@ -585,17 +593,6 @@ export const SCOPED_ROWS_MAX = 20000;
 export function scopedRows(k: number, total: number): number {
   return Math.min(SCOPED_ROWS_MAX, Math.max(SIDE_ROWS_MAX, Math.round(Math.sqrt(8 * k * total))));
 }
-
-/**
- * How much of a narrowed side is read when the walk found nothing of it, in
- * walks: four times the rows the walk was given, at the most. A side within
- * that is read whole, and ranked exactly; of a larger one the first that
- * many chunks are, which is an answer from the caller's scope and not the
- * nearest of it. The bound is on what a search can cost where no chunk of
- * the side has a vector yet (a backlog still being embedded finds none,
- * however far it reads).
- */
-export const SIDE_READ_AFTER_WALK = 4;
 
 interface SideSizes {
   /** Searchable chunks of sources, counted as far as the cap. */
@@ -692,10 +689,14 @@ async function sideSizes(store: Store, sides: SideSql, cap: number, asOf?: TimeI
  * side is the caller's choice, and may lie anywhere from the question. Its
  * shared walk is of the nearest chunks the filter leaves; a side is read up
  * to `scopedRows` chunks and walked on for as many rows where it is larger
- * (the choice by cost is argued there); and a side the walk found nothing of
- * is read after all, as far as `SIDE_READ_AFTER_WALK` times that, in a second
- * statement. tests/search-scoped-sides.test.ts holds each of these on an
- * index large enough to be walked.
+ * (the choice by cost is argued there). A walk that ends short of `k` is all
+ * such a side gets: the list is returned as it is and the channel says it is
+ * partial. For a while a side the walk found nothing of was read instead, as
+ * far as four times the walk's rows — and of a side larger than that, the
+ * first so-many chunks in no order: 5 of the true top 8 of 14,000 pages came
+ * back, ranked and scored like any exact answer, and the fusion took them for
+ * one. tests/search-scoped-sides.test.ts holds each of these on an index
+ * large enough to be walked.
  *
  * The scan's settings are made by the statement itself, for the statement: a
  * CTE calls `set_config(…, true)`, which lasts to the end of the transaction
@@ -714,7 +715,7 @@ async function vectorSearch(
   asOf?: TimeInput,
   filter?: ResolvedScopeFilter,
   exactSide?: number,
-): Promise<RankedChunk[]> {
+): Promise<Recall> {
   const qv = queryVector ?? (await embedder.embed([query]))[0];
   // a search for certain kinds reads the sides they are on, and no side that holds nothing it can return
   const kinds = filter?.kinds;
@@ -754,7 +755,7 @@ async function vectorSearch(
   const ask = (compose: (parts: {
     near: (pagesOnly: boolean) => string;
     walk: (generated: boolean, when?: string) => string;
-    read: (generated: boolean, most?: number) => string;
+    read: (generated: boolean) => string;
     lim: () => string;
   }) => string[]): Promise<(RankedChunk & { walked: boolean })[]> => {
     const p = new Params([toVectorLiteral(qv)]);
@@ -785,18 +786,15 @@ async function vectorSearch(
        ORDER BY e.embedding <=> $1::${VECTOR_TYPE}
        LIMIT ${lim()})`;
     // a side's own vectors, read from its documents. The inner query has no order (and OFFSET 0 keeps it
-    // a step of its own), so the planner has no use for the vector index there. With `most`, the first
-    // that many chunks of the side and no more.
-    const read = (generated: boolean, most?: number) => `(SELECT ${columns}, 1 - nearest.far AS raw, ${generated} AS generated, false AS walked
+    // a step of its own), so the planner has no use for the vector index there
+    const read = (generated: boolean) => `(SELECT ${columns}, 1 - nearest.far AS raw, ${generated} AS generated, false AS walked
        FROM (
          SELECT held.chunk_id, held.far FROM (
            SELECT c.id AS chunk_id, e.embedding <=> $1::${VECTOR_TYPE} AS far
-           FROM ${most === undefined
-    ? `documents d
-           JOIN chunks c ON c.document_id = d.id`
-    : `(SELECT c.id FROM documents d JOIN chunks c ON c.document_id = d.id WHERE ${cond} AND ${onSide(generated)} LIMIT ${Math.floor(most)}) c`}
-           JOIN embeddings e ON e.chunk_id = c.id AND e.model = ${model}${most === undefined ? `
-           WHERE ${cond} AND ${onSide(generated)}` : ''}
+           FROM documents d
+           JOIN chunks c ON c.document_id = d.id
+           JOIN embeddings e ON e.chunk_id = c.id AND e.model = ${model}
+           WHERE ${cond} AND ${onSide(generated)}
            OFFSET 0
          ) held
          ORDER BY held.far
@@ -859,7 +857,7 @@ async function vectorSearch(
     );
   };
 
-  let rows = await ask(({ near, walk, read, lim }) => {
+  const rows = await ask(({ near, walk, read, lim }) => {
     const branches: string[] = [];
     if (pages === 'near') {
       branches.push(near(sources !== 'walk'));
@@ -875,21 +873,25 @@ async function vectorSearch(
     if (pages === 'walk') branches.push(walk(true));
     return branches;
   });
-  // A side the caller narrowed the search to, and the walk found nothing of: it lies behind more of the
-  // index than a walk is worth (or the library walks no further than its first rows). The side is read
-  // instead, as far as `SIDE_READ_AFTER_WALK` times the rows the walk was given: an answer from the
-  // caller's own scope, at a cost bounded by the side's size, sooner than none.
-  if (narrowed) {
-    const unfound = [false, true].filter((generated) => (generated ? pages : sources) === 'walk' && !rows.some((r) => Boolean(r.generated) === generated));
-    if (unfound.length > 0) rows = rows.concat(await ask(({ read }) => unfound.map((generated) => read(generated, SIDE_READ_AFTER_WALK * walkMax))));
-  }
   // where the index was walked on for the sources, that list is the sources': it holds the nearest ones too
   const walkedSources = rows.some((r) => r.walked && !r.generated);
   const of = (generated: boolean) => rows
     .filter((r) => Boolean(r.generated) === generated && (generated || !walkedSources || r.walked))
     .sort((x, y) => y.raw - x.raw)
     .slice(0, k);
-  return mergeSides(of(false), of(true));
+  const out: Recall = mergeSides(of(false), of(true));
+  // A side the index was walked for, and the walk ended short of `k` of it: the side holds more (it was
+  // too large to read), and they lie further than the walk goes — or the library walks no further than
+  // its first rows. What was found is returned, nearest first, and the channel says the list is short.
+  // Nothing more is read: any part of the side that could be read within a limit is no nearer the
+  // question than the rest of it.
+  const short = [false, true]
+    .filter((generated) => (generated ? pages : sources) === 'walk' && of(generated).length < k)
+    .map((generated) => `${of(generated).length} of the ${k} ${generated ? 'pages' : 'sources'} asked for`);
+  if (short.length > 0) {
+    out.partial = `the walk of the vector index ended ${iterative ? `at its limit of ${walkMax} rows` : 'at its first rows (this pgvector has no iterative scan)'} with ${short.join(' and ')}`;
+  }
+  return out;
 }
 
 /**
@@ -1591,11 +1593,11 @@ export async function searchExplained(
   }
   const fetchK = Math.max(k * 3, 24);
   const channels: ExplainedSearch['channels'] = {};
-  const timed = async (name: SearchChannelName, run: () => Promise<RankedChunk[]>, tolerate = false): Promise<RankedChunk[]> => {
+  const timed = async (name: SearchChannelName, run: () => Promise<Recall>, tolerate = false): Promise<RankedChunk[]> => {
     const started = Date.now();
     try {
       const rows = await run();
-      channels[name] = { hits: rows.length, ms: Date.now() - started };
+      channels[name] = { hits: rows.length, ms: Date.now() - started, ...(rows.partial ? { partial: rows.partial } : {}) };
       return rows;
     } catch (err) {
       channels[name] = { hits: 0, ms: Date.now() - started, error: err instanceof Error ? err.message : String(err) };
