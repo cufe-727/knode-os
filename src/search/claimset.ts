@@ -356,6 +356,12 @@ const itemKey = (name: string) => CODE.exec(name)?.[0] ?? name;
 const RETROSPECTIVE = /最初|起初|原先|原来|一开始|当初|此前曾|\boriginally\b|\binitially\b|\bat first\b|\bpreviously\b/i;
 /** A statement that a value changed, which may name the old one ("由30天改为45天", "以240个连接为准"). */
 const CHANGE = /改为|改成|改回|调整为|调为|变更为|更新为|提高到|提高至|降低到|降至|上调|下调|恢复|回退|退回|撤回|以.{0,16}为准|\brolled back\b|\bback to\b|\bchanged? (?:it )?to\b|\braised to\b|\blowered to\b|\brevert(?:ed)? to\b|\bcorrected to\b/i;
+/** A statement that the earlier figure was wrong ("撤回原先的200，以240为准", "更正为"), not that it changed since. */
+const CORRECTS = /更正|订正|勘误|有误|应为|撤回|以.{0,16}为准|\bcorrect(?:ed|ion)\b|\btypo\b|\berratum\b|\bshould (?:read|be)\b/i;
+/** A change since ("改回", "调整为"): the extractor may flag a revert as a correction, but what it replaces did hold. */
+const CHANGED = /改回|恢复|回退|退回|回到|调整为|调为|改为|改成|变更为|更新为|提高到|提高至|降低到|降至|上调|下调|\brolled back\b|\bback to\b|\bchanged? (?:it )?to\b|\braised to\b|\blowered to\b|\brevert(?:ed)? to\b/i;
+/** The claim `by`, which replaced another, says that one was wrong (and so never held). */
+const correcting = (by: { statement: string; correction: boolean | null }) => CORRECTS.test(by.statement) || (Boolean(by.correction) && !CHANGED.test(by.statement));
 /** It states an earlier value only: "最初定为200" — not "撤回原先的200，以240为准". */
 const onlyRetrospective = (c: { statement: string; correction: boolean | null }) => !c.correction && RETROSPECTIVE.test(c.statement) && !CHANGE.test(c.statement);
 /** A statement that a state holds, so that "没有关闭" can be tested on an item's latest one. */
@@ -905,11 +911,11 @@ export async function computeClaimSet(
   if (numeric) {
     // readings: one figure a claim states for a period. Only claims stated as fact; a claim replaced by another of its
     // own period never held (a typo, a restatement), one replaced by a later period's is that period's history
+    // only a claim of the scope replaces one: an entity merged across scopes (one setting code in ten divisions)
+    // chains the supersession of one scope's figures through another's
+    const inScope = new Map(cands.map((c) => [c.id, c]));
     const replacedBy = new Map<string, Cand>();
-    const superseders = [...new Set(matched.map((c) => c.superseded_by).filter((x): x is string => Boolean(x)))];
-    if (superseders.length) {
-      for (const r of await store.query<Cand>(`${select} WHERE cl.id = ANY($1::text[])`, [superseders])) replacedBy.set(r.id, r);
-    }
+    for (const c of matched) if (c.superseded_by && inScope.has(c.superseded_by)) replacedBy.set(c.superseded_by, inScope.get(c.superseded_by)!);
     const left = { notFact: 0, replaced: 0, recalled: 0, noNumber: 0, units: new Map<string, number>(), grans: new Map<string, number>() };
     const readings = new Map<string, Cand>();
     const periods = new Map<string, Period | null>();
@@ -924,10 +930,13 @@ export async function computeClaimSet(
       if (onlyRetrospective(c)) { left.recalled++; continue; }
       const period = periodOf(c);
       periods.set(c.id, period);
-      if (c.superseded_by) {
+      if (c.superseded_by && replacedBy.has(c.superseded_by)) {
         const by = replacedBy.get(c.superseded_by);
         const byPeriod = by ? periodOf(by) : null;
-        const samePeriod = !by || by.correction || !period || !byPeriod || (byPeriod.gran === period.gran && byPeriod.key === period.key);
+        // replaced for its own period: by a correction, by a claim of the same period, or — neither period known (a
+        // setting) — by one of the same day; a later change of a setting is its history, not a correction of it
+        const samePeriod = !by || correcting(by)
+          || (period && byPeriod ? byPeriod.gran === period.gran && byPeriod.key === period.key : !period && !byPeriod && dateOf(by) === dateOf(c));
         if (samePeriod) { left.replaced++; continue; }
       }
       const d = dateOf(c);
@@ -935,8 +944,13 @@ export async function computeClaimSet(
       const prev = readings.get(key);
       if (!prev || byDate(dateOf(prev), d) < 0) readings.set(key, c);
     }
-    // one unit: the commonest; a tie names no figure
-    const unitOf = (c: Cand) => (c.unit ?? '').trim().toLowerCase();
+    // one unit: the commonest; a tie names no figure. A unit that begins another is the same one written with its
+    // noun ("万" and "万用户", "个" and "个连接"); "亿元" and "亿美元" are two
+    const raw = (c: Cand) => (c.unit ?? '').trim().toLowerCase();
+    const allUnits = [...new Set([...readings.values()].map(raw))].sort((a, b) => a.length - b.length);
+    const unitRoot = new Map<string, string>();
+    for (const u of allUnits) unitRoot.set(u, allUnits.find((v) => v && u.startsWith(v)) ?? u);
+    const unitOf = (c: Cand) => unitRoot.get(raw(c)) ?? raw(c);
     const byUnit = new Map<string, number>();
     for (const c of readings.values()) byUnit.set(unitOf(c), (byUnit.get(unitOf(c)) ?? 0) + 1);
     const unitsRanked = [...byUnit].sort((a, b) => b[1] - a[1]);

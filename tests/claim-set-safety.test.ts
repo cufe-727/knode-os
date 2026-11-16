@@ -366,6 +366,42 @@ describe('the rest of the review (item 10)', () => {
   });
 });
 
+describe('history the measurement showed the first fix lost', () => {
+  beforeAll(async () => {
+    await addEntity('cutoff', '拦截分数线', 'component');
+    await addEntity('fj', '飞驰集团', 'organization');
+    await addDoc('s1', '宁德时代配置周报 3月', d('2025-03-17'), '拦截分数线定为80分。', ['catl']);
+    await addDoc('s2', '宁德时代配置周报 5月', d('2025-05-19'), '拦截分数线改为85分。', ['catl']);
+    await addDoc('s3', '宁德时代配置周报 7月', d('2025-07-14'), '拦截分数线改回原来的80分。', ['catl']);
+    await addDoc('fj-1', '飞驰集团配置周报', d('2025-06-13'), '拦截分数线撤回原先的80分，以85分为准。', ['fj']);
+    // one setting entity for two companies (a merge across scopes); the extractor flags the revert as a correction
+    const revert = await addClaim('s3', 'cutoff', '宁德时代拦截分数线改回原来的80分', { attribute: '分数线', num: 80, unit: '分', at: d('2025-07-14'), correction: true });
+    const other = await addClaim('fj-1', 'cutoff', '飞驰集团拦截分数线撤回原先的80分，以85分为准', { attribute: '分数线', num: 85, unit: '分', at: d('2025-06-13'), correction: true });
+    const change = await addClaim('s2', 'cutoff', '宁德时代拦截分数线改为85分', { attribute: '分数线', num: 85, unit: '分', at: d('2025-05-19'), supersededBy: other });
+    await addClaim('s1', 'cutoff', '宁德时代拦截分数线定为80分', { attribute: '分数线', num: 80, unit: '分', at: d('2025-03-17'), supersededBy: change });
+    await store.query(`UPDATE claims SET superseded_by = $1 WHERE id = $2`, [revert, other]);
+    for (const doc of ['s1', 's2', 's3']) for (let i = 0; i < 3; i++) await addClaim(doc, 'catl', `宁德时代配置项${i}正常`, { at: d('2025-05-01') });
+    for (let i = 0; i < 3; i++) await addClaim('fj-1', 'fj', `飞驰集团配置项${i}正常`, { at: d('2025-06-13') });
+    // a series whose unit is written with and without its noun
+    for (const [day, v, unit] of [['2025-04-07', 121, '万'], ['2025-04-14', 135, '万用户'], ['2025-04-21', 128, '万']] as const) {
+      await addClaim('r2', 'catl', `宁德时代本周周活跃用户${v}${unit}`, { attribute: '周活跃用户', num: v, unit, at: d(day), from: d(day), to: d(day.replace(/\d\d$/, (x) => String(Number(x) + 4).padStart(2, '0'))) });
+    }
+  });
+
+  it('keeps a setting\'s earlier value as its history when a later change, or a revert flagged as a correction, replaced it', async () => {
+    expect(await set('2025年4月1日那天，宁德时代的拦截分数线是多少？', ['catl'])).toMatchObject({ answer: '80' });
+    // replaced by the other company's correction of its own copy: still 宁德时代's value then
+    expect(await set('2025年6月18日那天，宁德时代的拦截分数线是多少？', ['catl'])).toMatchObject({ answer: '85' });
+    expect(await set('截至2025年11月7日，宁德时代的拦截分数线是多少？', ['catl'])).toMatchObject({ answer: '80' });
+  });
+
+  it('takes a unit with and without its noun for one unit', async () => {
+    const max = await set('宁德时代的最高周活跃用户是多少？', ['catl']);
+    expect(max).toMatchObject({ answer: '135' });
+    expect(max!.lines[0]).toContain('of 3 readings');
+  });
+});
+
 describe('a Chinese question end to end (review item 11)', () => {
   it('puts the value as of a day, its sources and what it left out before the model, and no forecast as a fact', async () => {
     const { llm, prompts } = recordingLlm();
