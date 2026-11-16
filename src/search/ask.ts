@@ -69,7 +69,7 @@ function renderComputed(c: ComputedSet): string {
 /** The rows of a computed set as known facts, each with every source. */
 function computedFacts(c: ComputedSet): PromptFact[] {
   return c.rows.map((r) => ({
-    id: r.id, subject: r.subject, object: r.object, type: 'set', statement: r.statement, status: 'fact', kind: 'fact',
+    id: r.id, subject: r.subject, object: r.object, type: 'set', statement: r.statement, status: r.status, kind: r.kind,
     startDate: null, endDate: null, eventDate: null, date: r.date, path: r.sources[0] ?? null, sources: r.sources, superseded: r.superseded, chunkId: null,
   }));
 }

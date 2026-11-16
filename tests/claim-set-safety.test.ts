@@ -99,6 +99,16 @@ beforeAll(async () => {
   await addClaim('r2', 'bmw', '宝马是宁德时代的客户', { object: 'catl', at: d('2025-08-01') });
   await addClaim('r2', 'catl-v', 'CATL 的客户包括多家欧洲车企', { at: d('2025-08-01') });
   await addClaim('r4', 'byd', '比亚迪是CATL的客户', { object: 'catl-v', at: d('2025-10-10') });
+  // a customer only rumoured
+  await addEntity('nio', '蔚来', 'organization');
+  await addClaim('r5', 'nio', '蔚来或将成为宁德时代的客户', { object: 'catl', at: d('2026-01-05'), kind: 'rumor', status: 'suspected' });
+  // a weekly series: each week's reading superseded by the next week's, as supersession marks a series
+  const weeks = [['2025-03-03', '2025-03-07', 12.1], ['2025-03-10', '2025-03-14', 13.4], ['2025-03-17', '2025-03-21', 12.8]] as const;
+  let next: string | undefined;
+  for (const [from, to, v] of [...weeks].reverse()) {
+    await addDoc(`wk-${from}`, `宁德时代周报 ${from}`, d(to), `本周出货量${v}GWh`, ['catl']);
+    next = await addClaim(`wk-${from}`, 'catl', `宁德时代本周出货量${v}GWh`, { attribute: '出货量', num: v, unit: 'GWh', at: d(from), from: d(from), to: d(to), supersededBy: next });
+  }
 });
 
 afterAll(async () => {
@@ -128,6 +138,40 @@ const withRouter = (router: Partial<NonNullable<KnodeConfig['retrieval']['router
   c.retrieval.router = { ...c.retrieval.router!, ...router };
   return c;
 };
+
+describe('numbers from current, factual claims of one unit and one period granularity (review item 1)', () => {
+  it('takes no maximum over a typo a later claim of its own quarter replaced, a forecast, another currency or a mix of quarter and half-year', async () => {
+    const max = await set('宁德时代的最高营收是多少？', ['catl', 'catl-v']);
+    // a quarter and a half-year, one reading each: no granularity to take a maximum over
+    expect(max).toBeNull();
+    expect(await set('宁德时代营收总额是多少？', ['catl', 'catl-v'])).toBeNull();
+  });
+
+  it('gives the value as of a day from factual readings of the commonest unit, and says what it left out', async () => {
+    const v = await set('截至2025年12月31日，宁德时代的营收是多少？', ['catl', 'catl-v']);
+    expect(v).toMatchObject({ op: 'value', answer: '1789' });
+    const text = v!.lines.join('\n');
+    expect(text).not.toContain('4500');
+    expect(text).not.toContain('8470');
+    expect(text).toMatch(/left out.*not stated as fact/i);
+    expect(text).toMatch(/left out.*another unit.*亿美元/i);
+    expect(text).toMatch(/left out.*replaced for its own period/i);
+  });
+
+  it('counts every week of a series that supersession marks week by week', async () => {
+    const max = await set('宁德时代的最高周出货量是多少？', ['catl', 'catl-v']);
+    expect(max).toMatchObject({ op: 'max', answer: '13.4' });
+    expect(max!.lines[0]).toContain('of 3 readings');
+  });
+
+  it('shows each row with its own kind and status, and counts no item reported only as a rumour', async () => {
+    const { llm, prompts } = recordingLlm();
+    const res = await ask(store, defaultConfig(), embedder, llm, '宁德时代有哪些客户？', { computed: true });
+    expect(prompts[0]).toContain('[rumor, suspected; set] 蔚来或将成为宁德时代的客户');
+    expect(res.computed!.lines.join('\n')).not.toMatch(/^- 蔚来/m);
+    expect(res.computed!.lines.join('\n')).toMatch(/not as fact.*蔚来/);
+  });
+});
 
 describe('the switches', () => {
   it('computes no set unless the workspace or the call turns computed sets on', async () => {

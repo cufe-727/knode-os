@@ -194,6 +194,9 @@ export interface SetRow {
   /** The title of the first source, which often says what period it reports on ("平台组周报 · 第5周"). */
   title: string | null;
   superseded: boolean;
+  /** The claim's own kind and status: a forecast or a rumour is shown as one. */
+  kind: string;
+  status: string;
 }
 
 export interface ComputedSet {
@@ -220,7 +223,51 @@ export interface ComputedSet {
 interface Cand {
   id: string; subject_id: string; subject: string; subject_type: string; object_id: string | null; object: string | null; object_type: string | null;
   statement: string; attribute: string | null; value_num: number | null; value_text: string | null; unit: string | null;
-  eff: string | Date | null; superseded_by: string | null; correction: boolean | null; kind: string | null;
+  eff: string | Date | null; superseded_by: string | null; correction: boolean | null; kind: string | null; status: string | null;
+  valid_from: string | Date | null; valid_to: string | Date | null;
+}
+
+/** How a claim not stated as fact was stated: its kind, and its status when hedged ("rumor, suspected"). */
+const claimKind = (c: { kind: string | null; status: string | null }) => [c.kind && c.kind !== 'fact' ? c.kind : '', c.status && c.status !== 'fact' ? c.status : ''].filter(Boolean).join(', ') || 'fact';
+/** A claim stated as fact: no forecast, opinion or rumour, nothing suspected or disputed. */
+const isFact = (c: { kind: string | null; status: string | null }) => (c.kind ?? 'fact') === 'fact' && (c.status ?? 'fact') === 'fact';
+
+export type Granularity = 'week' | 'month' | 'quarter' | 'half' | 'year';
+/** The period a reading is of: its granularity and which one ("quarter", "2025-Q1"). */
+export interface Period { gran: Granularity; key: string }
+
+/**
+ * The period a claim's figure is of: from its validity window when it has
+ * one, else from the words of its statement ("2025年一季度", "上半年", "全年",
+ * "本周", "Q3 2025"), with its own date for the year; null when neither says.
+ */
+export function periodOf(c: { statement: string; valid_from?: string | Date | null; valid_to?: string | Date | null; eff?: string | Date | null }): Period | null {
+  const from = toDateString(c.valid_from ?? null);
+  const to = toDateString(c.valid_to ?? null);
+  if (from && to && to >= from) {
+    const days = (Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000 + 1;
+    const y = from.slice(0, 4);
+    const m = Number(from.slice(5, 7));
+    if (days <= 8) return { gran: 'week', key: isoWeek(from) };
+    if (days <= 31) return { gran: 'month', key: from.slice(0, 7) };
+    if (days <= 92) return { gran: 'quarter', key: `${y}-Q${Math.floor((m - 1) / 3) + 1}` };
+    if (days <= 184) return { gran: 'half', key: `${y}-H${m <= 6 ? 1 : 2}` };
+    if (days <= 366) return { gran: 'year', key: y };
+    return null;
+  }
+  const st = c.statement;
+  const eff = toDateString(c.eff ?? null);
+  const year = /(\d{4})\s*(?:年|财年)/.exec(st)?.[1] ?? /\b(?:FY\s?)?((?:19|20)\d{2})\b/.exec(st)?.[1] ?? eff?.slice(0, 4);
+  if (!year) return null;
+  let m = /第?([一二三四1-4])\s*季度|\bQ([1-4])\b/i.exec(st);
+  if (m) return { gran: 'quarter', key: `${year}-Q${numOf(m[1] ?? m[2])}` };
+  if (/上半年|\bH1\b|\bfirst half\b/i.test(st)) return { gran: 'half', key: `${year}-H1` };
+  if (/下半年|\bH2\b|\bsecond half\b/i.test(st)) return { gran: 'half', key: `${year}-H2` };
+  if (/全年|年度|财年|\bfull[- ]year\b|\bFY\b|\bannual\b/i.test(st)) return { gran: 'year', key: year };
+  m = /(?<![\d年])(\d{1,2})\s*月(?!\s*\d{1,2}\s*[日号])/.exec(st);
+  if (m && Number(m[1]) >= 1 && Number(m[1]) <= 12) return { gran: 'month', key: `${year}-${pad(m[1])}` };
+  if (eff && /本周|当周|这周|\bthis week\b|\bweekly\b/i.test(st)) return { gran: 'week', key: isoWeek(eff) };
+  return null;
 }
 
 /** An identifier inside a name ("INC-001-T1", "R-04"): two names with one identifier are one item. */
@@ -473,7 +520,7 @@ export async function computeClaimSet(
   const select = `SELECT cl.id, cl.subject_id, se.name AS subject, se.type AS subject_type, cl.object_id, oe.name AS object, oe.type AS object_type,
             cl.statement, ${col('attribute', 'text')} AS attribute, ${col('valueNum', 'float8')} AS value_num, ${col('valueText', 'text')} AS value_text,
             ${col('unit', 'text')} AS unit, COALESCE(${col('effective', 'timestamptz')}, cl.event_at, cl.valid_from) AS eff,
-            cl.superseded_by, cl.correction, cl.kind
+            cl.superseded_by, cl.correction, cl.kind, cl.status, cl.valid_from, cl.valid_to
      FROM claims cl JOIN entities se ON se.id = cl.subject_id LEFT JOIN entities oe ON oe.id = cl.object_id`;
   let cands: Cand[];
   let matchedAttrs: Set<string>;
@@ -611,6 +658,7 @@ export async function computeClaimSet(
       id: c.id, subject: c.subject, object: c.object, statement: c.statement, date: dateOf(c),
       value: c.value_num !== null ? `${fmt(c.value_num)}${c.unit ?? ''}` : c.value_text, attribute: c.attribute,
       sources: first ? [first, ...src.filter((s) => s !== first)] : src, title: first ? titleOf.get(first) ?? null : null, superseded: Boolean(c.superseded_by),
+      kind: c.kind ?? 'fact', status: c.status ?? 'fact',
     };
   };
   const label = (r: SetRow) => `${r.date ?? '?'}${r.title ? ` 《${r.title}》` : ''}`;
@@ -644,19 +692,65 @@ export async function computeClaimSet(
 
   const numeric = read.op === 'max' || read.op === 'min' || read.op === 'mean' || read.op === 'sum' || read.op === 'value' || Boolean(read.threshold);
   if (numeric) {
-    // readings: one value a claim states on a date, one per subject and week (a week's report and its restatement are one reading)
-    const readings = new Map<string, Cand>();
-    for (const c of matched) {
-      if (read.op !== 'value' && c.value_num === null) continue;
-      if (read.op !== 'value' && matchedAttrs.size > 0 && (!c.attribute || !matchedAttrs.has(c.attribute))) continue;
-      if (c.value_num === null && !c.value_text) continue;
-      if (onlyRetrospective(c)) continue;
-      if (!inPeriod(c)) continue;
-      const d = dateOf(c);
-      const key = read.op === 'value' ? c.id : `${c.subject_id}|${d ? isoWeek(d) : c.id}`;
-      const prev = readings.get(key);
-      if (!prev || (prev.superseded_by && !c.superseded_by)) readings.set(key, c);
+    // readings: one figure a claim states for a period. Only claims stated as fact; a claim replaced by another of its
+    // own period never held (a typo, a restatement), one replaced by a later period's is that period's history
+    const replacedBy = new Map<string, Cand>();
+    const superseders = [...new Set(matched.map((c) => c.superseded_by).filter((x): x is string => Boolean(x)))];
+    if (superseders.length) {
+      for (const r of await store.query<Cand>(`${select} WHERE cl.id = ANY($1::text[])`, [superseders])) replacedBy.set(r.id, r);
     }
+    const left = { notFact: 0, replaced: 0, recalled: 0, noNumber: 0, units: new Map<string, number>(), grans: new Map<string, number>() };
+    const readings = new Map<string, Cand>();
+    const periods = new Map<string, Period | null>();
+    for (const c of matched) {
+      if (read.op !== 'value' && matchedAttrs.size > 0 && (!c.attribute || !matchedAttrs.has(c.attribute))) continue;
+      if (c.value_num === null && (read.op !== 'value' || !c.value_text)) {
+        if (c.attribute && matchedAttrs.has(c.attribute)) left.noNumber++;
+        continue;
+      }
+      if (!inPeriod(c)) continue;
+      if (!isFact(c)) { left.notFact++; continue; }
+      if (onlyRetrospective(c)) { left.recalled++; continue; }
+      const period = periodOf(c);
+      periods.set(c.id, period);
+      if (c.superseded_by) {
+        const by = replacedBy.get(c.superseded_by);
+        const byPeriod = by ? periodOf(by) : null;
+        const samePeriod = !by || by.correction || !period || !byPeriod || (byPeriod.gran === period.gran && byPeriod.key === period.key);
+        if (samePeriod) { left.replaced++; continue; }
+      }
+      const d = dateOf(c);
+      const key = read.op === 'value' ? c.id : `${c.subject_id}|${period ? `${period.gran}:${period.key}` : d ? isoWeek(d) : c.id}`;
+      const prev = readings.get(key);
+      if (!prev || byDate(dateOf(prev), d) < 0) readings.set(key, c);
+    }
+    // one unit: the commonest; a tie names no figure
+    const unitOf = (c: Cand) => (c.unit ?? '').trim().toLowerCase();
+    const byUnit = new Map<string, number>();
+    for (const c of readings.values()) byUnit.set(unitOf(c), (byUnit.get(unitOf(c)) ?? 0) + 1);
+    const unitsRanked = [...byUnit].sort((a, b) => b[1] - a[1]);
+    if (unitsRanked.length > 1 && unitsRanked[0][1] === unitsRanked[1][1]) return null;
+    const theUnit = unitsRanked[0]?.[0];
+    for (const [k, c] of readings) if (unitOf(c) !== theUnit) { left.units.set(c.unit ?? '(none)', (left.units.get(c.unit ?? '(none)') ?? 0) + 1); readings.delete(k); }
+    // one granularity for a figure over many readings: the commonest known one; a tie, or a sum over periods not all known, names none
+    if (read.op !== 'value') {
+      const byGran = new Map<string, number>();
+      for (const c of readings.values()) { const g = periods.get(c.id)?.gran ?? 'unknown'; byGran.set(g, (byGran.get(g) ?? 0) + 1); }
+      const known = [...byGran].filter(([g]) => g !== 'unknown').sort((a, b) => b[1] - a[1]);
+      if (known.length > 1 && known[0][1] === known[1][1]) return null;
+      if (read.op === 'sum' && (byGran.has('unknown') || known.length !== 1)) return null;
+      const theGran = known[0]?.[0];
+      if (theGran) for (const [k, c] of readings) if (periods.get(c.id)?.gran !== theGran) { left.grans.set(periods.get(c.id)?.gran ?? 'unknown', (left.grans.get(periods.get(c.id)?.gran ?? 'unknown') ?? 0) + 1); readings.delete(k); }
+    }
+    const leftOut = [
+      left.notFact ? `${left.notFact} not stated as fact (a forecast, opinion or rumour, or suspected)` : '',
+      left.replaced ? `${left.replaced} replaced for its own period by a later claim` : '',
+      left.recalled ? `${left.recalled} only recalling an earlier value` : '',
+      left.units.size ? `${[...left.units.values()].reduce((a, b) => a + b, 0)} in another unit (${[...left.units.keys()].join(', ')})` : '',
+      left.grans.size ? `${[...left.grans.values()].reduce((a, b) => a + b, 0)} of another period length (${[...left.grans.keys()].join(', ')})` : '',
+      left.noNumber ? `${left.noNumber} of the attribute with no numeric value recorded` : '',
+    ].filter(Boolean);
+    if (readings.size === 0) return null;
     let list = [...readings.values()].sort((a, b) => byDate(dateOf(a), dateOf(b)) || a.id.localeCompare(b.id));
     if (read.op === 'value') {
       // the value then: the latest stated on or before the date, a correction over what it corrects
@@ -672,6 +766,7 @@ export async function computeClaimSet(
       lines.push(`History up to ${read.asOf} (${list.length} statements, latest last): ${history.map((c) => `${dateOf(c)} ${c.value_num !== null ? fmt(c.value_num) + (c.unit ?? '') : c.value_text}${c.correction ? ' (correction)' : ''}`).join('; ')}`);
       rows.push(...history.map(toRow));
       items = list.length;
+      if (leftOut.length) lines.push(`Left out: ${leftOut.join('; ')}.`);
     } else {
       if (read.threshold) {
         const { cmp, value } = read.threshold;
@@ -711,6 +806,7 @@ export async function computeClaimSet(
         }
       }
       rows.push(...list.map(toRow));
+      if (leftOut.length) lines.push(`Left out: ${leftOut.join('; ')}.`);
     }
   } else {
     // items: the entities the claims are about, or the ones of the kind the question asks for
@@ -776,6 +872,9 @@ export async function computeClaimSet(
       });
     }
     if (read.atLeast) list = list.filter((it) => it.about.size >= read.atLeast!);
+    // an item no claim states as fact (only forecast, rumoured, suspected) is not counted; it is named apart
+    const unfactual = list.filter((it) => !it.claims.some(isFact));
+    list = list.filter((it) => it.claims.some(isFact));
     list.sort((a, b) => byDate(dateOf(a.claims[0]), dateOf(b.claims[0])) || a.key.localeCompare(b.key));
     items = list.length;
     const relatedCount = list.some((it) => it.about.size > 0) && (read.atLeast !== undefined || read.asks === 'person' || read.asks === 'organization');
@@ -797,8 +896,9 @@ export async function computeClaimSet(
       }
     }
     if (uncoded.length) lines.push(`Also named without an identifier (each may be one listed above, not counted): ${uncoded.map((it) => it.name).join('、')}`);
+    if (unfactual.length) lines.push(`Also reported, not as fact (not counted): ${unfactual.map((it) => `${it.name} (${[...new Set(it.claims.map((c) => claimKind(c)))].join(', ')})`).join('、')}`);
     // the rows: each item's first and latest claims, and a few between
-    for (const it of list) {
+    for (const it of [...list, ...unfactual]) {
       const cs = it.claims;
       const pick = cs.length <= ROWS_PER_ITEM ? cs : [cs[0], ...cs.slice(1, -1).filter((c) => c.attribute && matchedAttrs.has(c.attribute)).slice(-(ROWS_PER_ITEM - 2)), cs[cs.length - 1]];
       for (const c of pick) rows.push(toRow(c));
