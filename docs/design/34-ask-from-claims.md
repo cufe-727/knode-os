@@ -86,3 +86,22 @@ The default (computed sets off, second round on) was judged safe to deploy; comp
 
 `multihopAnswer` keeps the computed-sets gate; what a chain's set is scoped to is the relation walk's to decide.
 
+
+## 5. After the third check of 2026-11-16 (same branch, from 36f6ea5)
+
+Default config (computed sets off, second round on):
+
+- **Second round** (08c8705, 7341ceb): word statistics are read only once the keyword index (`chunks_match_grams_idx`) is ready; on a ready index they are a bitmap scan of it. A chain step counts as covered only by a passage or claim of its own, not by the one that led to it.
+- **Cross-lingual questions** (no change): the narrow rule (an English name with no linked entity read in its own language) cannot fire on the 10x pack — none of its 18 asked cross-lingual questions names a linked entity, so it recovers none. The earlier gain came from lookups reading entities the passages happen to mention, which item 2 of the re-check ruled out.
+- **Segmenter** (no change): a word `Intl.Segmenter` cuts wrongly is in no passage (df 0) and is ignored; an uncut long run is dropped. Both fail safe: the round does not fire.
+- **Evaluation** (b5c8bf0): an empty variable is unset, an unreadable one is an error naming it, and the options are recorded in the run's metadata (`askOptions`).
+
+Computed sets (still off by default), one commit each with its test:
+
+- **合计 is a sum; a peer is no item** (d5a96ba).
+- **Scale after the currency** (a220f77): "HK$ bn", "USD billion".
+- **Threshold in its own unit** (5c61ebe): "超过1万亿元" is compared in the base; a bare figure in the unit shown.
+- **Running totals** (07f6707): "前三季度", "1-9月", "Q3 YTD" and a validity window from 1 January through another month than June or December are `ytd`, never the third quarter; a sum or mean of running totals is not computed. A question's "前三季度" is the window from 1 January.
+- **Fiscal quarters** (760d0ec): a quarter or half of a fiscal year with no days recorded is in no calendar window, and is said.
+- **Disagreeing figures** (2fc56af): a period with two figures, neither recorded as replacing the other, gives an answer only where either figure gives the same one: a maximum it cannot reach, a threshold both figures pass or fail. Otherwise nothing is computed, and a value as of a day whose period disagrees is not computed either — the two paths agree.
+- **Time budget** (f0537e8): a set asked for and left uncomputed past its budget is said in the prompt ("Not computed: its time budget of N ms ran out"), in `route.computedSkipped` and in the gaps ("the answer may be incomplete"). On PGlite no timer fires while a statement runs (WASM on the event loop's thread), so the budget is overrun by the statement under way when it passes (a 50 ms budget returned after 509–567 ms on the 113k-entity store). On PostgreSQL the race ends at the budget and the statement finishes on the server, unwaited; a `statement_timeout` per statement would end it there too.
