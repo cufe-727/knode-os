@@ -9,7 +9,7 @@ import { toDateString, toIso } from '../store/temporal.js';
 import { directJudge, JudgeCall, JudgeRunner, verdictMayDecide } from '../work/judge.js';
 import { applyClaimMerge, reanchorClaimGroups } from './claim-merge.js';
 import { pendingRekey, rekeyState, rekeyWeeklyReadings } from './claim-rekey.js';
-import { sameValue, seriesObject } from './claim-state.js';
+import { sameValue, seriesObject, statementObject } from './claim-state.js';
 import { claimId, readingWeek } from './store.js';
 import { packSubjectBatches, SubjectBatch } from './subject-batches.js';
 import { alikeWording, Wording, wordingOf, wordingPrefixLength } from './wording.js';
@@ -683,11 +683,16 @@ export function monthsApart(
  * One day with two values is a real disagreement or a misreading: the judge's.
  */
 export function seriesRelation(
-  a: Pick<ClaimLite, 'subject' | 'object' | 'kind' | 'attribute' | 'value_num' | 'value_text' | 'unit' | 'eff'> & Partial<Pick<ClaimLite, 'object_name' | 'object_type'>>,
-  b: Pick<ClaimLite, 'subject' | 'object' | 'kind' | 'attribute' | 'value_num' | 'value_text' | 'unit' | 'eff'> & Partial<Pick<ClaimLite, 'object_name' | 'object_type'>>,
+  a: Pick<ClaimLite, 'subject' | 'object' | 'kind' | 'attribute' | 'value_num' | 'value_text' | 'unit' | 'eff'> & Partial<Pick<ClaimLite, 'object_name' | 'object_type' | 'statement' | 'subject_name'>>,
+  b: Pick<ClaimLite, 'subject' | 'object' | 'kind' | 'attribute' | 'value_num' | 'value_text' | 'unit' | 'eff'> & Partial<Pick<ClaimLite, 'object_name' | 'object_type' | 'statement' | 'subject_name'>>,
 ): 'different_time' | 'same' | null {
   if (!a.attribute || a.attribute !== b.attribute || a.subject !== b.subject || a.kind !== b.kind) return null;
-  const of = (c: typeof a) => seriesObject(c.attribute, { id: c.object, name: c.object_name, type: c.object_type }, c.value_text);
+  const of = (c: typeof a) => {
+    const object = seriesObject(c.attribute, { id: c.object, name: c.object_name, type: c.object_type }, c.value_text);
+    if (object) return object;
+    const about = c.statement ? statementObject(c.statement, c.attribute, c.subject_name ? [c.subject_name] : []) : '';
+    return about ? `~${about}` : '';
+  };
   if (of(a) !== of(b)) return null;
   const da = toDateString(a.eff);
   const db = toDateString(b.eff);

@@ -372,3 +372,32 @@ describe('back-references outside periodic reports', () => {
     expect(await ctx.store.query(`SELECT 1 FROM scopes WHERE kind = 'backref' AND status = 'active'`)).toEqual([]);
   });
 });
+
+describe('owner and state claims the model gave no object', () => {
+  it('keeps statements about different things apart, and the subject\'s own owner one series', async () => {
+    const ctx = await workspace('no-object', {
+      'raw/docs/a.md': dated('a', '2025-03-10', 'entities:\n  - { name: 比亚迪, type: organization }\nclaims:\n  - { subject: 比亚迪, statement: 云业务由张三负责, type: other }\n  - { subject: 比亚迪, statement: 比亚迪负责人为王传福, type: other }\n'),
+      'raw/docs/b.md': dated('b', '2025-03-17', 'entities:\n  - { name: 比亚迪, type: organization }\nclaims:\n  - { subject: 比亚迪, statement: 电池业务由李四负责, type: other }\n  - { subject: 比亚迪, statement: 比亚迪的负责人是王传福和李柯, type: other }\n'),
+    });
+    await refreshClaimState(ctx.store);
+    const rows = await ctx.store.query<{ statement: string; current: boolean }>(
+      `SELECT statement, superseded_by IS NULL AS current FROM claims WHERE tx_to IS NULL AND attribute IS NOT NULL`,
+    );
+    const current = rows.filter((r) => r.current).map((r) => r.statement).sort();
+    // each business keeps its owner; the company's own owner is one series
+    expect(current).toEqual(['云业务由张三负责', '电池业务由李四负责', '比亚迪的负责人是王传福和李柯'].sort());
+  });
+
+  it('reads what an owner or state statement is about', async () => {
+    const { statementObject } = await import('../src/graph/claim-state.js');
+    expect(statementObject('云业务由张三负责', '负责人', ['比亚迪'])).toBe('云业务');
+    expect(statementObject('比亚迪云业务由张三负责。', '负责人', ['比亚迪'])).toBe('云业务');
+    expect(statementObject('R-03由赖艳负责', '负责人', ['R-03'])).toBe('');
+    expect(statementObject('风险R-54由陈强南乔负责。', '负责人', ['R-54'])).toBe('');
+    expect(statementObject('风险R-118的负责人是方平。', '负责人', ['R-118'])).toBe('');
+    expect(statementObject('R-59正在跟进，负责人为叶超', '负责人', ['R-59'])).toBe('');
+    expect(statementObject('Atlas负责人是廖欣', '负责人', ['Orion', 'Atlas'])).toBe('');
+    expect(statementObject('比亚迪半导体业务上市状态为审核中', '状态', ['比亚迪'])).toBe('半导体业务上市');
+    expect(statementObject('R-03状态为已关闭', '状态', ['R-03'])).toBe('');
+  });
+});

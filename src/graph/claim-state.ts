@@ -89,6 +89,39 @@ export function seriesObject(attribute: string | null | undefined, object: Serie
   return o.id;
 }
 
+/** Kind words written before or after a name: 风险R-54, 事故INC-001, Orion项目. */
+const KIND_WORDS = /^(?:风险|事故|故障|项目|公司|集团|系统|平台|团队|小组|部门|工程|方案|计划|risk|incident|project|company|the)+|(?:风险|事故|故障|项目|公司|集团|系统|平台|团队|小组|部门)+$/giu;
+
+/** Where an owner or a state is said, what stands before it is what the owner or state is of. */
+const OWNER_AT = /(?:由|归)\s*[\p{Script=Han}A-Za-z·]{2,12}?\s*(?:负责|牵头|主导|跟进)|(?:的)?(?:负责人|牵头人|责任人|跟进人)\s*(?:为|是|：|:)|\b(?:is )?(?:led|owned|run) by\b|\b(?:lead|owner)\s+(?:is|was|:)/iu;
+const STATE_AT = /(?:的)?(?:状态|阶段)\s*(?:为|是|：|:)|\b(?:status|stage|phase)\s+(?:is|was|:)/iu;
+
+/**
+ * What an owner or a state statement is about when the claim carries no
+ * object: the last clause before "由张三负责" / "负责人为" / "状态为", without
+ * the subject's own spellings and function words. "" when that is the subject
+ * itself ("R-03由赖艳负责", "Atlas负责人是廖欣" of Orion, formerly Atlas). The
+ * model often leaves the object out: "云业务由张三负责" and "电池业务由李四负责",
+ * both filed under 比亚迪, are the owners of two businesses, not one owner
+ * changing.
+ */
+export function statementObject(statement: string, attribute: string | null | undefined, spellings: readonly string[]): string {
+  const head = attributeHead(attribute);
+  if (!head || !TEXT_KEYS.has(head)) return '';
+  const text = statement.normalize('NFKC');
+  const at = (STATE_KEYS.has(head) ? STATE_AT : OWNER_AT).exec(text);
+  if (!at) return '';
+  let before = (text.slice(0, at.index).split(/[，,;；。:：]/).pop() ?? '').trim();
+  for (const sp of [...spellings].map((x) => x.normalize('NFKC').trim()).filter((x) => x.length >= 2).sort((a, b) => b.length - a.length)) {
+    if (before.toLowerCase().includes(sp.toLowerCase())) before = before.split(new RegExp(sp.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')).join(' ');
+  }
+  before = before.replace(DATE_WORDS, ' ').replace(/\s+/g, '').replace(LEADING_FUNCTION, '').replace(TRAILING_FUNCTION, '').replace(/^(?:的|之|其)+|(?:的|之)+$/u, '');
+  // the kind word a name is written with ("风险R-54", "项目Orion") is not another thing
+  before = before.replace(KIND_WORDS, '');
+  if (/^(?:the|its|their)$/i.test(before)) return '';
+  return before.length >= 2 ? fold(before) : '';
+}
+
 /** The head of a key's synonym group (跟进人 → 负责人), or the key. */
 export function attributeHead(attribute: string | null | undefined): string | null {
   if (!attribute) return null;

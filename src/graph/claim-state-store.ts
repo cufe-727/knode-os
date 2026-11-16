@@ -1,7 +1,7 @@
 import { breather } from '../pool.js';
 import { Store } from '../store/db.js';
 import { EvidenceAtRow, foldClaimEvidence, groupBy, toDateString, toIso } from '../store/temporal.js';
-import { CLAIM_STATE_VERSION, sameValue, seriesObject, subjectSpellingsOf, unifyAttributeKeys } from './claim-state.js';
+import { CLAIM_STATE_VERSION, sameValue, seriesObject, statementObject, subjectSpellingsOf, unifyAttributeKeys } from './claim-state.js';
 import { packSubjectBatches } from './subject-batches.js';
 
 /**
@@ -149,6 +149,8 @@ export interface StateRow {
   /** The object's name and type, which say whether it is the value or who handles a state (seriesObject). */
   object_name?: string | null;
   object_type?: string | null;
+  /** The statement, read for what an owner or state claim with no object is about (statementObject). */
+  statement?: string;
   kind: string;
   value_num: number | null;
   value_text: string | null;
@@ -200,6 +202,14 @@ export function seriesSupersession(series: StateRow[]): Map<string, string | nul
   return out;
 }
 
+/** The object part of a claim's series: its object (seriesObject), else what its owner or state statement is about. */
+export function seriesKeyObject(r: Pick<StateRow, 'attribute' | 'object_id' | 'object_name' | 'object_type' | 'value_text' | 'statement'>, spellings: readonly string[]): string {
+  const object = seriesObject(r.attribute, { id: r.object_id, name: r.object_name, type: r.object_type }, r.value_text);
+  if (object) return object;
+  const about = statementObject(r.statement ?? '', r.attribute, spellings);
+  return about ? `~${about}` : '';
+}
+
 /**
  * Supersession by attribute, in every domain: the series of a subject's
  * attribute (its canonical key, per object — seriesObject says when an
@@ -231,7 +241,7 @@ export async function supersedeByAttribute(store: Store, opts: { claimsPerBatch?
     await pause();
     const rows = await store.query<StateRow>(
       `SELECT c.id, COALESCE(se.canonical_id, c.subject_id) AS subject, COALESCE(ak.canonical, c.attribute) AS attribute,
-              COALESCE(oe.canonical_id, c.object_id) AS object_id, oe.name AS object_name, oe.type AS object_type, c.kind, c.value_num, c.value_text, c.unit,
+              COALESCE(oe.canonical_id, c.object_id) AS object_id, oe.name AS object_name, oe.type AS object_type, c.statement, c.kind, c.value_num, c.value_text, c.unit,
               COALESCE(c.effective_at, c.event_at, c.valid_from, c.observed_at) AS eff, c.valid_to, c.correction, c.superseded_by, c.tx_from
        FROM claims c
        JOIN entities se ON se.id = c.subject_id
@@ -242,7 +252,14 @@ export async function supersedeByAttribute(store: Store, opts: { claimsPerBatch?
     );
     const ids: string[] = [];
     const marks: (string | null)[] = [];
-    for (const series of groupBy(rows, (r) => `${r.subject}\u0000${r.attribute}\u0000${seriesObject(r.attribute, { id: r.object_id, name: r.object_name, type: r.object_type }, r.value_text)}\u0000${r.kind}`).values()) {
+    // the spellings of each subject group: what an owner or state statement with no object is about is read against them
+    const names = await store.query<{ root: string; name: string; aliases: string[] | null }>(
+      `SELECT COALESCE(canonical_id, id) AS root, name, aliases FROM entities WHERE COALESCE(canonical_id, id) = ANY($1::text[])`,
+      [[...new Set(rows.map((r) => r.subject))]],
+    );
+    const spellings = new Map<string, string[]>();
+    for (const n of names) (spellings.get(n.root) ?? spellings.set(n.root, []).get(n.root)!).push(n.name, ...(n.aliases ?? []));
+    for (const series of groupBy(rows, (r) => `${r.subject}\u0000${r.attribute}\u0000${seriesKeyObject(r, spellings.get(r.subject) ?? [])}\u0000${r.kind}`).values()) {
       await pause();
       const want = seriesSupersession(series);
       for (const r of series) {
