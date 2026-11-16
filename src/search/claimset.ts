@@ -1148,7 +1148,23 @@ async function computeWithin(
             const total = vs.reduce((s, v) => s + v, 0);
             const v = read.op === 'mean' ? total / vs.length : total;
             if (groups.size === 1) answer = fmt(v);
-            lines.push(`${key === 'all' ? '' : `${key}: `}${read.op} of ${attr} over ${vs.length} readings${from || to ? ` (${from ?? ''}..${to ?? ''})` : ''} = ${fmt(v)}${unit} (3 decimals: ${v.toFixed(3)})`);
+            // a total over a window says how many of the window's periods its figures cover: three quarters of a year
+            // are not the year's
+            let covered = '';
+            const g = periods.get(cs[0].id)?.gran;
+            if (read.op === 'sum' && g && from && to) {
+              // the periods of that length lying wholly inside the window
+              const inWindow = new Set<string>();
+              for (let t = new Date(`${from}T00:00:00Z`); t.toISOString().slice(0, 10) <= to; t.setUTCDate(t.getUTCDate() + 1)) {
+                const d = t.toISOString().slice(0, 10);
+                const k = g === 'week' ? isoWeek(d) : g === 'month' ? d.slice(0, 7) : g === 'quarter' ? `${d.slice(0, 4)}-${quarterOf(d)}` : g === 'half' ? `${d.slice(0, 4)}-H${Number(d.slice(5, 7)) <= 6 ? 1 : 2}` : d.slice(0, 4);
+                const span = periodSpan({ gran: g, key: k });
+                if (span.from >= from && span.to <= to) inWindow.add(k);
+              }
+              const expected = inWindow.size;
+              if (expected > cs.length) covered = `; it covers ${cs.length} of the window's ${expected} ${g}s only, so it is not the window's total`;
+            }
+            lines.push(`${key === 'all' ? '' : `${key}: `}${read.op} of ${attr} over ${vs.length} readings${from || to ? ` (${from ?? ''}..${to ?? ''})` : ''} = ${fmt(v)}${unit} (3 decimals: ${v.toFixed(3)})${covered}`);
           } else {
             const best = cs.reduce((b, c) => ((read.op === 'max' ? inBase(c) > inBase(b) : inBase(c) < inBase(b)) ? c : b));
             const r = toRow(best);

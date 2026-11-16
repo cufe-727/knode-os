@@ -502,6 +502,12 @@ describe('periods a figure covers (re-check item 5)', () => {
     expect(await set('宁德时代2025年上半年净利润总额是多少？', ['catl'])).toMatchObject({ op: 'sum', answer: '305' });
   });
 
+  it('says a total of three quarters is not the year\'s', async () => {
+    const sum = await set('宁德时代2025年销售额总额是多少？', ['catl']);
+    expect(sum).toMatchObject({ op: 'sum', answer: '2830' });
+    expect(sum!.lines[0]).toContain("it covers 3 of the window's 4 quarters only");
+  });
+
   it('averages quarterly figures by the quarters they cover', async () => {
     // 销售额 (item 4): 847, 942, 1041 for 2025's first three quarters; 2024's fourth in a bare unit, a US-dollar figure
     expect(await set('宁德时代平均每季度销售额是多少？', ['catl'])).toMatchObject({ op: 'mean', answer: '943.333333' });
