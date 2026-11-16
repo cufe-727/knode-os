@@ -106,6 +106,19 @@ claims:
     expect(current).toEqual(['R-03状态为已关闭', 'R-03由钱博负责'].sort());
   });
 
+  it('supersedes within a series of claims that name no object, on stored rows', async () => {
+    const ctx = await workspace('objectless', {
+      'raw/docs/a.md': dated('周报1', '2025-03-03', 'entities:\n  - { name: 结算平台, type: project }\nclaims:\n  - { subject: 结算平台, statement: 结算平台完成度为40%, type: other }\n  - { subject: 结算平台, statement: 结算平台状态为进行中, type: other }\n'),
+      'raw/docs/b.md': dated('周报2', '2025-03-10', 'entities:\n  - { name: 结算平台, type: project }\nclaims:\n  - { subject: 结算平台, statement: 结算平台完成度为55%, type: other }\n  - { subject: 结算平台, statement: 结算平台状态为已上线, type: other }\n'),
+    });
+    await refreshClaimState(ctx.store);
+    const rows = await ctx.store.query<{ statement: string; object_id: string | null; current: boolean }>(
+      `SELECT statement, object_id, superseded_by IS NULL AS current FROM claims WHERE tx_to IS NULL AND attribute IS NOT NULL`,
+    );
+    expect(rows.every((r) => r.object_id === null)).toBe(true);
+    expect(rows.filter((r) => r.current).map((r) => r.statement).sort()).toEqual(['结算平台完成度为55%', '结算平台状态为已上线'].sort());
+  });
+
   it('never settles two claims toward different objects as one by rule', () => {
     const base = { subject: 'co', kind: 'fact', attribute: '状态', unit: null, value_num: null };
     expect(seriesRelation({ ...base, object: 'b', value_text: '已完成', eff: '2025-06-16' }, { ...base, object: 'c', value_text: '已完成', eff: '2025-06-16' })).toBeNull();

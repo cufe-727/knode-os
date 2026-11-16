@@ -74,14 +74,19 @@ claims:
 INC-020-D3T3（P1）活动页白屏，吴婷修复。
 `,
     });
-    const rows = await ctx.store.query<{ subject_id: string; statement: string }>(`SELECT subject_id, statement FROM claims WHERE tx_to IS NULL ORDER BY statement`);
+    const rows = (await ctx.store.query<{ subject_id: string; statement: string }>(`SELECT subject_id, statement FROM claims WHERE tx_to IS NULL`))
+      .sort((a, b) => (a.statement < b.statement ? -1 : 1));
     expect(rows).toEqual([
       { subject_id: 'inc-017-d7t3', statement: 'INC-017-D7T3已由周磊修复' },
       { subject_id: 'inc-020-d3t3', statement: 'INC-020-D3T3已由吴婷修复' },
     ]);
-    // the title alone still finds an incident of that title
-    const both = await ctx.store.query<{ id: string }>(`SELECT id FROM entities WHERE tx_to IS NULL AND id LIKE 'inc-%' ORDER BY id`);
-    expect(both.map((r) => r.id)).toEqual(['inc-017-d7t3', 'inc-020-d3t3']);
+    const both = await ctx.store.query<{ id: string }>(`SELECT id FROM entities WHERE tx_to IS NULL AND id LIKE 'inc-%'`);
+    expect(both.map((r) => r.id).sort()).toEqual(['inc-017-d7t3', 'inc-020-d3t3']);
+    // the title alone names neither incident: it is the title's own entity, not whichever incident came first
+    const { resolveEntityId } = await import('../src/graph/resolve.js');
+    expect((await resolveEntityId(ctx.store, { name: '活动页白屏', type: 'event' })).id).toBe('活动页白屏');
+    // the incident's own identifier still finds it
+    expect((await resolveEntityId(ctx.store, { name: 'INC-020-D3T3', type: 'event' })).id).toBe('inc-020-d3t3');
   });
 });
 

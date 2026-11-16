@@ -1027,7 +1027,7 @@ async function splitCoded(store: Store, config: KnodeConfig | undefined, stats: 
  */
 async function mergeCodesIntoCarriers(store: Store, stats: EntityContextStats, progress: (msg: string) => void): Promise<void> {
   const rules = await store.query<{ id: string; label: string }>(
-    `SELECT n.id, n.label FROM entity_namesakes n JOIN entities e ON e.id = n.id AND e.tx_to IS NULL AND e.canonical_id IS NULL ORDER BY n.id`,
+    `SELECT n.id, n.label FROM entity_namesakes n JOIN entities e ON e.id = n.id AND e.tx_to IS NULL AND e.canonical_id IS NULL ORDER BY n.id COLLATE "C"`,
   );
   const byLabel = new Map<string, string[]>();
   for (const r of rules) {
@@ -1036,7 +1036,7 @@ async function mergeCodesIntoCarriers(store: Store, stats: EntityContextStats, p
   }
   const named = await store.query<{ id: string; name: string; type: string }>(
     `SELECT id, name, type FROM entities WHERE tx_to IS NULL AND canonical_id IS NULL AND name ~ '[0-9]'
-       AND NOT EXISTS (SELECT 1 FROM entity_namesakes n WHERE n.id = entities.id) ORDER BY id`,
+       AND NOT EXISTS (SELECT 1 FROM entity_namesakes n WHERE n.id = entities.id) ORDER BY id COLLATE "C"`,
   );
   for (const e of named) {
     const c = codeOf(e.name);
