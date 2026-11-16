@@ -8,7 +8,7 @@ import { entityKeyKinds } from '../src/graph/normalize.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
 import type { ChatMessage, LlmClient } from '../src/llm/client.js';
 import { ask } from '../src/search/ask.js';
-import { computeClaimSet, readSetQuestion, SET_BLOCK_CHARS } from '../src/search/claimset.js';
+import { computeClaimSet, documentOwners, readSetQuestion, SET_BLOCK_CHARS } from '../src/search/claimset.js';
 import { classifyQuestion } from '../src/search/route.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
 
@@ -399,6 +399,35 @@ describe('history the measurement showed the first fix lost', () => {
     const max = await set('宁德时代的最高周活跃用户是多少？', ['catl']);
     expect(max).toMatchObject({ answer: '135' });
     expect(max!.lines[0]).toContain('of 3 readings');
+  });
+});
+
+describe('a figure belongs to its claim\'s subject (re-check item 3)', () => {
+  beforeAll(async () => {
+    // a peer's figures stated in 宁德时代's own reports
+    await addClaim('r1', 'catl', '宁德时代2025年一季度毛利率24.4%', { attribute: '毛利率', num: 24.4, unit: '%', at: d('2025-04-20') });
+    await addClaim('r2', 'catl', '宁德时代2025年二季度毛利率25.0%', { attribute: '毛利率', num: 25.0, unit: '%', at: d('2025-08-01') });
+    await addClaim('r2', 'byd', '比亚迪2025年二季度毛利率17.6%', { attribute: '毛利率', num: 17.6, unit: '%', at: d('2025-08-01') });
+    await addClaim('r1', 'catl', '宁德时代市值9800亿元', { attribute: '市值', num: 9800, unit: '亿元', at: d('2025-04-10') });
+    await addClaim('r1', 'byd', '比亚迪市值9000亿元', { attribute: '市值', num: 9000, unit: '亿元', at: d('2025-04-11') });
+    // a document whose two organisations are each the subject of one claim
+    await addEntity('aaa', 'AAA集团', 'organization');
+    await addDoc('tie', '行业快讯', d('2025-05-01'), 'AAA集团与比亚迪。', ['aaa', 'byd']);
+    await addClaim('tie', 'aaa', 'AAA集团发布新品', { at: d('2025-05-01') });
+    await addClaim('tie', 'byd', '比亚迪发布新品', { at: d('2025-05-01') });
+  });
+
+  it('takes no peer company\'s figure stated in the company\'s report for the company\'s', async () => {
+    expect(await set('宁德时代的最低毛利率是多少？', ['catl'])).toMatchObject({ answer: '24.4' });
+    const v = await set('截至2025年6月30日，宁德时代的市值是多少？', ['catl']);
+    expect(v).toMatchObject({ op: 'value', answer: '9800' });
+    expect(v!.lines.join('\n')).toMatch(/Left out: .*other organisations? \(比亚迪\)/);
+  });
+
+  it('gives a document whose organisations tie no owner', async () => {
+    const owners = await documentOwners(store, ['raw/docs/tie.md', 'raw/docs/r1.md']);
+    expect(owners.get('raw/docs/tie.md')!.home).toBeNull();
+    expect(owners.get('raw/docs/r1.md')!.home).toBe('catl');
   });
 });
 

@@ -569,6 +569,10 @@ interface DocInfo {
  * its index (`= ANY($ids)`): an embedded database without statistics turns a
  * correlated lookup into a scan of the index for every row.
  */
+export async function documentOwners(store: Store, paths: string[]): Promise<Map<string, DocInfo>> {
+  return docsOf(store, paths);
+}
+
 async function docsOf(store: Store, paths: string[]): Promise<Map<string, DocInfo>> {
   const out = new Map<string, DocInfo>();
   if (paths.length === 0) return out;
@@ -598,7 +602,9 @@ async function docsOf(store: Store, paths: string[]): Promise<Map<string, DocInf
   const docOf = new Map(docs.map((d) => [d.path, d]));
   for (const p of paths) {
     const per = [...(counts.get(p) ?? new Map<string, number>())].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
-    out.set(p, { home: per[0]?.[0] ?? null, title: docOf.get(p)?.title ?? null, date: toDateString(docOf.get(p)?.doc_date ?? null) });
+    // two organisations equally often the subject: the document is neither's (no tie is broken by an id's spelling)
+    const home = per.length && !(per.length > 1 && per[1][1] === per[0][1]) ? per[0][0] : null;
+    out.set(p, { home, title: docOf.get(p)?.title ?? null, date: toDateString(docOf.get(p)?.doc_date ?? null) });
   }
   return out;
 }
@@ -803,10 +809,14 @@ export async function computeClaimSet(
   let matched = cands.filter(matches);
   if (matched.length === 0) return skip('no claim matched');
 
+  // a figure is its claim's subject's: another organisation's figure stated in the scope's document (a peer's revenue
+  // in a company's report) is not the scope's, whatever document states it
+  const peer = (c: Cand) => scoped && c.subject_type === 'organization' && !members.has(c.subject_id) && !namedWhat.has(c.subject_id);
   // a value as of a date: every value of the subjects the matching claims are about
   if (read.op === 'value') {
-    // what the value is of: the subjects the matching claims are about, the scope's organisations only when nothing else is
-    let subjects = new Set(matched.map((c) => c.subject_id).filter((id) => !members.has(id)));
+    // what the value is of: the subjects the matching claims are about (no peer organisation), the scope's
+    // organisations only when nothing else is
+    let subjects = new Set(matched.filter((c) => !peer(c)).map((c) => c.subject_id).filter((id) => !members.has(id)));
     if (subjects.size === 0) subjects = new Set(matched.map((c) => c.subject_id));
     // a later report may name it only by the short name it was given ("下称保留期") or its code: those statements
     // are about it whoever their subject is
@@ -815,6 +825,7 @@ export async function computeClaimSet(
     const have = new Set(matched.map((c) => c.id));
     for (const c of cands) if (aliases.some((a) => c.statement.includes(a))) have.add(c.id);
     matched = cands.filter((c) => (subjects.has(c.subject_id) && (have.has(c.id) || !members.has(c.subject_id))) || (have.has(c.id) && c.value_num !== null));
+    // a peer's figure is left out below, and said
   }
 
   // the period: the router's explicit range, else what the question's period words give; a value as of a day is read
@@ -916,7 +927,7 @@ export async function computeClaimSet(
     const inScope = new Map(cands.map((c) => [c.id, c]));
     const replacedBy = new Map<string, Cand>();
     for (const c of matched) if (c.superseded_by && inScope.has(c.superseded_by)) replacedBy.set(c.superseded_by, inScope.get(c.superseded_by)!);
-    const left = { notFact: 0, replaced: 0, recalled: 0, noNumber: 0, units: new Map<string, number>(), grans: new Map<string, number>() };
+    const left = { notFact: 0, replaced: 0, recalled: 0, noNumber: 0, units: new Map<string, number>(), grans: new Map<string, number>(), peers: new Map<string, number>() };
     const readings = new Map<string, Cand>();
     const periods = new Map<string, Period | null>();
     for (const c of matched) {
@@ -926,6 +937,7 @@ export async function computeClaimSet(
         continue;
       }
       if (!inPeriod(c)) continue;
+      if (peer(c)) { left.peers.set(c.subject, (left.peers.get(c.subject) ?? 0) + 1); continue; }
       if (!isFact(c)) { left.notFact++; continue; }
       if (onlyRetrospective(c)) { left.recalled++; continue; }
       const period = periodOf(c);
@@ -974,6 +986,7 @@ export async function computeClaimSet(
       left.units.size ? `${[...left.units.values()].reduce((a, b) => a + b, 0)} in another unit (${[...left.units.keys()].join(', ')})` : '',
       left.grans.size ? `${[...left.grans.values()].reduce((a, b) => a + b, 0)} of another period length (${[...left.grans.keys()].join(', ')})` : '',
       left.noNumber ? `${left.noNumber} of the attribute with no numeric value recorded` : '',
+      left.peers.size ? `${[...left.peers.values()].reduce((a, b) => a + b, 0)} about other organisations (${[...left.peers.keys()].join(', ')})` : '',
     ].filter(Boolean);
     if (readings.size === 0) return skip('no reading');
     let list = [...readings.values()].sort((a, b) => byDate(dateOf(a), dateOf(b)) || a.id.localeCompare(b.id));
