@@ -1293,9 +1293,10 @@ async function computeWithin(
       : [];
     if (late()) return skip('over its time budget');
     // the scope's own organisations are where the items are, never items
-    // another organisation's claim about itself ("比亚迪毛利率17.6%", stated in the scope's report) makes it no item
-    // of the scope: an organisation is one when its claim relates it to the scope (names a member, or is the scope's)
-    const relatesToScope = (c: Cand) => (c.object_id !== null && members.has(c.object_id)) || names.some((n) => n.length >= 2 && c.statement.includes(n));
+    // another organisation's figure about itself ("比亚迪毛利率17.6%", stated in the scope's report) makes it no item
+    // of the scope, unless the claim names the scope; what it did ("客户甲升级了事故INC-901") still lists it
+    const ownFigure = (c: Cand) => c.value_num !== null && c.object_id === null;
+    const relatesToScope = (c: Cand) => !ownFigure(c) || (c.object_id !== null && members.has(c.object_id)) || names.some((n) => n.length >= 2 && c.statement.includes(n));
     const itemsOf = (c: Cand): { key: string; name: string; id: string }[] => {
       const subjectFits = !members.has(c.subject_id) && (!read.asks || c.subject_type === read.asks) && !(scoped && c.subject_type === 'organization' && !relatesToScope(c));
       if (subjectFits) return [{ key: itemKey(c.subject), name: c.subject, id: c.subject_id }];

@@ -636,6 +636,19 @@ describe('round three (C1-C7)', () => {
     const s = await set('宁德时代的毛利率有哪些？', ['catl']);
     expect(s?.lines.join('\n') ?? '').not.toMatch(/^- 比亚迪/m);
   });
+
+  it('C1: still lists an organisation whose claim is about something else than its own figure (a customer escalating an incident)', async () => {
+    await addEntity('cust-a', '客户甲', 'organization');
+    await addEntity('inc-901', 'INC-901', 'event');
+    await addDoc('cr1', '宁德时代事故周报', d('2025-05-02'), '宁德时代：客户甲升级了事故INC-901。', ['catl', 'cust-a', 'inc-901']);
+    // the report is 宁德时代's: most of its claims are
+    await addClaim('cr1', 'catl', '宁德时代本周处理事故3起', { attribute: '处理事故数', num: 3, at: d('2025-05-01') });
+    await addClaim('cr1', 'catl', '宁德时代本周事故均已关闭', { at: d('2025-05-01') });
+    await addClaim('cr1', 'cust-a', '客户甲升级了事故INC-901', { object: 'inc-901', at: d('2025-05-01') });
+    await tier0Known(store, { force: true });
+    const s = await set('宁德时代今年有哪些客户升级过事故？', ['catl'], '2025-11-07');
+    expect(s?.lines.join('\n') ?? '').toMatch(/客户甲/);
+  });
 });
 
 describe('a Chinese question end to end (review item 11)', () => {
