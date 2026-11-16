@@ -5,7 +5,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { defaultConfig } from '../src/config.js';
 import { entityKeyKinds } from '../src/graph/normalize.js';
 import type { EmbeddingProvider } from '../src/ingest/embeddings.js';
-import type { LlmClient } from '../src/llm/client.js';
+import type { ChatMessage, LlmClient } from '../src/llm/client.js';
 import { ask } from '../src/search/ask.js';
 import { stepsAsFacts, walkRelations, walkTerms } from '../src/search/walk.js';
 import { ordinalInQuestion, pickByOrder, presentOf } from '../src/search/walk-order.js';
@@ -395,4 +395,29 @@ describe('the walk\'s cost', () => {
     expect(walk.steps.every((s) => s.hop === 1)).toBe(true);
     expect(walk.spent).toMatchObject({ budgetMs: 0, before: 'hop 2' });
   });
+
+  it('tells the answer that its time budget ran out, through the multi-hop route', async () => {
+    // the walk's first read of relations takes longer than its whole budget (1500 ms)
+    const q0 = store.query.bind(store);
+    const slow = Object.assign(Object.create(Object.getPrototypeOf(store)), store, {
+      query: async (sql: string, params?: unknown[]) => {
+        if (sql.includes('AS near_id')) await new Promise((r) => setTimeout(r, 1600));
+        return q0(sql, params as never[]);
+      },
+    }) as Store;
+    const prompts: string[] = [];
+    const llm = {
+      enabled: true,
+      complete: async (messages: ChatMessage[]) => {
+        prompts.push(messages.map((m) => m.content).join('\n'));
+        return 'Unknown.\n{"citations":[],"gaps":[]}';
+      },
+      completeJson: async () => ({}),
+    } as unknown as LlmClient;
+    const embedder = { model: MODEL, dimensions: 4, embed: async (t: string[]) => t.map(() => [1, 0, 0, 0]) } as EmbeddingProvider;
+    const res = await ask(slow, config, embedder, llm, '二部平台组的事故是谁修复的？他还修复过哪些事故', { route: 'multihop' });
+    expect(res.route.walked?.spent).toMatchObject({ budgetMs: 1500, before: 'hop 2' });
+    expect(res.facts.some((f) => f.id === 'walk:spent')).toBe(true);
+    expect(prompts.some((p) => /The relation walk stopped before hop 2: its time budget \(1500 ms\) was spent after \d+ ms/.test(p))).toBe(true);
+  }, 10_000);
 });
