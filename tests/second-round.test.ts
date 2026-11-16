@@ -69,6 +69,10 @@ beforeAll(async () => {
   // a project mentioned in two documents only
   await addDoc('orion-1', 'Orion reached its first milestone; Atlas waits on it.', ['orion', 'atlas']);
   await addDoc('orion-2', 'Orion launched in week 32.', ['orion']);
+  // a chain's step known only from the passage and claim that lead to it, and a document of its own
+  await addEntity('fangjie', '方杰', 'person');
+  await addDoc('raised-cn', '方杰提出了R-03。', ['fangjie', 'r-03']);
+  await addDoc('fj-move', '方杰本周调到了增长组。', ['fangjie']);
   // another project's budget: the word a lookup about Orion misses, held by a passage that is not Orion's
   await addDoc('atlas-budget', 'The Atlas budget was cut by a fifth.', ['atlas']);
   // a person three documents mention: any passage of theirs is a step further
@@ -150,9 +154,9 @@ describe('the second round', () => {
     expect(r).toBeNull();
   });
 
-  it('gives a chain no second round when its passages and facts hold every word it asks', async () => {
-    const r = await secondRound(store, 'Who raised risk R-07?', {
-      named: ['r-07'], contexts: [result('raised7', 'Li Wei raised risk R-07 on the payment gateway.')],
+  it('gives a chain no second round when its passages and facts hold every word it asks and its step a passage of its own', async () => {
+    const r = await secondRound(store, 'Who raised risk R-07, and is that person on call?', {
+      named: ['r-07'], contexts: [result('raised7', 'Li Wei raised risk R-07 on the payment gateway.'), result('liwei-duty', 'Li Wei is on call.')],
       facts: [{ subject: 'R-07', object: 'Li Wei', statement: 'R-07 was raised by Li Wei' }], chain: true,
     });
     expect(r).toBeNull();
@@ -192,6 +196,19 @@ describe('the second round', () => {
       named: ['orion'], contexts: [result('orion-2', 'Orion第三季度的毛利率为24%')], facts: [], chain: false,
     });
     expect(r).toBeNull();
+  });
+
+  it('takes neither the passage nor the claim that led to a chain\'s step for the step\'s own, however the claim is worded', async () => {
+    for (const fact of [
+      { subject: '方杰', object: 'R-03', statement: '方杰提出R-03' },
+      { subject: 'R-03', object: '方杰', statement: 'R-03由方杰提出' },
+    ]) {
+      const r = await secondRound(store, 'R-03是谁提出的？此人现在在哪个组？', {
+        named: ['r-03'], contexts: [result('raised-cn', '方杰提出了R-03。')], facts: [fact], chain: true,
+      });
+      expect(r, fact.statement).not.toBeNull();
+      expect(r!.chunks.map((c) => c.path), fact.statement).toContain('raw/docs/fj-move.md');
+    }
   });
 
   it('gives a chain no round when its first round already holds the step\'s own passages and no word is missing', async () => {

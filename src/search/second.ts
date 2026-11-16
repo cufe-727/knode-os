@@ -200,9 +200,15 @@ export async function secondRound(
   // are about, its passages mention — that the question does not name
   const reachedNames = new Map<string, number>();
   for (const f of facts.slice(0, 40)) for (const n of [f.subject, f.object]) if (n && !names.includes(n)) reachedNames.set(n, (reachedNames.get(n) ?? 0) + 1);
-  const reached = await q<{ id: string; name: string; docs: number; passages: number }>(
-    `WITH ctx AS (SELECT m.entity_id, count(DISTINCT m.chunk_id)::int AS passages FROM entity_mentions m WHERE m.chunk_id = ANY($2::text[]) GROUP BY 1)
-     SELECT e.id, e.name, COALESCE(ctx.passages, 0) AS passages,
+  // `own`: passages mentioning it that mention no entity the question names — not the passage that led to it
+  const reached = await q<{ id: string; name: string; docs: number; passages: number; own: number }>(
+    `WITH named AS MATERIALIZED (SELECT DISTINCT chunk_id FROM entity_mentions WHERE entity_id = ANY($3::text[]) AND chunk_id = ANY($2::text[])),
+     ctx AS (
+       SELECT m.entity_id, count(DISTINCT m.chunk_id)::int AS passages,
+              count(DISTINCT m.chunk_id) FILTER (WHERE m.chunk_id NOT IN (SELECT chunk_id FROM named))::int AS own
+       FROM entity_mentions m WHERE m.chunk_id = ANY($2::text[]) GROUP BY 1
+     )
+     SELECT e.id, e.name, COALESCE(ctx.passages, 0) AS passages, COALESCE(ctx.own, 0) AS own,
             (SELECT count(DISTINCT m.document_id)::int FROM entity_mentions m WHERE m.entity_id = e.id) AS docs
      FROM entities e LEFT JOIN ctx ON ctx.entity_id = e.id
      WHERE (e.name = ANY($1::text[]) OR ctx.entity_id IS NOT NULL) AND e.tx_to IS NULL AND e.canonical_id IS NULL AND NOT e.id = ANY($3::text[])`,
@@ -221,10 +227,12 @@ export async function secondRound(
     .sort((a, b) => (weight.get(b.name) ?? 0) - (weight.get(a.name) ?? 0) || a.docs - b.docs || a.id.localeCompare(b.id))
     .slice(0, BRIDGES);
   if (stepCheck) {
-    // the chain's step: the reached entity weighed most; it is covered when a passage mentions it or a fact is about it
+    // the chain's step: the reached entity weighed most; it is covered by a passage or a fact of its own — one that
+    // names nothing the question names: the passage or claim that led to it ("方杰提出R-03") is the link, not the step
     const step = [...reached].filter((r) => !names.includes(r.name))
       .sort((a, b) => (weight.get(b.name) ?? 0) - (weight.get(a.name) ?? 0) || a.id.localeCompare(b.id))[0];
-    if (!step || step.passages > 0 || facts.some((f) => f.subject === step.name)) return null;
+    const linkText = (f: FactLike) => names.some((n) => n.length >= 2 && (`${f.statement} ${f.object ?? ''}`.includes(n) || f.subject === n));
+    if (!step || step.own > 0 || facts.some((f) => f.subject === step.name && !linkText(f))) return null;
     thin = true;
   }
   const common = new Set(bridges.filter((b) => b.docs > BRIDGE_DOCS).map((b) => b.id));
