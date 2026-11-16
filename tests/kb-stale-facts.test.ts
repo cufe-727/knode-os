@@ -91,9 +91,10 @@ describe('back-references to the previous report', () => {
     expect(backReferenceIn('上周那起缓存击穿已由方杰修复，根因是参数填反了')).toBe('缓存击穿');
     expect(backReferenceIn('方杰已修复上周发生的配置下发失败。')).toBe('配置下发失败');
     expect(backReferenceIn('上周发生的登录失败事故已由贾洋修复。')).toBe('登录失败');
-    expect(backReferenceIn('上周发生的缓存击穿问题根因是一处空指针。')).toBe('缓存击穿');
-    expect(backReferenceIn('上周发生了一起推送重复事故。')).toBe('推送重复');
-    expect(backReferenceIn('十部增长组上周的登录失败事故根因是机器资源不足。')).toBe('登录失败');
+    // only a statement of a fix refers back: a cause or a report of the incident does not
+    expect(backReferenceIn('上周发生的缓存击穿问题根因是一处空指针。')).toBeNull();
+    expect(backReferenceIn('上周发生了一起推送重复事故。')).toBeNull();
+    expect(backReferenceIn('十部增长组上周的登录失败事故已由贺敏修复，根因是机器资源不足。')).toBe('登录失败');
     expect(backReferenceIn("Last week's cache stampede was fixed by Fang Jie")).toBe('cache stampede');
     expect(backReferenceIn('上周那起INC-001-T1已由方杰修复')).toBeNull();
     expect(backReferenceIn('方杰本周完成接口评审')).toBeNull();
@@ -135,16 +136,21 @@ claims:
 `),
     });
     const { linkBackReferences } = await import('../src/graph/backrefs.js');
-    const stats = await linkBackReferences(ctx.store);
+    // off unless the workspace says which folders are periodic reports
+    expect(await linkBackReferences(ctx.store, { config: ctx.config })).toMatchObject({ references: 0, linked: 0 });
+    const config = { review: { ...ctx.config.review, backReferences: { periodic: ['raw/docs/周报'] } } };
+    const stats = await linkBackReferences(ctx.store, { config });
     expect(stats).toMatchObject({ references: 3, resolved: 2, linked: 2, disposed: 0 });
     const links = await ctx.store.query<{ source_id: string; target_id: string }>(
-      `SELECT source_id, target_id FROM relations WHERE tx_to IS NULL AND target_id LIKE 'inc-%' ORDER BY source_id`,
+      `SELECT source_id, target_id FROM relations WHERE tx_to IS NULL AND target_id LIKE 'inc-%'`,
     );
-    expect(links).toEqual([{ source_id: '廖欣', target_id: 'inc-002-t1' }, { source_id: '方杰', target_id: 'inc-001-t1' }]);
-    // a second run keeps them; once the reading no longer holds, the link goes
-    expect(await linkBackReferences(ctx.store)).toMatchObject({ resolved: 2, disposed: 0 });
+    expect(links.map((l) => `${l.source_id}→${l.target_id}`).sort()).toEqual(['廖欣→inc-002-t1', '方杰→inc-001-t1'].sort());
+    // a second run reads only what changed since the first: nothing
+    expect(await linkBackReferences(ctx.store, { config })).toMatchObject({ references: 0, resolved: 0, disposed: 0 });
+    // read again in full it keeps them; once the reading no longer holds, the link goes
+    expect(await linkBackReferences(ctx.store, { config, full: true })).toMatchObject({ resolved: 2, disposed: 0 });
     await ctx.store.query(`UPDATE documents SET doc_date = doc_date - interval '30 days' WHERE path = 'raw/docs/周报/平台组/w05.md'`);
-    expect(await linkBackReferences(ctx.store)).toMatchObject({ resolved: 0, disposed: 2 });
+    expect(await linkBackReferences(ctx.store, { config, full: true })).toMatchObject({ resolved: 0, disposed: 2 });
     expect(await ctx.store.query(`SELECT 1 FROM relations WHERE tx_to IS NULL AND target_id LIKE 'inc-%'`)).toEqual([]);
   });
 });

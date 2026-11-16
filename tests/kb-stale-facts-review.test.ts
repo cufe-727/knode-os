@@ -297,3 +297,30 @@ describe('a setting named by its code alone', () => {
     expect(row.subject).toBe(rule.id);
   });
 });
+
+describe('back-references outside periodic reports', () => {
+  const notes = {
+    'raw/docs/feishu/某分析师/0303.md': dated('航空周观察', '2025-03-03', 'entities:\n  - { name: B737, type: product }\n  - { name: 波音, type: organization }\nclaims:\n  - { subject: B737, statement: B737交付延迟仍在持续, type: event }\n'),
+    'raw/docs/feishu/某分析师/0310.md': dated('新能源车周观察', '2025-03-10', 'entities:\n  - { name: 王传福, type: person }\n  - { name: 比亚迪, type: organization }\nclaims:\n  - { subject: 王传福, statement: 上周的交付延迟已由王传福在业绩会上解释, type: event }\n  - { subject: 比亚迪, statement: 上周美联储宣布降息后比亚迪股价修复, type: market }\n'),
+  };
+
+  it('reads no reference into a sentence that states no fix, and links nothing in a folder that is not a series', async () => {
+    const { backReference, linkBackReferences } = await import('../src/graph/backrefs.js');
+    for (const s of ['上周美联储宣布降息', '上周的交付延迟已由王传福在业绩会上解释', '上周A股成交额下降', '上期分红已于6月派发', '由于上周暴雨，物流中断']) expect(backReference(s), s).toBeNull();
+    const ctx = await workspace('analyst', notes);
+    for (const backReferences of [{ detect: true }, { periodic: ['raw/docs/feishu'] }]) {
+      const stats = await linkBackReferences(ctx.store, { config: { review: { ...ctx.config.review, backReferences } }, full: true });
+      expect(stats.linked, JSON.stringify(backReferences)).toBe(0);
+    }
+    expect(await ctx.store.query(`SELECT 1 FROM scopes WHERE kind = 'backref'`)).toEqual([]);
+  });
+
+  it('tells a series of reports from a folder of notes', async () => {
+    const { isSeries } = await import('../src/graph/backrefs.js');
+    const weekly = [3, 10, 17, 24, 31].map((d, i) => ({ title: `平台组周报 · 第${10 + i}周`, date: `2025-03-${String(d).padStart(2, '0')}` }));
+    expect(isSeries(weekly)).toBe(true);
+    expect(isSeries(weekly.slice(0, 3))).toBe(false);
+    expect(isSeries(weekly.map((w, i) => ({ ...w, title: ['航空周观察', '新能源车周观察', '半导体周观察', '银行周观察', '地产周观察'][i] })))).toBe(false);
+    expect(isSeries(weekly.map((w, i) => ({ ...w, date: ['2025-03-03', '2025-03-04', '2025-03-20', '2025-03-21', '2025-04-30'][i] })))).toBe(false);
+  });
+});

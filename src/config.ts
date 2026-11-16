@@ -1102,6 +1102,15 @@ export interface ReviewConfig {
    * keep resolving to their entities under either setting.
    */
   identity?: ReviewIdentity;
+  /**
+   * Back-references across periodic reports (src/graph/backrefs.ts): a report's
+   * id-less "上周那起X已由Y修复" linked to the one identified incident X of the
+   * same series' previous report. Off unless set. `periodic`: folders (path
+   * prefixes such as "raw/docs/周报") whose documents are periodic reports.
+   * `detect`: also any folder whose dated documents demonstrably are a series
+   * (four or more, one title pattern, a regular interval).
+   */
+  backReferences?: { periodic?: string[]; detect?: boolean };
   /** LLM judge over duplicate-entity candidates: off / annotate suggestions with a verdict / also merge above autoMergeMinConfidence. */
   llmJudge: ReviewLlmMode;
   /** Candidates the judge rejects with at least this confidence are dropped (and remembered) instead of filed. */

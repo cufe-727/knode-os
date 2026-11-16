@@ -130,7 +130,7 @@ export async function refineWiki(
   }
   // a report's "上周那起X" names no id: linked to the one identified X of its series' previous report (backrefs.ts)
   try {
-    const backrefs = await linkBackReferences(store, { onProgress: progress });
+    const backrefs = await linkBackReferences(store, { config, onProgress: progress });
     if (backrefs.resolved || backrefs.disposed) progress(`back-references: ${backrefs.resolved} of ${backrefs.references} resolved, ${backrefs.linked} links, ${backrefs.disposed} disposed`);
   } catch (err) {
     progress(`back-references failed: ${err instanceof Error ? err.message : err}`);
