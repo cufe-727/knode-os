@@ -145,21 +145,11 @@ export function namesApartByCode(a: string, b: string): boolean {
   return Boolean(x && y && x.prefix === y.prefix && (x.counter !== y.counter || x.rest !== y.rest));
 }
 
-/**
- * Whether live entities are named by other identifiers of the kind `name` is
- * one of (INC-001-T1 … beside INC-006-T1): a numbered series. Only a kind
- * whose identifiers start with letters is looked for (a ticker such as
- * 600519.SH is not), by the letters before its first digit.
- */
-async function numberedSeries(q: Queryable, name: string): Promise<boolean> {
-  const code = nameCode(name);
-  const prefix = code ? /^[A-Z][A-Z._/-]*/.exec(code.value)?.[0] : undefined;
-  if (!code || !prefix) return false;
-  const rows = await q.query<{ name: string }>(
-    `SELECT name FROM entities WHERE tx_to IS NULL AND canonical_id IS NULL AND upper(name) LIKE $1 LIMIT 50`,
-    [`%${prefix.replace(/[%_\\]/g, (c) => `\\${c}`)}%`],
-  );
-  return rows.some((r) => namesApartByCode(name, r.name));
+/** Whether an entity carries one of these identifier keys among its spellings. */
+async function answersToCode(q: Queryable, id: string, codeKeys: string[]): Promise<boolean> {
+  if (codeKeys.length === 0) return false;
+  const rows = await q.query(`SELECT 1 FROM entity_alias_keys WHERE entity_id = $1 AND alias_key = ANY($2::text[]) LIMIT 1`, [id, codeKeys]);
+  return rows.length > 0;
 }
 
 async function byKeys(q: Queryable, keys: Set<string>, type: string | undefined, mode: ReviewResolution, refusing?: (id: string) => boolean, mention?: string): Promise<CandidateRow | null> {
@@ -180,13 +170,13 @@ async function byKeys(q: Queryable, keys: Set<string>, type: string | undefined,
     const own = nameKey(r.name);
     return keys.has(own.key) || (mode === 'suffix' && keys.has(own.bare));
   };
-  // a spelling several identifiers carry as an alias names none of them: "登录失败事故" is the title of
-  // every team's incident of that kind, and landing on the most mentioned one credited a fix to it
-  const coded = mention && !nameCode(mention) ? rows.filter((r) => !names(r) && typesCompatible(type, r.type) && nameCode(r.name)) : [];
-  const shared = coded.some((a, i) => coded.slice(i + 1).some((b) => namesApartByCode(a.name, b.name)));
+  // the mention's spellings that are identifiers: what a series-named entity may be reached by
+  const codeKeys = mention ? [...keys].filter((k) => nameCode(k)) : [];
   for (const r of [...rows.filter(names), ...rows.filter((r) => !names(r))]) {
     if (!typesCompatible(type, r.type)) continue;
-    if (shared && coded.includes(r)) continue;
+    // an entity named by a series identifier is reached by that identifier only: "登录失败事故", the title
+    // every team's incident of that kind carries as an alias, is not INC-001-T1 because it was mentioned first
+    if (mention && seriesCode(r.name) && !names(r) && !(await answersToCode(q, r.id, codeKeys))) continue;
     if (mention && namesApartByCode(mention, r.name)) continue;
     const canonical = await canonicalOf(q, r);
     if (mention && canonical.id !== r.id && namesApartByCode(mention, canonical.name)) continue;
@@ -285,10 +275,9 @@ export async function resolveEntityId(
   if (own) return finish(await settle(await canonicalOf(q, own)));
 
   // 3. name / alias key match against live entities of a compatible type (exact spellings, or suffix-stripped too in 'suffix' mode)
-  // a name that is one of a numbered series ("INC-006-T1" beside other INC-… entities) is that thing by its
-  // number alone: its other spellings (the incident's title) are what every incident of the kind is called
-  const code = nameCode(name);
-  if (code && (input.aliases ?? []).length > 0 && (await numberedSeries(q, name))) {
+  // a series identifier ("INC-006-T1") is that thing by its identifier alone: its other spellings (the
+  // incident's title) are what every incident of the kind is called. It lands on whatever carries exactly it.
+  if (seriesCode(name)) {
     const byNumber = await byKeys(q, mentionKeys(name, [], mode), input.type, mode, refusing, name);
     return finish(byNumber ? await settle(byNumber) : { id: slug });
   }

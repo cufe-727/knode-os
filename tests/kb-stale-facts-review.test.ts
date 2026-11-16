@@ -206,3 +206,94 @@ describe('codes of one kind', () => {
     expect((await ents(ctx)).filter((e) => /h20|h100/.test(e))).toEqual(['h100', 'nvidia-h20']);
   });
 });
+
+describe('the order documents arrive in', () => {
+  const docs: Record<string, string> = {
+    title: fm('复盘', '  - { name: 登录失败事故, type: event }\n', '  - { subject: 登录失败事故, statement: 登录失败事故复盘已完成, type: event }\n'),
+    one: fm('事故一', '  - { name: INC-001-T1, type: event, aliases: ["登录失败事故"] }\n', '  - { subject: INC-001-T1, statement: INC-001-T1已由甲修复, type: event }\n'),
+    five: fm('事故五', '  - { name: INC-005-T3, type: event, aliases: ["登录失败事故"] }\n', '  - { subject: INC-005-T3, statement: INC-005-T3已由乙修复, type: event }\n'),
+  };
+  it('decides nothing about which entity a title or an incident is', async () => {
+    const outcomes = new Set<string>();
+    for (const order of [['title', 'one', 'five'], ['one', 'title', 'five'], ['one', 'five', 'title'], ['five', 'title', 'one']]) {
+      const files = Object.fromEntries(order.map((k, i) => [`raw/docs/${i}-${k}.md`, docs[k]]));
+      const ctx = await workspace(`order-${order.join('-')}`, files);
+      outcomes.add(JSON.stringify(await subjects(ctx)));
+    }
+    expect([...outcomes]).toEqual([JSON.stringify(['inc-001-t1:INC-001-T1已由甲修复', 'inc-005-t3:INC-005-T3已由乙修复', '登录失败事故:登录失败事故复盘已完成'])]);
+  });
+});
+
+describe('a setting named by its code alone', () => {
+  const report = (code: string) => fm('周报', `  - { name: 对账批次间隔, type: other, aliases: ["${code}", "批次间隔"] }\n`, '  - { subject: 对账批次间隔, statement: 对账批次间隔定为15分钟, type: other }\n');
+  const alone = (code: string) => fm('周报', `  - { name: ${code}, type: other }\n`, `  - { subject: ${code}, statement: ${code}调整为20分钟, type: other }\n`);
+
+  it('ends with the one entity that carries the code, whichever report came first (identity "name")', async () => {
+    const { splitEntities } = await import('../src/graph/entity-context.js');
+    const outcomes = new Set<string>();
+    // another division's report first makes the setting an entity; the code alone then has no carrier yet
+    for (const [name, files] of [
+      ['code-first', { 'raw/docs/a.md': report('D2T2-C2'), 'raw/docs/b.md': alone('T2-C2'), 'raw/docs/c.md': report('T2-C2') }],
+      ['code-after', { 'raw/docs/a.md': report('D2T2-C2'), 'raw/docs/b.md': report('T2-C2'), 'raw/docs/c.md': alone('T2-C2') }],
+    ] as const) {
+      const ctx = await workspace(`code-${name}`, files);
+      await splitEntities(ctx.store, { config: ctx.config });
+      // one entity holds both statements; which spelling's id it keeps is the first document's
+      const bySubject = new Map<string, string[]>();
+      for (const r of await subjects(ctx)) {
+        const [subject, statement] = r.split(':');
+        (bySubject.get(subject) ?? bySubject.set(subject, []).get(subject)!).push(statement);
+      }
+      outcomes.add(JSON.stringify([...bySubject.values()].map((v) => v.sort()).sort()));
+    }
+    expect([...outcomes]).toEqual([JSON.stringify([['T2-C2调整为20分钟', '对账批次间隔定为15分钟'].sort()])]);
+  });
+
+  it('joins the entity a coded split labelled with that code (identity "context")', async () => {
+    const { enqueueTier1, runTier1Pass } = await import('../src/graph/tier1.js');
+    const { resolveEntityContext } = await import('../src/graph/entity-context.js');
+    const dataDir = path.join(tmp, 'coded-split');
+    initDataDir(dataDir);
+    const docs = new Map<string, { text: string; reply: { entities: unknown[]; relations: unknown[]; claims: unknown[] } }>();
+    const setting = (code: string) => ({ name: '对账批次间隔', type: 'component', aliases: [code] });
+    for (const [team, code, who] of [['支付组', 'T2-C2', '郭军'], ['二部支付组', 'D2T2-C2', '周洋']] as const) {
+      for (const k of [1, 2]) {
+        docs.set(`raw/docs/周报/${team}/w${k}.md`, {
+          text: `# ${team}周报 第${k}周\n\n对账批次间隔（${code}）定为15分钟。${who}负责。\n`,
+          reply: { entities: [{ name: team, type: 'organization', aliases: [] }, { name: who, type: 'person', aliases: [] }, setting(code)], relations: [{ source: who, target: team, type: 'member_of' }], claims: [] },
+        });
+      }
+    }
+    // the code alone, in a report of the second team
+    docs.set('raw/docs/周报/二部支付组/w3.md', {
+      text: '# 二部支付组周报 第3周\n\nD2T2-C2调整为20分钟。\n',
+      reply: { entities: [{ name: '二部支付组', type: 'organization', aliases: [] }, { name: 'D2T2-C2', type: 'component', aliases: [] }], relations: [], claims: [{ subject: 'D2T2-C2', object: null, type: 'other', kind: 'fact', statement: 'D2T2-C2调整为20分钟', status: 'fact' }] },
+    });
+    for (const [p, d] of docs) {
+      fs.mkdirSync(path.dirname(path.join(dataDir, p)), { recursive: true });
+      fs.writeFileSync(path.join(dataDir, p), d.text);
+    }
+    const ctx = await createContext(dataDir);
+    contexts.push(ctx);
+    await sync(ctx, { llmGraph: false });
+    for (const d of await ctx.store.query<{ id: string }>(`SELECT id FROM documents WHERE root = 'docs'`)) await enqueueTier1(ctx.store, d.id);
+    (ctx.config.extraction as { entityLlm?: unknown }).entityLlm = undefined;
+    const reply = (p: string) => docs.get(p)?.reply ?? { entities: [], relations: [], claims: [] };
+    const completeJson = async (messages: { role: string; content: string }[]) => {
+      const user = messages.find((m) => m.role === 'user')?.content ?? '';
+      const batched = [...user.matchAll(/^=== Document (\d+): .* \((raw\/docs\/[^)]+)\) ===$/gm)];
+      if (batched.length > 0) return { documents: batched.map((m) => ({ doc: Number(m[1]), ...reply(m[2]) })) };
+      return reply(/Document: .* \((raw\/docs\/[^)]+)\)/.exec(user)?.[1] ?? '');
+    };
+    const llm = { enabled: true, label: 'stub@extract', provider: 'openai', model: 'stub', completeJson } as never;
+    for (let i = 0; i < 10; i++) if ((await runTier1Pass(ctx.store, ctx.config, llm, { batchSize: 64 })).queued === 0) break;
+    ctx.config.review.identity = 'context';
+    await resolveEntityContext(ctx.store, { config: ctx.config });
+    const [rule] = await ctx.store.query<{ id: string }>(`SELECT id FROM entity_namesakes WHERE label = 'D2T2-C2'`);
+    expect(rule).toBeDefined();
+    const [row] = await ctx.store.query<{ subject: string }>(
+      `SELECT COALESCE(e.canonical_id, e.id) AS subject FROM claims c JOIN entities e ON e.id = c.subject_id WHERE c.tx_to IS NULL AND c.statement = 'D2T2-C2调整为20分钟'`,
+    );
+    expect(row.subject).toBe(rule.id);
+  });
+});
