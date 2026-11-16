@@ -122,6 +122,10 @@ const CHAIN_OPENING = [
   new RegExp(`^\\s*(?:请问|那么|并且|而且|又|是|由)?\\s*(?:谁|哪(?:一)?[个位家名项件组](?!些)|有?(?<!第)[一另]\\s*(?:[位名家]|[起个项件]\\s*(?:[^，。？?；;、\\s]{0,12}?的)?${ENTITY_NOUN}))`),
   // "这家公司的创始人是谁，他…": the clause asks who or which one, at its end
   /是(?:谁|哪(?:一)?[个位家名])\s*[，,。？?；;：:—]?\s*$/,
+];
+
+/** The English openings: only where a sentence starts ("The CEO, who joined…" is a relative clause, not a question). */
+const CHAIN_OPENING_EN = [
   new RegExp(`^\\s*(?:and\\s+|then\\s+|so\\s+)?(?:who(?:m)?\\b(?!\\s+(?:are|were)\\b)|which\\s+(?!\\w+s\\b)\\w+|(?:a|an|another|one)\\s+(?:[\\w-]+\\s+)?${EN_NOUN}\\b)`, 'i'),
 ];
 
@@ -133,6 +137,14 @@ const CHAIN_BACK = [
 
 /** A bare pronoun: stands for the answer of a clause that opened with the question word. */
 const CHAIN_PRONOUN = [/(?<![其吉])[他她](?!们)|(?<!其)它(?!们)/, /\b(?:he|she|him|her|his|hers|they|them|their|theirs)\b/i];
+
+/**
+ * A clause that asks who, wherever the word stands ("二部平台组的事故是谁修复的？",
+ * "fixed by whom?"): a later 他 / 她 / he / she stands for that person, not 它
+ * ("…是谁的主意？它后来…" is about what the question named).
+ */
+const CHAIN_ASKS_WHO = [/谁/, /\bwhom\b/i];
+const CHAIN_PERSON_PRONOUN = [/(?<![其吉])[他她](?!们)/, /\b(?:he|she|him|her|his|hers|they|them|their|theirs)\b/i];
 
 /** A label the question gives what it describes, used again later: "…的那一家记作甲；甲头一回…". */
 const CHAIN_LABEL = /(?:记作|记为|称作|称为|叫作)\s*[“"「]?([甲乙丙丁戊己庚辛壬癸]|[A-Z])(?![A-Za-z])/g;
@@ -156,17 +168,22 @@ function chainAt(question: string): number {
   const labels = new Set<string>();
   let introduced = false;
   let asked = false;
+  let askedWho = false;
   for (let i = 0; i < starts.length; i++) {
     const at = starts[i];
     const clause = question.slice(at, starts[i + 1] ?? question.length);
     if (i > 0) {
       const back = (introduced && CHAIN_BACK.some((re) => re.test(clause)))
         || (asked && CHAIN_PRONOUN.some((re) => re.test(clause)))
+        || (askedWho && CHAIN_PERSON_PRONOUN.some((re) => re.test(clause)))
         || [...labels].some((l) => clause.includes(l));
       if (back) return at;
     }
+    // a sentence starts at the beginning, or after 。？！；, a line, or ". ": not after a comma
+    const sentence = i === 0 || /[。？?！!；;\n]\s*$|\.\s+$/.test(question.slice(Math.max(0, at - 3), at));
     if (CHAIN_INTRO.some((re) => re.test(clause))) introduced = true;
-    if (CHAIN_OPENING.some((re) => re.test(clause))) asked = true;
+    if (CHAIN_OPENING.some((re) => re.test(clause)) || (sentence && CHAIN_OPENING_EN.some((re) => re.test(clause)))) asked = true;
+    if (CHAIN_ASKS_WHO.some((re) => re.test(clause))) askedWho = true;
     for (const m of clause.matchAll(CHAIN_LABEL)) labels.add(m[1]);
   }
   return -1;

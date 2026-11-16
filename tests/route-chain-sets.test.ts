@@ -70,6 +70,8 @@ const NOT_CHAINS: string[] = [
   'How much did OpenAI raise, and who led the round?',
   'Which supplier was cheaper, Foxconn or Pegatron, and why did that supplier win?',
   '平台组今年排第一名的工程师是谁，他修了几起事故？',
+  '马斯克收购推特是谁的主意？它后来改名叫什么？',
+  'The CEO, who joined in 2020, cut three divisions. What did they cost?',
 ];
 
 /** Real phrasing that does chain: the later clause asks about what the first part has to find. */
@@ -78,6 +80,10 @@ const CHAINS: string[] = [
   '收购了Figma的那家公司是谁，它的CEO是谁？',
   '谁是宁德时代的第一大客户？那家客户今年的订单量有多少？',
   '去年负责这个项目的人是谁？此人现在在哪个部门？',
+  // a list asked of the person the first clause has to find: 谁 mid-clause licenses 他 (tests/walk-safety.test.ts on the walk branch)
+  '二部平台组的事故是谁修复的？他还修复过哪些事故',
+  'Who fixed the Platform 2 team\'s incident? Which other incidents has he fixed?',
+  'The outage was fixed by whom? What else did she fix this year?',
   // 一位 / 一名 / 一家 introduce a person or an organisation whatever the noun (the life fixture's c-chain)
   '周敏介绍给林晓认识的跑步教练推荐了一位理疗师，这位理疗师在哪家机构坐诊？',
   '朋友给我介绍了一家律所，那家律所的合伙人是谁？',
