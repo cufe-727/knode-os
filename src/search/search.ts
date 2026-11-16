@@ -62,12 +62,38 @@ export interface SearchChannel {
   ms: number;
   /** Set when the channel could not answer (an embedding provider out of quota); hybrid search goes on without it. */
   error?: string;
+  /**
+   * Set when the channel returned fewer candidates than it was asked for though more exist: what stopped
+   * it, and how many it has. The rows it did return are its best, in order — only the list is short.
+   */
+  partial?: string;
 }
+
+/** A channel's candidates, with what cut the list short when something did (`SearchChannel.partial`). */
+type Recall = RankedChunk[] & { partial?: string };
 
 export type SearchChannelName = 'vector' | 'keyword' | 'graph';
 
+/**
+ * The results of a search, with `partial` when its vector channel returned
+ * fewer candidates than it was asked for though more exist
+ * (`SearchChannel.partial`): the results are then what the other channels and
+ * the short list found, and "nothing" from such a search is not "nothing
+ * there". It is a property of the array, not an element and not in its JSON:
+ * whoever passes results on says it in their own way (`knode_search` in a
+ * block after the results, `GET /api/search` in a header).
+ */
+export type SearchResults = SearchResult[] & { partial?: string };
+
+/** `results`, saying `partial` when there is something to say. */
+export function markedPartial(results: SearchResult[], partial: string | undefined): SearchResults {
+  // not enumerable: the array compares, spreads and iterates as an array of results and nothing else
+  if (partial) Object.defineProperty(results, 'partial', { value: partial, enumerable: false, writable: true, configurable: true });
+  return results;
+}
+
 export interface ExplainedSearch {
-  results: SearchResult[];
+  results: SearchResults;
   /** The channels that ran: all three in hybrid mode, one in vector or keyword mode, none for SAG; `rerank` when that stage ran. */
   channels: Partial<Record<SearchChannelName | 'rerank', SearchChannel>>;
 }
@@ -501,7 +527,7 @@ export async function describeVectorScan(store: Store): Promise<string> {
   const catalog = scan.catalog ? `pgvector ${scan.catalog} in the catalog` : 'no pgvector version in the catalog';
   if (!scan.iterative) {
     return `vector search: one walk of the index per search (${catalog}; the library on this server has no hnsw.iterative_scan, which pgvector has from 0.8.0). `
-      + 'A search with a filter, or for the sources among nearer generated pages, gets what the nearest 40 rows hold. '
+      + 'A search for the sources among nearer generated pages gets what the nearest 40 rows hold; a narrowed search reads a side small enough to read and otherwise gets what those rows hold of it, its vector channel marked partial. '
       + 'To change it: install pgvector 0.8.0 or later on the database server, restart it, then run ALTER EXTENSION vector UPDATE in the database.';
   }
   const behind = versionBefore(scan.catalog, 0, 8)
@@ -532,26 +558,131 @@ function scansIteratively(store: Store): Promise<boolean> {
 export const SIDE_ROWS_MAX = 2000;
 
 /**
- * The nearest chunks of all that a search reads first, for both sides: one
- * walk of the vector index at pgvector's own width (`hnsw.ef_search`).
+ * The nearest chunks of all that a search reads first, for both sides, at the
+ * least: one walk of the vector index at pgvector's own width
+ * (`hnsw.ef_search`).
  */
 export const NEAREST_OF_ALL = 40;
+
+/** The widest one walk of the index can be asked to be (`hnsw.ef_search` takes 1 to 1000). */
+const WALK_WIDTH_MAX = 1000;
+
+/**
+ * The nearest chunks a search reads first when each channel is asked for `k`
+ * candidates: five thirds of `k`, the forty that serve the 24 of a search for
+ * 8, and never fewer than forty.
+ *
+ * The walk on for the sources starts when those nearest hold fewer than `k`
+ * of them. Held at forty, they could not hold the 60 a search for 20 asks
+ * for, or the 72 of the evaluation's 24, and every such search walked on:
+ * "never starts" was true of searches for 13 at most.
+ */
+export function nearestFor(k: number): number {
+  return Math.min(WALK_WIDTH_MAX, Math.max(NEAREST_OF_ALL, Math.ceil((k * 5) / 3)));
+}
+
+/**
+ * The most rows a narrowed search may walk the index for, and the most a side
+ * of it may hold and be read, whatever the index's size and however many
+ * candidates it asks for. On the finance copy 10,000 rows are 120,000 to
+ * 190,000 blocks touched (twelve a row read, fourteen a row walked, more
+ * where the read is planned as a scan), and half a second to a second when
+ * they are walked. Narrowed searches are
+ * routine — a research agent
+ * names a folder or a kind in most of its searches, the web interface in
+ * every search of a picked folder — and the √ below grows with `k`: at the
+ * interface's 20 results it came to 16,500 rows a side there.
+ */
+export const SCOPED_ROWS_MAX = 10000;
+
+/**
+ * The rows a side may cost in a search its caller narrowed (to kinds, to
+ * places, to a trust tier or an actor, to a date): a side of
+ * this many chunks at most is ranked by reading its
+ * vectors, and the index is walked on for a larger one for this many rows.
+ *
+ * A row read and a row walked cost about the same: on the finance copy
+ * (566,914 chunks) nine to twelve blocks touched for a chunk whose vector is
+ * read through its document, ten for a row the walk goes on to, and much the
+ * same time on a server that has neither in memory. Reading a side costs its
+ * size. Walking to `k` chunks of a side that is `size` of the index's `total`
+ * costs `k · total / size` rows where the side lies as the index does — and a
+ * side a caller chose seldom does: the pages of that index took six times
+ * the even figure at the median, a folder of research notes twenty-five
+ * times. Eight times is allowed for, so reading is the cheaper below
+ * `size² = 8 · k · total`: 10,400 chunks there for the 24 a search for 8
+ * asks of a channel, 2,967 on an index of 45,850.
+ *
+ * `SIDE_ROWS_MAX` — what a search of everything spends on a side, where the
+ * side is no one's choice — had come to bound these too: a folder of 2,500
+ * chunks away from the question was walked for, 2,000 rows, and the search
+ * returned nothing; a search for pages got what 2,000 rows held where the
+ * finance copy's pages needed up to 9,300. Returning nothing for a search
+ * its caller narrowed is worse than taking longer over it.
+ */
+export function scopedRows(k: number, total: number): number {
+  return Math.min(SCOPED_ROWS_MAX, Math.max(SIDE_ROWS_MAX, Math.round(Math.sqrt(8 * k * total))));
+}
+
+/**
+ * The chunks a side of a narrowed search may hold and be read: half as many
+ * again as the rows of its walk, 15,000 at the most.
+ *
+ * Equal, the two left a cliff at their edge. A folder of 12,383 chunks on the
+ * finance copy, away from the question, was walked for: 10,000 rows, 140,963
+ * blocks, most of a second, and short for 17 questions of 30 — three of them
+ * with nothing at all. Read, it is 153,013 blocks and a tenth of a second,
+ * and exact. A side a little over the walk's rows costs little more to read
+ * than the walk that fails on it, so it is read; the walk is for sides so
+ * large that reading them would cost several walks.
+ */
+export function scopedReadRows(k: number, total: number): number {
+  return Math.round(1.5 * scopedRows(k, total));
+}
 
 interface SideSizes {
   /** Searchable chunks of sources, counted as far as the cap. */
   sources: number;
   generated: number;
+  /** A size here was not counted by this search: it is one remembered from an earlier count. */
+  remembered?: boolean;
 }
 
-const wholeSides = new WeakMap<object, SideSizes & { at: number }>();
+/** How long a count is remembered, where nothing this process wrote has put it out of date sooner. */
+const SIDES_REMEMBERED_MS = 60_000;
+
+const wholeSides = new WeakMap<object, SideSizes & { at: number; version: number }>();
+
+/** Per store, per search conditions and cap: each side last counted empty or past the cap — when, and at which content version of the store. */
+type SettledSides = { sources?: { at: number; n: number; version: number }; generated?: { at: number; n: number; version: number } };
+const settledSides = new WeakMap<object, Map<string, SettledSides>>();
+/** Conditions remembered per store: the oldest is forgotten past this many. */
+const LARGE_SIDES_KEPT = 64;
 
 /**
  * How many chunks each side of this search can return, counted as far as
  * `cap` + 1: what the search's own conditions leave (`searchable`), so a
  * side its filter empties, or the index holds nothing answerable of, counts
  * none, and one small enough to read says so. A search without a filter is
- * the whole index, counted once a minute per store; a filtered search is
- * counted for itself.
+ * the whole index, counted once a minute per store.
+ *
+ * A narrowed search is counted for itself, and a side it counted past the
+ * cap, or empty, is not counted again for a minute by a search with the same
+ * conditions. Those are the dear counts — as far as the cap through the
+ * search's conditions, or through every document to find none (3,008 blocks
+ * on the finance copy for the pages of a folder that has none, on every
+ * search of the folder, twice what its vector statement read) — and the
+ * whole index's sides are kept as long. A side within the cap is counted by
+ * each search, since what it holds decides what is read.
+ *
+ * What is remembered is put out of date by a write: it is kept with the
+ * store's content version (`Store.contentVersion`, which moves when this
+ * process writes documents, chunks, pages or scopes) and not used once that
+ * has moved — a folder that has just been filled, or emptied, is counted
+ * again by the next search. A write by another process moves nothing here,
+ * so the minute still ends a memory, and `fresh` counts whatever is
+ * remembered: the caller asks for that before it answers "nothing" from a
+ * remembered count.
  *
  * Documents are counted first, and a side's chunks only when its documents
  * are within the cap: a side of more documents than that has more chunks
@@ -559,10 +690,30 @@ const wholeSides = new WeakMap<object, SideSizes & { at: number }>();
  * on the finance copy with nothing in memory — once a minute, on whichever
  * search came first.
  */
-async function sideSizes(store: Store, sides: SideSql, cap: number, asOf?: TimeInput, filter: ResolvedScopeFilter = NO_FILTER): Promise<SideSizes> {
+async function sideSizes(store: Store, sides: SideSql, cap: number, asOf?: TimeInput, filter: ResolvedScopeFilter = NO_FILTER, fresh = false): Promise<SideSizes> {
+  // taken before anything is counted: a write that lands while the count runs puts the count out of date
+  const version = store.contentVersion;
+  const current = (kept: { at: number; version: number } | undefined): kept is { at: number; version: number } =>
+    !fresh && kept !== undefined && kept.version === version && Date.now() - kept.at < SIDES_REMEMBERED_MS;
   const whole = cap === SIDE_ROWS_MAX && !toIso(asOf) && isEmptyFilter(filter);
   const hit = whole ? wholeSides.get(store) : undefined;
-  if (hit && Date.now() - hit.at < 60_000) return hit;
+  if (current(hit)) return { sources: hit.sources, generated: hit.generated, remembered: true };
+  const key = JSON.stringify([cap, toIso(asOf), filter.kinds, filter.sources, filter.trust, filter.actor]);
+  const remembered = settledSides.get(store) ?? new Map<string, SettledSides>();
+  settledSides.set(store, remembered);
+  const settled = remembered.get(key) ?? {};
+  const name = (generated: boolean) => (generated ? 'generated' : 'sources') as 'generated' | 'sources';
+  const sizes: SideSizes = { sources: 0, generated: 0 };
+  const uncounted: boolean[] = [];
+  for (const generated of [false, true]) {
+    const known = settled[name(generated)];
+    if (current(known)) {
+      sizes[name(generated)] = known.n;
+      sizes.remembered = true;
+    } else {
+      uncounted.push(generated);
+    }
+  }
   const counted = async (chunks: boolean, which: boolean[]): Promise<number[]> => {
     const p = new Params();
     const cond = searchable('d', p, sides, asOf, filter);
@@ -573,15 +724,32 @@ async function sideSizes(store: Store, sides: SideSql, cap: number, asOf?: TimeI
     const [row] = await store.query<Record<string, number>>(`SELECT ${which.map((generated, i) => `${side(generated)} AS n${i}`).join(', ')}`, p.list);
     return which.map((_, i) => row?.[`n${i}`] ?? 0);
   };
-  const [sourceDocs, pageDocs] = await counted(false, [false, true]);
-  const sizes = { sources: sourceDocs, generated: pageDocs };
-  // a side of few documents: how many chunks they are
-  const few = [false, true].filter((generated) => { const n = generated ? pageDocs : sourceDocs; return n > 0 && n <= cap; });
-  if (few.length > 0) {
-    const chunks = await counted(true, few);
-    few.forEach((generated, i) => { sizes[generated ? 'generated' : 'sources'] = chunks[i]; });
+  if (uncounted.length > 0) {
+    const docs = await counted(false, uncounted);
+    uncounted.forEach((generated, i) => { sizes[name(generated)] = docs[i]; });
+    // a side of few documents: how many chunks they are
+    const few = uncounted.filter((generated) => sizes[name(generated)] > 0 && sizes[name(generated)] <= cap);
+    if (few.length > 0) {
+      const chunks = await counted(true, few);
+      few.forEach((generated, i) => { sizes[name(generated)] = chunks[i]; });
+    }
+    let settles = false;
+    for (const generated of uncounted) {
+      const n = sizes[name(generated)];
+      if (n === 0 || n > cap) {
+        settled[name(generated)] = { at: Date.now(), n, version };
+        settles = true;
+      } else {
+        delete settled[name(generated)];
+      }
+    }
+    if (settles) {
+      remembered.delete(key);
+      remembered.set(key, settled);
+      if (remembered.size > LARGE_SIDES_KEPT) remembered.delete(remembered.keys().next().value!);
+    }
   }
-  if (whole) wholeSides.set(store, { ...sizes, at: Date.now() });
+  if (whole) wholeSides.set(store, { sources: sizes.sources, generated: sizes.generated, at: Date.now(), version });
   return sizes;
 }
 
@@ -609,11 +777,12 @@ async function sideSizes(store: Store, sides: SideSql, cap: number, asOf?: TimeI
  *
  * So, for a search of both sides of a large index:
  *
- * - One walk, the nearest `NEAREST_OF_ALL` chunks of all, serves both sides:
- *   the pages among them are the pages' side — a page that is not among the
- *   nearest forty chunks is not near the question, and the keyword and graph
- *   channels still list pages by their own measure — and the sources among
- *   them are the sources', when there are `k`.
+ * - One walk, the nearest chunks of all, serves both sides (`nearestFor`:
+ *   forty for the 24 candidates of a search for 8, five thirds of `k` beyond
+ *   that): the pages among them are the pages' side — a page that is not
+ *   among them is not near the question, and the keyword and graph channels
+ *   still list pages by their own measure — and the sources among them are
+ *   the sources', when there are `k`.
  * - Only when there are not is the index walked on for the sources, for
  *   `SIDE_ROWS_MAX` rows at most: a branch of the statement whose condition
  *   (fewer than `k` sources among the nearest) holds no column, so the
@@ -623,9 +792,23 @@ async function sideSizes(store: Store, sides: SideSql, cap: number, asOf?: TimeI
  *   read 1,330; on the 10× index it runs for most questions, and the replay
  *   stands (hybrid 94 / 105 of 297 in the top 5 / top 8, 93 / 103 before).
  *
- * A search for pages alone walks on for them, as a search for sources does. A
- * side of `SIDE_ROWS_MAX` chunks at most — a filter's, or a small index's —
- * is ranked by reading its vectors, exactly.
+ * A search with no sources to return — it asked for pages, or its filter
+ * leaves none — walks on for the pages, as a search for sources does. A side
+ * of `SIDE_ROWS_MAX` chunks at most is ranked by reading its vectors, exactly.
+ *
+ * A search its caller narrowed (to kinds, to places, to a trust tier or an
+ * actor's reading, to a date) is another matter: the
+ * side is the caller's choice, and may lie anywhere from the question. Its
+ * shared walk is of the nearest chunks the filter leaves; a side is read up
+ * to `scopedRows` chunks and walked on for as many rows where it is larger
+ * (the choice by cost is argued there). A walk that ends short of `k` is all
+ * such a side gets: the list is returned as it is and the channel says it is
+ * partial. For a while a side the walk found nothing of was read instead, as
+ * far as four times the walk's rows — and of a side larger than that, the
+ * first so-many chunks in no order: 5 of the true top 8 of 14,000 pages came
+ * back, ranked and scored like any exact answer, and the fusion took them for
+ * one. tests/search-scoped-sides.test.ts holds each of these on an index
+ * large enough to be walked.
  *
  * The scan's settings are made by the statement itself, for the statement: a
  * CTE calls `set_config(…, true)`, which lasts to the end of the transaction
@@ -644,109 +827,262 @@ async function vectorSearch(
   asOf?: TimeInput,
   filter?: ResolvedScopeFilter,
   exactSide?: number,
-): Promise<RankedChunk[]> {
+): Promise<Recall> {
   const qv = queryVector ?? (await embedder.embed([query]))[0];
   // a search for certain kinds reads the sides they are on, and no side that holds nothing it can return
   const kinds = filter?.kinds;
   const wantsSources = !kinds || kinds.some((kind) => kind !== 'view');
   const wantsPages = !kinds || kinds.includes('view');
-  const readMax = exactSide ?? SIDE_ROWS_MAX;
-  const held = await sideSizes(store, sides, readMax, asOf, filter);
+  // A search its caller narrowed may cost what finding its side takes: narrowed to kinds or to places,
+  // to a trust tier or to what an actor may read, or to what was live at a date. Each leaves a part of
+  // the index that may lie anywhere from the question — a search as of a date whose live documents lay
+  // away from it was held to the 2,000 rows of a search of everything, and returned nothing.
+  const narrowed = Boolean(toIso(asOf)) || !isEmptyFilter(filter ?? NO_FILTER);
+  const total = narrowed ? await chunkTotal(store) : 0;
+  const budget = narrowed ? scopedRows(k, total) : SIDE_ROWS_MAX;
+  const readMax = exactSide ?? (narrowed ? scopedReadRows(k, total) : SIDE_ROWS_MAX);
+  const sizesOf = (h: SideSizes) => ({ sources: wantsSources ? h.sources : 0, generated: wantsPages ? h.generated : 0 });
+  let held = await sideSizes(store, sides, readMax, asOf, filter);
+  // "Nothing here" is not said from memory: where every side the search could return was remembered as
+  // empty, the sides are counted now. A folder remembered empty returned nothing, and nothing to say it
+  // was a memory, for up to a minute after fifty documents had come in from another process.
+  if (held.remembered && sizesOf(held).sources === 0 && sizesOf(held).generated === 0) held = await sideSizes(store, sides, readMax, asOf, filter, true);
   /**
-   * How a side is ranked: its vectors read; its chunks among the nearest of all, with the index walked
-   * on when those are short of `k` (sources); the same without walking on (pages beside sources); or the
-   * index walked on for it alone (pages, in a search for pages).
+   * How a side is ranked: its vectors read; the index walked on for it (the sources, and the pages
+   * where the search has no sources to return — it asked for pages, or its filter leaves none: a
+   * search of `wiki`, of `wiki/entities` — or where the caller named the sides); or its chunks among
+   * the nearest of all the search may return, without walking on for them (pages beside sources in a
+   * search that names no side).
+   *
+   * Each side is judged on its own. One that holds `readMax` chunks at the most is read, exactly; a
+   * larger one is walked for, `budget` rows of the index at the most, half each where both sides are
+   * walked. For a day the two shared one budget, the smaller side read first and the other given what
+   * was left: a folder of 2,000 chunks read beside 2,000 pages left the pages a walk of 555 rows, which
+   * found none and said nothing, and a side that would have been read on its own was walked for a few
+   * hundred rows because the other had been read. What one side costs no longer decides how the other
+   * is ranked; a narrowed search reads at the most two sides of `readMax`, or one and a walk.
+   * (`readMax` is half as much again as the walk's rows: `scopedReadRows`.)
    */
-  const way = (generated: boolean): 'none' | 'read' | 'near' | 'walk' => {
-    const size = generated ? held.generated : held.sources;
-    if (size === 0 || !(generated ? wantsPages : wantsSources)) return 'none';
-    if (size <= readMax) return 'read';
-    return generated && !wantsSources ? 'walk' : 'near';
-  };
-  const sources = way(false);
-  const pages = way(true);
+  const size = (generated: boolean) => sizesOf(held)[generated ? 'generated' : 'sources'];
+  const sources: 'none' | 'read' | 'walk' = size(false) === 0 ? 'none' : size(false) <= readMax ? 'read' : 'walk';
+  // Pages too many to read, beside sources. Where the caller named the sides — kinds, or places — the
+  // pages are theirs to have: they are walked for on their own, as the sources are, and a walk that ends
+  // short is said. Taken as the pages among the nearest chunks, 6,000 pages a caller had named beside
+  // 36,000 walked sources were none, with nothing said, where the same pages beside sources few enough
+  // to read are read and get their share. A search narrowed only by a date, a trust tier or an actor
+  // names no side: its pages are those among the nearest, as in a search of everything — a walk of their
+  // own for pages that are seldom near is what made every search several times slower.
+  const namesSides = Boolean(filter?.kinds || filter?.sources);
+  const pages: 'none' | 'read' | 'near' | 'walk' = size(true) === 0 ? 'none' : size(true) <= readMax ? 'read' : sources === 'none' || namesSides ? 'walk' : 'near';
+  const walks = Number(sources === 'walk') + Number(pages === 'walk' || pages === 'near');
+  const walkMax = narrowed ? Math.floor(budget / Math.max(1, walks)) : SIDE_ROWS_MAX;
   if (sources === 'none' && pages === 'none') return [];
-  const walksOn = sources === 'near' || pages === 'walk';
-  const iterative = walksOn && (await scansIteratively(store));
+  const iterative = (sources === 'walk' || pages === 'walk' || pages === 'near') && (await scansIteratively(store));
+  // The settings a walk of the index is made under, for this statement alone: the scan that walks on, as
+  // far as `walkMax` rows; and a first walk as wide as the candidates asked for, since one walk ends at
+  // `hnsw.ef_search` rows (40 unless the server says more, which is kept) — on a library that walks no
+  // further that is all of a search for 20's sixty that there is. The scan that walks on could fetch
+  // the rows past forty too, and is not left to: resumed, it goes on from the candidates the first
+  // walk set aside, and on an index of a few tight clusters those lay in another cluster — the rows
+  // after the fortieth were not the next nearest (one build in three of the test index).
+  const nearest = nearestFor(k);
+  const settings: string[] = [];
+  if (iterative) settings.push(`set_config('hnsw.iterative_scan', 'relaxed_order', true)`, `set_config('hnsw.max_scan_tuples', '${walkMax}', true)`);
+  if (nearest > NEAREST_OF_ALL) {
+    settings.push(`set_config('hnsw.ef_search', greatest(coalesce(nullif(current_setting('hnsw.ef_search', true), '')::int, ${NEAREST_OF_ALL}), ${nearest})::text, true)`);
+  }
 
-  const p = new Params([toVectorLiteral(qv)]);
-  // only vectors of the query's own space: while a new model's vectors are still coming in
-  // (a re-embed, or the deferred backlog) the table holds two (docs/design/12 §3.3)
-  const model = p.add(embedder.model);
-  const cond = searchable('d', p, sides, asOf, filter);
-  const lim = p.add(k);
-  const onSide = (generated: boolean) => `${generated ? '' : 'NOT '}${sides.generated('d')}`;
-  const columns = `c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content`;
-  const setting = iterative ? ' AND (SELECT mode FROM scan) IS NOT NULL' : '';
-  // the index, walked on until the side has its `k` (or `SIDE_ROWS_MAX` rows have been read)
-  const walk = (generated: boolean, when = '') => `(SELECT ${columns}, 1 - (e.embedding <=> $1::${VECTOR_TYPE}) AS raw, ${generated} AS generated, true AS walked
-     FROM embeddings e
-     JOIN chunks c ON c.id = e.chunk_id
-     JOIN documents d ON d.id = c.document_id
-     WHERE e.model = ${model} AND ${cond} AND ${onSide(generated)}${when}${setting}
-     ORDER BY e.embedding <=> $1::${VECTOR_TYPE}
-     LIMIT ${lim})`;
-  // a small side: its own vectors, read from its documents. The inner query has no order (and OFFSET 0
-  // keeps it a step of its own), so the planner has no use for the vector index there
-  const read = (generated: boolean) => `(SELECT ${columns}, 1 - nearest.far AS raw, ${generated} AS generated, false AS walked
-     FROM (
-       SELECT held.chunk_id, held.far FROM (
-         SELECT c.id AS chunk_id, e.embedding <=> $1::${VECTOR_TYPE} AS far
-         FROM documents d
-         JOIN chunks c ON c.document_id = d.id
-         JOIN embeddings e ON e.chunk_id = c.id AND e.model = ${model}
-         WHERE ${cond} AND ${onSide(generated)}
-         OFFSET 0
-       ) held
-       ORDER BY held.far
-       LIMIT ${lim}
-     ) nearest
-     JOIN chunks c ON c.id = nearest.chunk_id
-     JOIN documents d ON d.id = c.document_id)`;
-
-  const ctes: string[] = [];
-  const branches: string[] = [];
-  if (sources === 'near' || pages === 'near') {
-    // One walk of the index for both sides: the nearest chunks of all, each with its side. The inner
-    // query has no condition on the side, so its limit ends the walk whatever the statement's setting.
-    const both = sources === 'near' && pages === 'near';
-    ctes.push(`near AS MATERIALIZED (
-       SELECT ${columns}, 1 - nearest.far AS raw, ${sides.generated('d')} AS generated, false AS walked
+  /** One statement of the branches `compose` picks, with its own parameters: only what a branch uses is bound. */
+  const ask = (compose: (parts: {
+    near: (pagesOnly: boolean) => string;
+    walk: (generated: boolean, when?: string) => string;
+    read: (generated: boolean) => string;
+    lim: () => string;
+  }) => string[]): Promise<(RankedChunk & { walked: boolean; near_rows?: number | string | null })[]> => {
+    const p = new Params([toVectorLiteral(qv)]);
+    // only vectors of the query's own space: while a new model's vectors are still coming in
+    // (a re-embed, or the deferred backlog) the table holds two (docs/design/12 §3.3)
+    const model = p.add(embedder.model);
+    const cond = searchable('d', p, sides, asOf, filter);
+    let limit: string | undefined;
+    const lim = () => (limit ??= p.add(k));
+    const onSide = (generated: boolean) => `${generated ? '' : 'NOT '}${sides.generated('d')}`;
+    const columns = `c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content`;
+    const ctes: string[] = [];
+    let set = false;
+    // a branch that walks the index reads the statement's settings first: a condition without a column,
+    // which the executor tests once, before it starts the scan
+    const setting = () => {
+      if (settings.length === 0) return '';
+      set = true;
+      return ' AND (SELECT made FROM scan) IS NOT NULL';
+    };
+    const from = `FROM embeddings e
+       JOIN chunks c ON c.id = e.chunk_id
+       JOIN documents d ON d.id = c.document_id`;
+    // A narrowed search's walk of the index, `walkMax` rows of it at the most, nearest first, as a step
+    // of its own: its LIMIT is a fence no condition is moved across, so the planner cannot answer the
+    // statement by reading the side instead. Left to choose, it ranked a side without the index wherever
+    // it judged the filter narrow — 34,127 chunks of four folders on the finance copy, 420,703 blocks,
+    // where the budget is 10,000 rows.
+    //
+    // Each row of the walk is looked up as it is pulled (LATERAL, and OFFSET 0 keeps the lookup a step
+    // per row), and the first `most` rows the search may return end the statement: a side near the
+    // question ends its walk long before the fence. Joined as a set, the planner fetched every row
+    // behind the fence first and hashed them against the side — 10,000 rows for a side whose 24 nearest
+    // were among the first hundred. The walk yields rows nearest first, so the first that pass are the
+    // nearest that pass; their similarity is read from their vectors afterwards, `most` of them.
+    const hits = (most: string | number, conditions: string, when = '') => `(
+         SELECT hit.* FROM (
+           SELECT e.chunk_id
+           FROM embeddings e
+           WHERE e.model = ${model}${setting()}
+           ORDER BY e.embedding <=> $1::${VECTOR_TYPE}
+           LIMIT ${walkMax}
+         ) walked
+         CROSS JOIN LATERAL (
+           SELECT c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content, ${sides.generated('d')} AS generated
+           FROM chunks c
+           JOIN documents d ON d.id = c.document_id
+           WHERE c.id = walked.chunk_id AND ${conditions}
+           OFFSET 0
+         ) hit${when ? `
+         WHERE ${when}` : ''}
+         LIMIT ${most}
+       ) hit
+       JOIN embeddings v ON v.chunk_id = hit.chunk_id AND v.model = ${model}`;
+    const hitColumns = `hit.chunk_id, hit.document_id, hit.path, hit.title, hit.doc_date, hit.content, 1 - (v.embedding <=> $1::${VECTOR_TYPE}) AS raw`;
+    // in a narrowed search every row says how many rows the walk for both sides came to, when it is one of them
+    const notNear = narrowed ? ', NULL::bigint AS near_rows' : '';
+    // the index, walked on until the side has its `k` (or `walkMax` rows have been read)
+    const walk = (generated: boolean, when = '') => (narrowed
+      ? `(SELECT ${hitColumns}, ${generated} AS generated, true AS walked${notNear}
+       FROM ${hits(lim(), `${cond} AND ${onSide(generated)}`, when)})`
+      : `(SELECT ${columns}, 1 - (e.embedding <=> $1::${VECTOR_TYPE}) AS raw, ${generated} AS generated, true AS walked
+       ${from}
+       WHERE e.model = ${model} AND ${cond} AND ${onSide(generated)}${when ? ` AND ${when}` : ''}${setting()}
+       ORDER BY e.embedding <=> $1::${VECTOR_TYPE}
+       LIMIT ${lim()})`);
+    // a side's own vectors, read from its documents. The inner query has no order (and OFFSET 0 keeps it
+    // a step of its own), so the planner has no use for the vector index there
+    const read = (generated: boolean) => `(SELECT ${columns}, 1 - nearest.far AS raw, ${generated} AS generated, false AS walked${notNear}
        FROM (
-         SELECT e.chunk_id, e.embedding <=> $1::${VECTOR_TYPE} AS far
-         FROM embeddings e
-         WHERE e.model = ${model}
-         ORDER BY e.embedding <=> $1::${VECTOR_TYPE}
-         LIMIT ${NEAREST_OF_ALL}
+         SELECT held.chunk_id, held.far FROM (
+           SELECT c.id AS chunk_id, e.embedding <=> $1::${VECTOR_TYPE} AS far
+           FROM documents d
+           JOIN chunks c ON c.document_id = d.id
+           JOIN embeddings e ON e.chunk_id = c.id AND e.model = ${model}
+           WHERE ${cond} AND ${onSide(generated)}
+           OFFSET 0
+         ) held
+         ORDER BY held.far
+         LIMIT ${lim()}
+       ) nearest
+       JOIN chunks c ON c.id = nearest.chunk_id
+       JOIN documents d ON d.id = c.document_id)`;
+    // One walk of the index for both sides: the nearest chunks, each with its side.
+    // - A search of everything reads the nearest of all, and keeps those it may return: the walk has no
+    //   condition, so its limit ends it whatever the nearest are — code, lists of where to look — and
+    //   the cost is one walk on any index.
+    // - A narrowed search reads the nearest the filter leaves: the walk goes on to them, as far as
+    //   `walkMax` rows (`fenced`). Forty rows of everything hold little of a folder.
+    // The walk is as wide as the sources need (`nearestFor`); the pages' side is the pages among the
+    // first `NEAREST_OF_ALL` of it whatever its width. A wider walk is there for the sources' count,
+    // and handing every further page to a search that asks for more candidates is the crowding the
+    // sides were separated to end: the walk's direct route, which asks for 36, lost two to four gold
+    // documents of the 10× replay's top five that way.
+    const near = (pagesOnly: boolean) => {
+      const width = pagesOnly ? NEAREST_OF_ALL : nearest;
+      const wide = width > NEAREST_OF_ALL;
+      const picked = `chunk_id, document_id, path, title, doc_date, content, raw, generated, walked`;
+      ctes.push(narrowed
+        ? `near AS MATERIALIZED (
+       SELECT found.*, count(*) OVER () AS near_rows${wide ? ', row_number() OVER (ORDER BY found.raw DESC) AS place' : ''}
+       FROM (
+         SELECT ${hitColumns}, hit.generated, false AS walked
+         FROM ${hits(width, cond)}
+       ) found)`
+        : `near AS MATERIALIZED (
+       SELECT ${columns}, 1 - nearest.far AS raw, ${sides.generated('d')} AS generated, false AS walked${wide ? ', nearest.place' : ''}
+       FROM (
+         SELECT first.chunk_id, first.far${wide ? ', row_number() OVER (ORDER BY first.far) AS place' : ''}
+         FROM (
+           SELECT e.chunk_id, e.embedding <=> $1::${VECTOR_TYPE} AS far
+           FROM embeddings e
+           WHERE e.model = ${model}${wide ? setting() : ''}
+           ORDER BY e.embedding <=> $1::${VECTOR_TYPE}
+           LIMIT ${width}
+         ) first
        ) nearest
        JOIN chunks c ON c.id = nearest.chunk_id
        JOIN documents d ON d.id = c.document_id
-       WHERE ${cond}${both ? '' : ` AND ${onSide(pages === 'near')}`})`);
-    branches.push(`(SELECT * FROM near)`);
-    // and for the sources, when those nearest do not hold `k` of them, the index walked on: a branch
-    // whose condition holds no column, so the executor tests it once and, the sources being there, never
-    // starts the scan
-    if (sources === 'near') branches.push(walk(false, ` AND (SELECT count(*) FROM near WHERE NOT generated) < ${lim}`));
-  }
-  if (sources === 'read') branches.push(read(false));
-  if (pages === 'read') branches.push(read(true));
-  if (pages === 'walk') branches.push(walk(true));
-  if (iterative) {
-    ctes.push(`scan AS MATERIALIZED (
-       SELECT set_config('hnsw.iterative_scan', 'relaxed_order', true) AS mode, set_config('hnsw.max_scan_tuples', '${SIDE_ROWS_MAX}', true) AS most)`);
-  }
-  const rows = await store.query<RankedChunk & { walked: boolean }>(
-    `${ctes.length ? `WITH ${ctes.join(',\n     ')}\n     ` : ''}${branches.join('\n     UNION ALL\n     ')}`,
-    p.list,
-  );
+       WHERE ${cond})`);
+      // (a narrowed search takes every row of it, with how many there are: beside sources that are read,
+      // the sources among them are dropped once the count is known)
+      const kept = [pagesOnly && !narrowed ? 'generated' : '', wide ? `(NOT generated OR place <= ${NEAREST_OF_ALL})` : ''].filter(Boolean);
+      return `(SELECT ${picked}${narrowed ? ', near_rows' : ''} FROM near${kept.length ? ` WHERE ${kept.join(' AND ')}` : ''})`;
+    };
+    const branches = compose({ near, walk, read, lim });
+    // first in the statement: the walks that read it follow
+    if (set) {
+      ctes.unshift(`scan AS MATERIALIZED (
+       SELECT concat_ws(' ', ${settings.join(', ')}) AS made)`);
+    }
+    return store.query<RankedChunk & { walked: boolean; near_rows?: number | string | null }>(
+      `${ctes.length ? `WITH ${ctes.join(',\n     ')}\n     ` : ''}${branches.join('\n     UNION ALL\n     ')}`,
+      p.list,
+    );
+  };
+
+  const rows = await ask(({ near, walk, read, lim }) => {
+    const branches: string[] = [];
+    if (pages === 'near') {
+      branches.push(near(sources !== 'walk'));
+      // and for the sources, when those nearest do not hold `k` of them, the index walked on: a branch
+      // whose condition holds no column, so the executor tests it once and, the sources being there,
+      // never starts the scan
+      if (sources === 'walk') branches.push(walk(false, `(SELECT count(*) FROM near WHERE NOT generated) < ${lim()}`));
+    } else if (sources === 'walk') {
+      branches.push(walk(false));
+    }
+    if (sources === 'read') branches.push(read(false));
+    if (pages === 'read') branches.push(read(true));
+    if (pages === 'walk') branches.push(walk(true));
+    return branches;
+  });
   // where the index was walked on for the sources, that list is the sources': it holds the nearest ones too
   const walkedSources = rows.some((r) => r.walked && !r.generated);
+  // (sources that are read are the read's rows: those among the walk for both sides came with it for its count)
+  const ofNear = (r: { near_rows?: number | string | null }) => r.near_rows !== undefined && r.near_rows !== null;
   const of = (generated: boolean) => rows
-    .filter((r) => Boolean(r.generated) === generated && (generated || !walkedSources || r.walked))
+    .filter((r) => Boolean(r.generated) === generated && (generated || (sources === 'read' ? !ofNear(r) : !walkedSources || r.walked)))
     .sort((x, y) => y.raw - x.raw)
     .slice(0, k);
-  return mergeSides(of(false), of(true));
-
+  const out: Recall = mergeSides(of(false), of(true));
+  // A side the index was walked for, and the walk ended short of `k` of it: the side holds more (it was
+  // too large to read), and they lie further than the walk goes — or the library walks no further than
+  // its first rows. What was found is returned, nearest first, and the channel says the list is short.
+  // Nothing more is read: any part of the side that could be read within a limit is no nearer the
+  // question than the rest of it.
+  //
+  // The pages beside sources are those among the nearest chunks the search may return, and a walk that
+  // comes to its count of those has shown what they hold: no pages there is an answer. In a narrowed
+  // search the walk can end at its limit before it has them — the filter's chunks lie further — and
+  // then it has shown nothing: that is said too.
+  const nearWidth = sources === 'walk' ? nearest : NEAREST_OF_ALL;
+  const nearRows = Number(rows.find(ofNear)?.near_rows ?? 0);
+  const cutShort = (generated: boolean) => {
+    const way = generated ? pages : sources;
+    if (of(generated).length >= k) return false;
+    return way === 'walk' || (way === 'near' && narrowed && nearRows < nearWidth);
+  };
+  const short = [false, true]
+    .filter(cutShort)
+    .map((generated) => `${of(generated).length} of the ${k} ${generated ? 'pages' : 'sources'} asked for`);
+  if (short.length > 0) {
+    out.partial = `the walk of the vector index ended ${iterative ? `at its limit of ${walkMax} rows` : 'at its first rows (this pgvector has no iterative scan)'} with ${short.join(' and ')}`;
+  }
+  return out;
 }
 
 /**
@@ -767,15 +1103,19 @@ const KEYWORD_DF_CAP = 1000;
 const BM25_K1 = 1.2;
 const BM25_B = 0.75;
 
-const chunkTotals = new WeakMap<object, { n: number; at: number }>();
+const chunkTotals = new WeakMap<object, { n: Promise<number>; at: number }>();
 
-/** How many chunks the index holds, counted at most once a minute per store. */
-async function chunkTotal(store: Store): Promise<number> {
+/**
+ * How many chunks the index holds, counted at most once a minute per store.
+ * The channels of one search ask side by side: they share the one count.
+ */
+function chunkTotal(store: Store): Promise<number> {
   const hit = chunkTotals.get(store);
   if (hit && Date.now() - hit.at < 60_000) return hit.n;
-  const [row] = await store.query<{ n: number }>(`SELECT count(*)::int AS n FROM chunks`);
-  const n = row?.n ?? 0;
+  const n = store.query<{ n: number }>(`SELECT count(*)::int AS n FROM chunks`).then(([row]) => row?.n ?? 0);
   chunkTotals.set(store, { n, at: Date.now() });
+  // a count that failed is asked again by the next search
+  n.catch(() => { if (chunkTotals.get(store)?.n === n) chunkTotals.delete(store); });
   return n;
 }
 
@@ -1416,7 +1756,7 @@ export async function search(
   embedder: EmbeddingProvider,
   query: string,
   opts: SearchOptions = {},
-): Promise<SearchResult[]> {
+): Promise<SearchResults> {
   return (await searchExplained(store, embedder, query, opts)).results;
 }
 
@@ -1431,24 +1771,26 @@ export async function searchExplained(
   query: string,
   opts: SearchOptions = {},
 ): Promise<ExplainedSearch> {
-  const k = opts.k ?? 8;
+  // a number of results: anything else (a `k=abc` of a query string is NaN, and was sent as `LIMIT NaN`) is the default
+  const k = typeof opts.k === 'number' && Number.isFinite(opts.k) && opts.k >= 1 ? Math.floor(opts.k) : 8;
   const mode = opts.mode ?? 'hybrid';
   if (mode === 'sag') {
     const { sagSearch } = await import('./sag.js');
     // the walk's own direct route is not reranked: its final order is, below
-    const walked = await sagSearch(store, embedder, query, { ...opts, rerank: undefined, current: false });
+    const walked = await sagSearch(store, embedder, query, { ...opts, k, rerank: undefined, current: false });
     const channels: ExplainedSearch['channels'] = {};
     // a walk's results say which of them are pages (the direct route's hits and the expansion's rows both do)
     const results = await finish(store, query, walked, k, opts, channels, new Set(walked.filter((r) => r.generated).map((r) => r.chunkId)));
-    return { results, channels };
+    // a walk reports no channels; what cut its direct route's vector channel short comes with its results
+    return { results: markedPartial(results, walked.partial), channels };
   }
   const fetchK = Math.max(k * 3, 24);
   const channels: ExplainedSearch['channels'] = {};
-  const timed = async (name: SearchChannelName, run: () => Promise<RankedChunk[]>, tolerate = false): Promise<RankedChunk[]> => {
+  const timed = async (name: SearchChannelName, run: () => Promise<Recall>, tolerate = false): Promise<RankedChunk[]> => {
     const started = Date.now();
     try {
       const rows = await run();
-      channels[name] = { hits: rows.length, ms: Date.now() - started };
+      channels[name] = { hits: rows.length, ms: Date.now() - started, ...(rows.partial ? { partial: rows.partial } : {}) };
       return rows;
     } catch (err) {
       channels[name] = { hits: 0, ms: Date.now() - started, error: err instanceof Error ? err.message : String(err) };
@@ -1514,7 +1856,7 @@ export async function searchExplained(
   if (opts.track !== false) {
     await recordChunkHits(store, results.map((r) => ({ chunkId: r.chunkId, documentId: r.documentId })), heatCfg);
   }
-  return { results, channels };
+  return { results: markedPartial(results, channels.vector?.partial), channels };
 }
 
 /**

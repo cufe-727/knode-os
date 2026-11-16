@@ -529,6 +529,23 @@ async function testLlmConfig(config: LlmConfig): Promise<unknown> {
   return { ok: true, enabled: true, model: client.label, sample: reply.trim().slice(0, 120), ms: Date.now() - t0 };
 }
 
+/**
+ * Set on a `GET /api/search` response whose vector channel returned fewer
+ * candidates than it was asked for though more exist (`SearchResults.partial`):
+ * what stopped it. The body is the array of results either way.
+ */
+export const SEARCH_PARTIAL_HEADER = 'x-knode-search-partial';
+
+/**
+ * The most results `GET /api/search` returns, whatever `k` asks for: the
+ * bound a walk (`sag`) already has, twice the search tool's 50. The route had
+ * none — `k=1e9` answered with every chunk a query's words matched, content
+ * and all, which on a large workspace is the corpus in one response. Its
+ * callers ask for far fewer: the web embed 24, the desktop app 12, the CLI
+ * what its user types (8 unless told).
+ */
+export const SEARCH_ROUTE_K_MAX = 100;
+
 export function createApp(
   rootCtx: AppContext,
   log: (msg: string) => void = console.log,
@@ -2370,21 +2387,26 @@ export function createApp(
     const ctx = requestCtx(c);
     const q = c.req.query('q');
     if (!q) return c.json({ error: 'q required' }, 400);
-    const k = Number(c.req.query('k') ?? 8);
+    // a number of results, a hundred at the most; anything else is the default (`search` reads it so too)
+    const asked = Number(c.req.query('k') ?? 8);
+    const k = Number.isFinite(asked) && asked >= 1 ? Math.min(SEARCH_ROUTE_K_MAX, Math.floor(asked)) : 8;
     const modeParam = c.req.query('mode') ?? 'hybrid';
     if (!['hybrid', 'vector', 'keyword', 'sag'].includes(modeParam)) {
       return c.json({ error: `unsupported search mode: ${modeParam}` }, 400);
     }
     const mode = modeParam as SearchMode;
     try {
-      return c.json(await search(ctx.store, ctx.embedder, q, {
+      const results = await search(ctx.store, ctx.embedder, q, {
         k,
         mode,
         heat: ctx.config.heat,
         sag: ctx.config.retrieval.sag,
         asOf: c.req.query('as_of') || undefined,
         filter: resolveScopeFilter({ kinds: csv(c.req.query('kinds')), sources: csv(c.req.query('sources')) }),
-      }));
+      });
+      // the body stays the array of results; a vector channel that came back short is said beside it
+      if (results.partial) c.header(SEARCH_PARTIAL_HEADER, results.partial);
+      return c.json(results);
     } catch (e) {
       return c.json(err(e), status(e));
     }

@@ -197,10 +197,45 @@ processing is started, as embedding does now.
   for itself (`hnsw.iterative_scan = relaxed_order`, with `hnsw.max_scan_tuples` set to 2,000): the walk goes on
   until `k` rows pass the filter. Since the same day it does so only where it must: one walk of the nearest 40
   chunks serves both sides, and the walk is carried on for the sources only when those 40 hold fewer than `k` of
-  them. Carried on for each side, it made a search three to five times slower on a copy of the finance index
+  them. (Forty for the 24 candidates a search for 8 asks of each channel; since 2026‑11‑16 five thirds of the
+  candidates beyond that — 100 for a search for 20 — with `hnsw.ef_search` raised to as many for the statement,
+  never lowered: held at forty, every search for 14 or more walked on. The pages' side stays the pages among the
+  first forty, however wide the walk.) Carried on for each side, it made a search three to five times slower on a copy of the finance index
   (562,563 chunks, an eighth of them generated pages, seldom among the nearest): 192 to 272 ms at the median with
   nothing in memory, against 76 to 81 before any of this and 48 to 56 now. No server setting is involved, and
-  none needs changing. That scan exists from pgvector 0.8.0. What decides is the **library** the
+  none needs changing.
+
+  A search its caller narrowed — to kinds or places (`kinds`, `sources`), to a trust tier or an actor's reading
+  (`trust`, `actor`), or to a date (`asOf`) — is costed for itself (since 2026‑11‑16;
+  `scopedRows`): the side is the caller's choice and may lie anywhere from the question, so the 2,000 rows a search
+  of everything spends on a side are not its bound. Its measure is √(8 · k · chunks) rows, 10,000 at the most (the
+  finance index is at that limit). Each side is judged on its own: one that holds half as many chunks again at the
+  most (`scopedReadRows`: 15,000 there) is ranked by reading its vectors, a larger one by walking the index for the
+  measure's rows, half each where both sides are walked. Where the caller named the sides (`kinds`, `sources`) the
+  pages are walked for on their own as the sources are; in a search narrowed only by a date, a trust tier or an
+  actor they are the pages among the nearest chunks, as in a search of everything. The two were equal for a day, and a folder a little over
+  them and away from the question (12,383 chunks) was walked for 10,000 rows in most of a second and came back
+  short for 17 questions of 30, where reading it takes 153,000 blocks and a tenth of a second. (For a day the two sides shared one budget, the smaller read first: a folder read beside pages left
+  the pages a walk of a few hundred rows that found none and said nothing.) Each walk is a step of its own in the
+  statement, that many rows of the index at the most, each row looked up as it is pulled: the planner cannot answer
+  by reading the side instead (left to choose, it ranked 34,000 chunks of four folders without the index, 420,000
+  blocks), and a side near the question ends its walk in a few dozen rows. A side counted past the measure, or
+  empty, is not counted again for a minute by a search with the same conditions — unless this process has written
+  documents, chunks, pages or scopes since (`Store.contentVersion`), which puts every remembered count out of date
+  at once; and where all a search could return was remembered as empty, the sides are counted before it answers
+  with nothing (a write by another process does not show here). A walk that ends short of `k` is all such a side gets: what it found is returned, nearest
+  first, and the channel is marked partial (`SearchChannel.partial`, in `channels.vector` of an explained search)
+  with what stopped it and how many it has; so is the walk that looks for pages beside the sources, when it ends at
+  its limit before it has its forty rows. The mark goes where the results go: `search()` returns them with a
+  `partial` property (not an element, not in their JSON), a walk's results carry its direct route's, `knode_search`
+  adds a block `{ "partial": … }` after the results, and `GET /api/search` sets the `x-knode-search-partial`
+  header; the array of results is the same in each. An agent can tell "semantic recall stopped early" from
+  "nothing there". Nothing is read after a walk: for a day a side the walk found nothing of
+  was read as far as four times the walk's rows, and of a larger side that was its first so-many chunks in no
+  order, returned as if they were its nearest. The 2,000 had bounded narrowed searches too, and a folder of 2,500
+  chunks away from the question returned nothing.
+
+  That scan exists from pgvector 0.8.0. What decides is the **library** the
   server has loaded, not `pg_extension.extversion`: knode-os asks whether the setting exists
   (`current_setting('hnsw.iterative_scan', true)`), once per store, and `serve` logs one line per workspace it opens
   saying which behaviour is in effect and why (`describeVectorScan`). knode-os never alters the extension. What an
@@ -208,8 +243,9 @@ processing is started, as embedding does now.
 
   - *The log says "one walk of the index per search".* The library is older than 0.8.0. Install pgvector 0.8.0 or
     later on the database server (the package, or `make install` of the release), restart PostgreSQL, then in each
-    database that has the extension: `ALTER EXTENSION vector UPDATE;`. Until then a filtered search, and the sources'
-    side of a search, get what the nearest 40 rows hold, as before this change.
+    database that has the extension: `ALTER EXTENSION vector UPDATE;`. Until then the sources' side of a search
+    gets what the nearest 40 rows hold, as before this change, and so does a narrowed search of a side too large to
+    read, its vector channel marked partial.
   - *The log says "the catalog is behind the library".* The library was upgraded and `ALTER EXTENSION vector UPDATE`
     was not run. Search already uses the iterative scan; run the statement, as the extension's owner, to bring the
     catalog (and the SQL objects of later versions) in line.

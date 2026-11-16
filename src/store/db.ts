@@ -25,6 +25,11 @@ const RETRY_SQLSTATES = new Set(['40P01', '40001']);
 /** Tries a transaction gets in all before such a failure is passed on (see Store.tx). */
 export const TX_ATTEMPTS = 4;
 
+/** A statement that may change rows: it holds a writing verb, wherever in it (a CTE may write). */
+const CONTENT_WRITE = /(?:^|[\s(;])(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|TRUNCATE|DROP\s+TABLE|ALTER\s+TABLE|COPY)\s/i;
+/** The tables that say which documents and chunks a search may return (`Store.contentVersion`). */
+const CONTENT_TABLE = /\b(?:documents|chunks|pages|scopes)\b/i;
+
 function isRetryableTxError(err: unknown): boolean {
   const code = (err as { code?: unknown } | null | undefined)?.code;
   return typeof code === 'string' && RETRY_SQLSTATES.has(code);
@@ -223,13 +228,40 @@ export class Store implements Queryable {
     return sent;
   }
 
+  private contentWrites = 0;
+
+  /**
+   * A number that moves whenever a statement sent through this store may have
+   * changed which documents, chunks, generated pages or scopes exist. What is
+   * kept in memory about them (the sizes of a search's sides) is kept with
+   * the number it was taken at, and is not used once it has moved.
+   *
+   * It is this process's writes only. Another process writing the same
+   * database (a CLI sync beside a running server) does not move it: what
+   * relies on it must still age out, and must not answer "nothing" from
+   * memory.
+   */
+  get contentVersion(): number {
+    return this.contentWrites;
+  }
+
+  /** Counts `sql` as a write to the content tables when it is one; before it is sent, so a reader never sees the old number after the write. */
+  private noteWrite(sql: string): void {
+    if (CONTENT_WRITE.test(sql) && CONTENT_TABLE.test(sql)) this.contentWrites++;
+  }
+
   async query<T>(sql: string, params?: unknown[]): Promise<T[]> {
+    this.noteWrite(sql);
     const res = await this.track(() => this.db.query<T>(sql, params));
+    // and after it: a count taken while the write was in flight is not kept past it
+    this.noteWrite(sql);
     return res.rows;
   }
 
   async exec(sql: string): Promise<void> {
+    this.noteWrite(sql);
     await this.track(() => this.db.exec(sql));
+    this.noteWrite(sql);
   }
 
   /**
@@ -247,20 +279,28 @@ export class Store implements Queryable {
     for (let attempt = 1; ; attempt++) {
       // a body that swallowed the deadlock error fails later on "current transaction is aborted": the deadlock decides
       let conflict = false;
+      // a transaction's writes are seen by others when it commits: the content version moves then
+      let wrote = false;
       const watch = <R>(p: Promise<R>): Promise<R> =>
         p.catch((err: unknown) => {
           if (isRetryableTxError(err)) conflict = true;
           throw err;
         });
       try {
-        return await this.track(() => this.db.transaction(async (tx) =>
+        const done = await this.track(() => this.db.transaction(async (tx) =>
           fn({
-            query: async (sql, params) => (await watch(tx.query(sql, params))).rows as never,
+            query: async (sql, params) => {
+              wrote ||= CONTENT_WRITE.test(sql) && CONTENT_TABLE.test(sql);
+              return (await watch(tx.query(sql, params))).rows as never;
+            },
             exec: async (sql) => {
+              wrote ||= CONTENT_WRITE.test(sql) && CONTENT_TABLE.test(sql);
               await watch(tx.exec(sql));
             },
           }),
         ));
+        if (wrote) this.contentWrites++;
+        return done;
       } catch (err) {
         if (attempt >= TX_ATTEMPTS || !(conflict || isRetryableTxError(err))) throw err;
         console.warn(`[knode-os] transaction rolled back (${err instanceof Error ? err.message : err}); running it again, attempt ${attempt + 1} of ${TX_ATTEMPTS}`);

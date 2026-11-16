@@ -6,7 +6,7 @@ import { NO_FILTER, ResolvedScopeFilter, evidenceFilterSql } from '../store/reso
 import { Params, TimeInput, rowLiveAt, toIso } from '../store/temporal.js';
 import { SearchResult } from '../types.js';
 import { BridgeCandidate, lexicalBridge } from './bridge.js';
-import { GENERATED_SHARE, SearchOptions, docLiveAt, entityMatchSql, generatedPlaces, queryTerms, search, sidesOf } from './search.js';
+import { GENERATED_SHARE, SearchOptions, SearchResults, docLiveAt, entityMatchSql, generatedPlaces, markedPartial, queryTerms, search, sidesOf } from './search.js';
 
 interface EntityMentionRow {
   entity_id: string;
@@ -382,7 +382,7 @@ export async function sagSearch(
   embedder: EmbeddingProvider,
   query: string,
   opts: SearchOptions = {},
-): Promise<SearchResult[]> {
+): Promise<SearchResults> {
   const cfg = normalizedConfig(opts.sag);
   const scope: SagScope = { asOf: opts.asOf, filter: opts.filter ?? NO_FILTER };
   const k = boundedInteger(opts.k ?? 8, 8, 1, 100);
@@ -505,5 +505,6 @@ export async function sagSearch(
   if (opts.track !== false) {
     await recordChunkHits(store, results.map((result) => ({ chunkId: result.chunkId, documentId: result.documentId })), heatCfg);
   }
-  return results;
+  // the direct route is a hybrid search: where its vector channel came back short, the walk's results say so
+  return markedPartial(results, direct.partial);
 }
