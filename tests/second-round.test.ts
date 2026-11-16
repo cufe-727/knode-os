@@ -126,13 +126,16 @@ describe('ask with a second round', () => {
   const llm = { enabled: false } as unknown as LlmClient;
   it('adds what the second round found to the contexts and says why it ran; off when asked', async () => {
     const q = 'Who raised risk R-07, and where is that person now?';
+    // routed to the walk, the first round runs the lookup route's graph search as well (docs/design/30 §3), which
+    // reaches the passage on its own; the second round still runs from Li Wei, and adds only what the first lacks
     const res = await ask(store, defaultConfig(), embedder, llm, q, { queryVector: [1, 0, 0, 0], k: 1 });
     expect(res.route.kind).toBe('multihop');
     expect(res.route.second).toMatchObject({ from: ['Li Wei'] });
-    expect(res.route.second!.chunks).toBeGreaterThan(0);
     expect(res.contexts.map((c) => c.path)).toContain('raw/docs/liwei-move.md');
+    const second = res.route.second!.chunks;
     const off = await ask(store, defaultConfig(), embedder, llm, q, { queryVector: [1, 0, 0, 0], k: 1, second: false });
     expect(off.route.second).toBeUndefined();
-    expect(off.contexts.map((c) => c.path)).not.toContain('raw/docs/liwei-move.md');
+    // what the second round added is what turning it off loses
+    expect(res.contexts.length - off.contexts.length).toBe(second);
   });
 });
