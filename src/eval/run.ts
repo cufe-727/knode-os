@@ -30,7 +30,7 @@ import { closeKnodeStates } from './systems/knode.js';
 import { describeDatabase, EVAL_POOL_MAX, evalDatabase, orphanedEvalSchemas, sameDatabase } from './database.js';
 import { makeSystems } from './systems/index.js';
 import { removeHeldTempDirs, sweepStaleTempDirs } from './tmp.js';
-import { boundedTrace } from './trace.js';
+import { boundedOutputs, boundedTrace } from './trace.js';
 import { SystemEnv, SystemUnderTest, taggedEmbedder } from './systems/types.js';
 import { extractFinalAnswer } from './metrics/text.js';
 import { AnswerRecord, BuildRecord, emptyUsage, ScoreRecord, Suite, SUITES, Task, TaskType, Usage } from './types.js';
@@ -1086,6 +1086,8 @@ async function answerAll(
         text: a.text, finalAnswer: extractFinalAnswer(a.text),
         citations: a.citations ?? citationsIn(a.text, docs), retrieved: a.retrieved ?? [], toolCalls: a.toolCalls ?? 0,
         ...(a.commands ? { commands: boundedTrace(a.commands) } : {}),
+        // what each command returned, beside it (docs/design/33 D7); absent when the session's events carried none
+        ...(a.commands && a.outputs?.some((o) => o) ? { outputs: boundedOutputs(a.outputs.slice(0, a.commands.length)) } : {}),
         ...(a.capped ? { capped: true } : {}), ...(a.leaked?.length ? { leaked: a.leaked } : {}), ...(a.error ? { error: a.error } : {}),
         ...(a.error && /^cancelled:/.test(a.error) ? { cancelled: true } : {}),
         usage: meter.usage((e) => e.system === s.id && e.task === t.id, mark), ms: Date.now() - t0,

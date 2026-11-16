@@ -1,6 +1,6 @@
 # 33 — The evaluation as a ladder: what search adds, what the wiki adds, what knode's tools add
 
-Status: design (2026-11-14). Nothing here is implemented.
+Status: design (2026-11-14); stage 1 built 2026-11-15 (§10). Stages 2–5 are not.
 
 ## 0. Why
 
@@ -140,3 +140,24 @@ Cost at API prices, from the 10× run: an agent answer is $0.08–0.18, so four 
 - Whether the MCP-only diagnostic (`agent-knode`) is a deployment that matters: if agents reach a workspace only through `/mcp`, it belongs in the headline for that product path.
 - Which real-document packs: two from those on disk, or new corpora chosen for long, unstructured documents.
 - Whether the long documents and extra years should also go into the life recipe, whose documents cost model calls to write.
+
+## 10. Stage 1 as built (2026-11-15)
+
+`eval run --systems ladder` runs `agent-grep`, `agent-rag`, `agent-knode-wiki-sources`, `agent-knode-full`, `knode-ask` and `rag-hybrid` (`--systems single-call`: the last two). The default set no longer has `agent-knode` or `agent-knode-wiki`; both run when named.
+
+**Arm B, `agent-rag`** (`src/eval/systems/rag.ts`). In the rag group, so it shares `rag-hybrid`'s build, and builds it itself when `rag-hybrid` is not in the run. Its one tool, `search(query, k)` (k 8 by default, at most 20), is the hybrid ranking `rag-hybrid` answers from, returned as JSON: each hit's document path (as in the agent's folder), the 1,200-character passage and its RRF score. The run serves it over loopback HTTP behind a per-host secret (`startServedTools`, `src/eval/toolhost.ts`), as it serves knode's tools, so a worker's session reaches it through `serve`'s lease-bound route unchanged. The MCP server is named `knode`, as every evaluation session's is on a worker. Query embeddings are metered under `agent-rag` without a task, so an answer's own usage leaves them out (on a local bge-m3 they cost nothing).
+
+**Arm D, `agent-knode-full`** (`src/eval/systems/knode.ts`). Arm C's folder (`wiki/` and `raw/docs/`, where the pages' links point) and the six tools of §2, on the shared knode build. A build now keeps one tool host per tool set, so the host serves D only its six; `serve`'s route refuses anything else from a worker's session. Its guide is `questionKindGuide` with grep and reading done in the shell, then the catalog schema, without the catalog guide's pointer to `knode_datasources` (a tool D does not have).
+
+**Briefs.** One skeleton (`armBrief`, `src/eval/systems/agents.ts`): the existing agent brief, with each arm's "what you have" in its place and D's guide after it. Arms A and C ask exactly as in the 2026-11 runs. `src/eval/systems/briefs.ts` lists the four; `tests/eval-briefs.test.ts` shows them side by side, and `tests/eval-ladder.test.ts` checks every prompt the arms' sessions got is that brief and the question.
+
+**Telemetry.** An answer record's `outputs` is entry for entry with `commands`: `{ text, chars, failed? }`, the first 2,000 characters of what the command or tool call returned and the full length, or null where nothing came back. It is read from Codex's `item.completed` events (a command's `aggregated_output`; an MCP call's text content, else its structured content, else its error), paired with the start by item id, else by kind in order. A worker sends a longer output cut to that head with `knode_output_chars`, so `serve` keeps less per lease; an older worker's whole outputs are read the same way, and records without `outputs` report as before.
+
+**Report** (`src/eval/report.ts`), first after the run's facts:
+
+- *The ladder*: the five differences of §2 for which the run answered with both arms, paired over the questions both were scored on (first answers; all packs pooled, a question per pack and task). Correctness, weighted tokens, USD at API prices, latency and tool calls each get Δ, a paired-bootstrap interval and p, the MDE (α 0.05, power 0.8, unadjusted) and significance after Holm across the rows shown, metric by metric.
+- *Which questions tell the agents apart*: over the questions every agent system of the run was scored on, all fully right (correctness 1), none fully right, and the rest, overall and per task type. On run-10x's records this gives 168, 56 and 37 of 261, the figures of §0.
+- USD and tokens per correct answer beside correctness in each pack's answering table.
+- *knode tools and correctness*, per pack and every agent that called knode's tools (D, and `agent-knode` when it runs): calls per tool, and mean correctness of the scored answers that called it against those that did not. Descriptive: the groups differ in their questions too.
+
+Not shown without a model-backed run: whether agents use `search` or knode's tools much when grep is beside them, whether Codex's `item.completed` events carry outputs in exactly the fields read here (the reader tolerates missing ones, which leave `outputs` absent), and every number the ladder will report.

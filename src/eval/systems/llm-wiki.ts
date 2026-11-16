@@ -161,7 +161,7 @@ export function llmWiki(): SystemUnderTest {
           prompt: `${AGENT_BRIEF('The current directory is a wiki compiled from the documents: start from index.md. The source documents themselves are not here; pages cite them as raw/<path> — cite those paths.')}\n\n${prompt}`,
         });
         recordAgent(env.meter, { system: 'agent-wiki', stage: 'agent', task: task.id }, env.models.model, r);
-        return { text: r.text, citations: citationsIn(r.text, new Set(env.staged.docs.map((d) => d.path))), toolCalls: r.toolCalls, commands: r.commands, capped: r.capped, leaked: r.leaked, error: r.error };
+        return { text: r.text, citations: citationsIn(r.text, new Set(env.staged.docs.map((d) => d.path))), toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs, capped: r.capped, leaked: r.leaked, error: r.error };
       } finally {
         copy.cleanup();
       }
@@ -208,7 +208,10 @@ export function llmWiki(): SystemUnderTest {
 }
 
 /** Brief for an agent that has a wiki and the sources it was compiled from. */
-export const WIKI_SOURCES_BRIEF = (wiki: string, raw: string) => AGENT_BRIEF(`The current directory holds a wiki compiled from the documents (${wiki}; start from its index.md) and the source documents themselves (${raw}). Use the wiki to find your way — which sources bear on the question and how they connect — and open the sources to check details or find what the wiki leaves out. Cite source documents by their paths under ${raw}.`);
+/** What an agent with a wiki and the sources beside it has: the sentence of the shared brief that says so. */
+export const WIKI_SOURCES_HAS = (wiki: string, raw: string) => `The current directory holds a wiki compiled from the documents (${wiki}; start from its index.md) and the source documents themselves (${raw}). Use the wiki to find your way — which sources bear on the question and how they connect — and open the sources to check details or find what the wiki leaves out. Cite source documents by their paths under ${raw}.`;
+
+export const WIKI_SOURCES_BRIEF = (wiki: string, raw: string) => AGENT_BRIEF(WIKI_SOURCES_HAS(wiki, raw));
 
 /**
  * A wiki and the sources side by side in a fresh directory with nothing else
@@ -248,7 +251,7 @@ export function llmWikiSources(): SystemUnderTest {
         recordAgent(env.meter, { system: 'agent-wiki-sources', stage: 'agent', task: task.id }, env.models.model, r);
         const docs = new Set(env.staged.docs.map((d) => d.path));
         const opened = r.filesTouched.filter((f) => f.startsWith('raw/')).map((f) => f.slice('raw/'.length)).filter((f) => docs.has(f));
-        return { text: r.text, citations: citationsIn(r.text, docs), retrieved: [...new Set(opened)], toolCalls: r.toolCalls, commands: r.commands, capped: r.capped, leaked: r.leaked, error: r.error };
+        return { text: r.text, citations: citationsIn(r.text, docs), retrieved: [...new Set(opened)], toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs, capped: r.capped, leaked: r.leaked, error: r.error };
       } finally {
         copy.cleanup();
       }

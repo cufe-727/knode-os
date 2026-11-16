@@ -7,6 +7,7 @@ import { formatTag, Meter, MeterTag } from '../meter.js';
 import type { LoadedPack, StagedCorpus } from '../pack.js';
 import type { QuotaGuard } from '../quota.js';
 import type { Shim } from '../shim.js';
+import type { ToolOutput } from '../trace.js';
 import type { Citation, KnowledgeUnit, Task } from '../types.js';
 
 /**
@@ -47,6 +48,8 @@ export interface SystemAnswer {
   toolCalls?: number;
   /** An agent's command lines and MCP tool calls, in order (src/eval/trace.ts); bounded when the record is written. */
   commands?: string[];
+  /** What each of `commands` returned: its head and full length (src/eval/trace.ts); bounded with them. */
+  outputs?: (ToolOutput | null)[];
   capped?: boolean;
   leaked?: string[];
   error?: string;

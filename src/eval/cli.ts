@@ -14,7 +14,7 @@ import { buildScaleData, renderScale, writeReport } from './report.js';
 import { parseLocal, runEval, scoreRun } from './run.js';
 import { Meter, sumEvents } from './meter.js';
 import { RunStore } from './runstore.js';
-import { DEFAULT_SYSTEMS, SYSTEMS } from './systems/index.js';
+import { DEFAULT_SYSTEMS, expandSystems, SYSTEM_TRACKS, SYSTEMS } from './systems/index.js';
 import { EXTERNAL_SYSTEMS, externalPacks, venvPython } from './systems/external.js';
 import { Suite, SUITES, TASK_TYPES, TaskType } from './types.js';
 import { loadConfig, resolveDataDir } from '../config.js';
@@ -205,6 +205,8 @@ export function registerEvalCommands(program: Command): void {
         const ext = (EXTERNAL_SYSTEMS as readonly string[]).includes(id);
         console.log(`${id.padEnd(18)} ${s.kind.padEnd(9)} ${s.answers ? 'answers ' : 'retrieval'} ${s.label}${ext ? ` — ${fs.existsSync(venvPython(id)) ? 'installed' : 'not installed'}, packs: ${externalPacks().join(', ')}` : ''}`);
       }
+      console.log('\ntracks (--systems <track>):');
+      for (const [track, ids] of Object.entries(SYSTEM_TRACKS)) console.log(`${track.padEnd(18)} ${ids.join(', ')}`);
     });
   systems
     .command('install <id>')
@@ -219,7 +221,7 @@ export function registerEvalCommands(program: Command): void {
     .command('run')
     .description('run a benchmark: build every system on each pack, answer, score, report')
     .requiredOption('--pack <packs>', 'comma-separated pack directories or names under ~/knode-eval/packs')
-    .option('--systems <list>', `comma-separated (default: ${DEFAULT_SYSTEMS.join(',')})`)
+    .option('--systems <list>', `comma-separated system ids or tracks (${Object.entries(SYSTEM_TRACKS).map(([t, ids]) => `${t} = ${ids.join(',')}`).join('; ')}); default: ${DEFAULT_SYSTEMS.join(',')}`)
     .option('--suites <list>', `comma-separated: ${SUITES.join(',')}`)
     .option('--run-dir <dir>', 'resume this run directory')
     .option('--config-from <workspace>', 'knode workspace whose embedder the run uses (read-only)')
@@ -271,11 +273,15 @@ export function registerEvalCommands(program: Command): void {
         waitMinutes: waitMinutesOption(opts),
         pool: poolOption(opts),
         repeat: Number(opts.repeat),
-        repeatSystems: csv(opts.repeatSystems),
+        repeatSystems: (() => {
+          const ids = csv(opts.repeatSystems);
+          return ids && expandSystems(ids);
+        })(),
         repeatSample: repeatSampleOption(opts),
         judgeAudit: judgeAuditOption(opts),
         packs: csv(opts.pack)!.map(resolvePack),
-        systems: csv(opts.systems) ?? DEFAULT_SYSTEMS,
+        // a track is recorded as the systems it stands for, so a resumed run asks the same ones
+        systems: expandSystems(csv(opts.systems) ?? DEFAULT_SYSTEMS),
         suites: (csv(opts.suites) as Suite[] | undefined) ?? [...SUITES],
         runDir: opts.runDir,
         configFrom: opts.configFrom,

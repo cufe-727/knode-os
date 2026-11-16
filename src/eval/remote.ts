@@ -1246,6 +1246,7 @@ export function agentResultOf(s: EvalSessionAnswer, opts: AgentRunOptions, at: {
     text,
     usage: at.usage ?? readCodexEvents(s.stdout).usage,
     commands: trace.commands,
+    outputs: trace.outputs,
     toolCalls: trace.steps,
     capped,
     leaked: [...new Set(trace.leaked)],

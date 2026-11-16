@@ -91,8 +91,9 @@ export class VectorIndex<T> {
     return new VectorIndex(items, vectors.map(normalize), embedder);
   }
 
-  async search(query: string, k = 10): Promise<Hit<T>[]> {
-    const [q] = await this.embedder.embed([query]);
+  /** The `k` nearest items; `embedder` embeds the query when it is to be metered apart from the build (the same model). */
+  async search(query: string, k = 10, embedder: EmbeddingProvider = this.embedder): Promise<Hit<T>[]> {
+    const [q] = await embedder.embed([query]);
     const qv = normalize(q);
     return this.items
       .map((item, i) => ({ item, score: dot(qv, this.vectors[i]) }))

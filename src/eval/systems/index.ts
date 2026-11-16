@@ -1,8 +1,9 @@
 import { agentGrep } from './agents.js';
+import { LADDER_ARMS } from './briefs.js';
 import { externalSystem, EXTERNAL_SYSTEMS } from './external.js';
-import { agentKnode, agentKnodeWiki, agentKnodeWikiSources, knodeAsk, knodeSag } from './knode.js';
+import { agentKnode, agentKnodeFull, agentKnodeWiki, agentKnodeWikiSources, knodeAsk, knodeSag } from './knode.js';
 import { llmWiki, llmWikiSources } from './llm-wiki.js';
-import { ragBm25, ragHybrid, ragVector } from './rag.js';
+import { agentRag, ragBm25, ragHybrid, ragVector } from './rag.js';
 import { closedBook, longContext } from './refs.js';
 import type { SystemUnderTest } from './types.js';
 
@@ -13,9 +14,11 @@ export const SYSTEMS: Record<string, () => SystemUnderTest> = {
   'agent-knode': agentKnode,
   'agent-knode-wiki': agentKnodeWiki,
   'agent-knode-wiki-sources': agentKnodeWikiSources,
+  'agent-knode-full': agentKnodeFull,
   'agent-wiki': llmWiki,
   'agent-wiki-sources': llmWikiSources,
   'agent-grep': agentGrep,
+  'agent-rag': agentRag,
   'rag-hybrid': ragHybrid,
   'rag-bm25': ragBm25,
   'rag-vector': ragVector,
@@ -24,12 +27,32 @@ export const SYSTEMS: Record<string, () => SystemUnderTest> = {
   ...Object.fromEntries(EXTERNAL_SYSTEMS.map((id) => [id, () => externalSystem(id)])),
 };
 
-export const DEFAULT_SYSTEMS = Object.keys(SYSTEMS).filter((id) => !EXTERNAL_SYSTEMS.includes(id as (typeof EXTERNAL_SYSTEMS)[number]));
+/**
+ * Named sets of systems `--systems` takes beside system ids (docs/design/33
+ * §2): `ladder`, the headline — the four agent arms and the single-call track
+ * — and `single-call` alone (knode's Ask and plain RAG, a cheap regression
+ * check on every pack).
+ */
+export const SYSTEM_TRACKS: Record<string, readonly string[]> = {
+  ladder: [...LADDER_ARMS, 'knode-ask', 'rag-hybrid'],
+  'single-call': ['knode-ask', 'rag-hybrid'],
+};
+
+/** Diagnostics a run takes only when named (docs/design/33 D3): MCP tools with no files, the wiki with no sources. */
+export const DIAGNOSTIC_SYSTEMS = ['agent-knode', 'agent-knode-wiki'] as const;
+
+/** System ids with every track name replaced by its systems, in order, each once. */
+export function expandSystems(ids: readonly string[]): string[] {
+  return [...new Set(ids.flatMap((id) => SYSTEM_TRACKS[id] ?? [id]))];
+}
+
+/** A run with no `--systems`: every native system but the diagnostics. */
+export const DEFAULT_SYSTEMS = Object.keys(SYSTEMS).filter((id) => !EXTERNAL_SYSTEMS.includes(id as (typeof EXTERNAL_SYSTEMS)[number]) && !(DIAGNOSTIC_SYSTEMS as readonly string[]).includes(id));
 
 export function makeSystems(ids: string[]): SystemUnderTest[] {
-  return ids.map((id) => {
+  return expandSystems(ids).map((id) => {
     const f = SYSTEMS[id];
-    if (!f) throw new Error(`unknown system "${id}" (known: ${Object.keys(SYSTEMS).join(', ')})`);
+    if (!f) throw new Error(`unknown system "${id}" (known: ${Object.keys(SYSTEMS).join(', ')}; tracks: ${Object.keys(SYSTEM_TRACKS).join(', ')})`);
     return f();
   });
 }

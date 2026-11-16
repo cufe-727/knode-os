@@ -19,6 +19,32 @@ export function boundedTrace(commands: string[]): string[] {
   return commands.slice(0, TRACE_MAX_ENTRIES).map((c) => (c.length > TRACE_MAX_CHARS ? c.slice(0, TRACE_MAX_CHARS) : c));
 }
 
+/** Characters of a command's or tool call's output kept on the answer (docs/design/33 §2, D7). */
+export const TOOL_OUTPUT_HEAD = 2000;
+
+/**
+ * What one trace entry returned: the first `TOOL_OUTPUT_HEAD` characters of
+ * its output (a command's stdout and stderr as Codex aggregated them, an MCP
+ * call's text content or its error) and the full length. `failed`: a
+ * command that exited non-zero, a tool call that returned an error.
+ */
+export interface ToolOutput {
+  text: string;
+  chars: number;
+  failed?: boolean;
+}
+
+/** A tool output as kept: its head and full length (`chars` when the text was already cut, by a worker). */
+export function toolOutput(text: string, opts: { chars?: number; failed?: boolean } = {}): ToolOutput {
+  const chars = Math.max(opts.chars ?? 0, text.length);
+  return { text: text.length > TOOL_OUTPUT_HEAD ? text.slice(0, TOOL_OUTPUT_HEAD) : text, chars, ...(opts.failed ? { failed: true } : {}) };
+}
+
+/** The outputs stored beside a bounded trace: entry for entry (null where none came back), each head cut again. */
+export function boundedOutputs(outputs: (ToolOutput | null)[]): (ToolOutput | null)[] {
+  return outputs.slice(0, TRACE_MAX_ENTRIES).map((o) => (o ? toolOutput(o.text, { chars: o.chars, failed: o.failed }) : null));
+}
+
 /** Words of a shell string, quotes removed; an unclosed quote runs to the end (the entry may have been cut). */
 function words(s: string): string[] {
   const out: string[] = [];

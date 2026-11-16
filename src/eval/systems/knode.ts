@@ -18,10 +18,10 @@ import { currentRemote } from '../placement.js';
 import { dirBytes, listFiles } from '../pack.js';
 import { citationsIn } from '../prompts.js';
 import type { Citation, KnowledgeUnit } from '../types.js';
-import { AGENT_BRIEF } from './agents.js';
+import { AGENT_BRIEF, armBrief } from './agents.js';
 import { catalogGuide } from '../../mcp/catalog-guide.js';
 import { questionKindGuide } from '../../mcp/question-kinds.js';
-import { WIKI_SOURCES_BRIEF, wikiWithSources } from './llm-wiki.js';
+import { WIKI_SOURCES_HAS, wikiWithSources } from './llm-wiki.js';
 import { recordAgent, shimClient, SystemEnv, SystemUnderTest } from './types.js';
 import { evalTempDir } from '../tmp.js';
 import { startToolHost, ToolHost } from '../toolhost.js';
@@ -57,8 +57,8 @@ interface KnodeState {
   ctx: Promise<AppContext> | null;
   /** A close in flight: the next open waits for it. */
   closing: Promise<void> | null;
-  /** The build's tool host for agent sessions, started once with the first session. */
-  host: Promise<ToolHost> | null;
+  /** The build's tool hosts for agent sessions, one per tool set (agent-knode's, agent-knode-full's), each started with its first session. */
+  hosts: Map<string, Promise<ToolHost>>;
   /** wiki page path → the corpus documents it was generated from. */
   pageSources: Map<string, string[]>;
 }
@@ -120,7 +120,7 @@ export function evalPassSettings(): { concurrency: number; batchSize: number } {
 function stateFor(env: SystemEnv): KnodeState {
   let s = states.get(env.workDir);
   if (!s) {
-    s = { ws: path.join(env.workDir, 'ws'), ctx: null, closing: null, host: null, pageSources: new Map() };
+    s = { ws: path.join(env.workDir, 'ws'), ctx: null, closing: null, hosts: new Map(), pageSources: new Map() };
     states.set(env.workDir, s);
   }
   return s;
@@ -196,22 +196,29 @@ function open(s: KnodeState): Promise<AppContext> {
   return opening;
 }
 
-/** The build's tool host (single-flight): every agent session of the build calls its tools on the one open index. */
-function toolHost(s: KnodeState): Promise<ToolHost> {
-  if (s.host) return s.host;
-  const starting = startToolHost(() => open(s), KNODE_AGENT_TOOLS);
-  s.host = starting;
+/**
+ * The build's tool host for one tool set (single-flight): every agent session
+ * of the build with those tools calls them on the one open index. A set has a
+ * host of its own, so a session can call only the tools its arm has, here and
+ * on a worker (serve's route passes a session's own tools only).
+ */
+function toolHost(s: KnodeState, tools: string[]): Promise<ToolHost> {
+  const key = [...tools].sort().join(',');
+  const had = s.hosts.get(key);
+  if (had) return had;
+  const starting = startToolHost(() => open(s), tools);
+  s.hosts.set(key, starting);
   starting.catch(() => {
-    if (s.host === starting) s.host = null;
+    if (s.hosts.get(key) === starting) s.hosts.delete(key);
   });
   return starting;
 }
 
 /** Close the tool host, then the context once an open still in flight has finished; an open after this waits for the close. */
 async function close(s: KnodeState): Promise<void> {
-  const host = s.host;
-  s.host = null;
-  if (host) await (await host.catch(() => null))?.close();
+  const hosts = [...s.hosts.values()];
+  s.hosts.clear();
+  for (const host of hosts) await (await host.catch(() => null))?.close();
   const opened = s.ctx;
   if (!opened) return s.closing ?? undefined;
   s.ctx = null;
@@ -613,7 +620,7 @@ export function agentKnode(): SystemUnderTest {
   return knodeSystem('agent-knode', 'Codex agent with knode MCP retrieval tools', 'agent', true, {
     async answer(task, prompt, env) {
       const s = stateFor(env);
-      const host = await toolHost(s);
+      const host = await toolHost(s, KNODE_AGENT_TOOLS);
       await env.quota.wait();
       const tmp = evalTempDir('mcp');
       const empty = tmp.root;
@@ -632,7 +639,7 @@ export function agentKnode(): SystemUnderTest {
           ...citationsIn(r.text, docs).map((c) => c.doc),
           ...[...r.text.matchAll(/wiki\/[^\s)\]'"`，。]+\.md/g)].flatMap((m) => toCorpus(s, m[0])),
         ])].map((doc) => ({ doc }));
-        return { text: r.text, citations, toolCalls: r.toolCalls, commands: r.commands, capped: r.capped, leaked: r.leaked, error: r.error };
+        return { text: r.text, citations, toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs, capped: r.capped, leaked: r.leaked, error: r.error };
       } finally {
         tmp.cleanup();
       }
@@ -661,7 +668,7 @@ export function agentKnodeWiki(): SystemUnderTest {
           text: r.text,
           citations: citationsIn(r.text, docs),
           retrieved: [...new Set(viaPages)],
-          toolCalls: r.toolCalls, commands: r.commands,
+          toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs,
           capped: r.capped,
           leaked: r.leaked,
           error: r.error,
@@ -686,7 +693,7 @@ export function agentKnodeWikiSources(): SystemUnderTest {
           sandbox: 'read-only',
           model: env.models.model,
           effort: env.models.answerEffort,
-          prompt: `${WIKI_SOURCES_BRIEF('wiki/, generated pages; sources/ holds one summary per document', 'raw/docs/')}\n\n${prompt}`,
+          prompt: `${armBrief(KNODE_WIKI_SOURCES_HAS)}\n\n${prompt}`,
         });
         recordAgent(env.meter, { system: 'agent-knode-wiki-sources', stage: 'agent', task: task.id }, env.models.model, r);
         const docs = new Set(env.staged.docs.map((d) => d.path));
@@ -694,7 +701,74 @@ export function agentKnodeWikiSources(): SystemUnderTest {
           text: r.text,
           citations: citationsIn(r.text, docs),
           retrieved: [...new Set(r.filesTouched.flatMap((f) => toCorpus(s, f)))],
-          toolCalls: r.toolCalls, commands: r.commands,
+          toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs,
+          capped: r.capped,
+          leaked: r.leaked,
+          error: r.error,
+        };
+      } finally {
+        copy.cleanup();
+      }
+    },
+  });
+}
+
+/**
+ * Arm D's knode tools (docs/design/33 §2): retrieval only — hybrid search,
+ * the graph, claims, SQL over the catalog, resolution, orientation. Not
+ * `knode_grep`, `knode_read` or `knode_ls`: the shell does that, so every
+ * knode call an arm-D answer makes is a use of something grep cannot do.
+ */
+export const KNODE_FULL_TOOLS = ['knode_search', 'knode_graph_search', 'knode_claims', 'knode_query', 'knode_resolve', 'knode_survey'];
+
+/** Arm D's sentence of the shared brief: arm C's folder, and knode's retrieval tools beside it. */
+/** Arm C's sentence: the knode wiki and the sources beside it, where its pages' links point. */
+export const KNODE_WIKI_SOURCES_HAS = WIKI_SOURCES_HAS('wiki/, generated pages; sources/ holds one summary per document', 'raw/docs/');
+
+export const AGENT_KNODE_FULL_HAS = `${KNODE_WIKI_SOURCES_HAS} You also have knode's retrieval tools (on the MCP server knode) over an index built from the same documents: ${KNODE_FULL_TOOLS.join(', ')}. Their results name documents as raw/docs/<path> and pages as wiki/<page>, the paths of the current directory. A tool call counts against the budget as a command does.`;
+
+/**
+ * Arm D's tool guide: which tool answers which kind of question
+ * (`questionKindGuide`), with grep and reading done in the shell, and the
+ * catalog's schema for knode_query.
+ */
+export function knodeFullGuide(): string {
+  // the catalog guide points to knode_datasources for the full list of views: arm D has no such tool, and a brief
+  // naming tools an agent was not given sends it searching for them
+  const catalog = catalogGuide().replace(/; knode_datasources lists every view/, '');
+  return `${questionKindGuide({ grep: 'rg in the shell (rg -n -C3 "<string>" raw/docs wiki)', read: 'the shell (sed -n, head or cat; several files in one command)' })}
+
+${catalog}`;
+}
+
+export function agentKnodeFull(): SystemUnderTest {
+  return knodeSystem('agent-knode-full', 'Codex agent reading the knode wiki and the sources, with knode retrieval tools', 'agent', true, {
+    async answer(task, prompt, env) {
+      const s = stateFor(env);
+      const host = await toolHost(s, KNODE_FULL_TOOLS);
+      await env.quota.wait();
+      // arm C's folder: the pages and the sources where their links point
+      const copy = wikiWithSources(path.join(s.ws, 'wiki'), env.staged.dir, 'wiki', 'raw/docs');
+      try {
+        const r = await runAgent({
+          cwd: copy.dir,
+          sandbox: 'read-only',
+          model: env.models.model,
+          effort: env.models.answerEffort,
+          prompt: `${armBrief(AGENT_KNODE_FULL_HAS, knodeFullGuide())}\n\n${prompt}`,
+          mcp: { name: 'knode', url: host.url, token: host.secret, enabledTools: KNODE_FULL_TOOLS },
+        });
+        recordAgent(env.meter, { system: 'agent-knode-full', stage: 'agent', task: task.id }, env.models.model, r);
+        const docs = new Set(env.staged.docs.map((d) => d.path));
+        const citations = [...new Set([
+          ...citationsIn(r.text, docs).map((c) => c.doc),
+          ...[...r.text.matchAll(/wiki\/[^\s)\]'"`，。]+\.md/g)].flatMap((m) => toCorpus(s, m[0])),
+        ])].map((doc) => ({ doc }));
+        return {
+          text: r.text,
+          citations,
+          retrieved: [...new Set(r.filesTouched.flatMap((f) => toCorpus(s, f)))],
+          toolCalls: r.toolCalls, commands: r.commands, outputs: r.outputs,
           capped: r.capped,
           leaked: r.leaked,
           error: r.error,

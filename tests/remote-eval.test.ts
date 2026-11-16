@@ -241,6 +241,10 @@ describe('an evaluation run with remote workers', () => {
     expect(answers.filter((a) => a.error)).toEqual([]);
     expect(new Set(answers.map((a) => a.worker))).toEqual(new Set(['local']));
     expect(new Set(answers.map((a) => a.backend))).toEqual(new Set(['codex-cli:gpt-test']));
+    // a session on the run's own slot keeps what its commands returned, as a worker's does
+    const grep = answers.find((a) => a.system === 'agent-grep')!;
+    expect(grep.outputs?.map((o) => o?.chars)).toEqual([grep.outputs![0]!.text.length, expect.any(Number)]);
+    expect(grep.outputs![1]!.text.length).toBe(2000);
     expect(store.meta()!.remote).toEqual({ serve: base, calls: true, judge: true });
     expect(store.allScores().some((s) => s.worker === 'local' && s.backend === 'claude-cli:claude-test')).toBe(true);
     // published to serve and taken there by the run's own slots: one path either way
@@ -277,6 +281,11 @@ describe('an evaluation run with remote workers', () => {
     expect(grep.leaked ?? []).toEqual([]);
     expect(grep.usage.calls).toBe(1);
     expect(answers.find((a) => a.system === 'agent-knode')!.commands).toEqual(['mcp:knode.knode_resolve {"query":"林晓的岗位"}']);
+    // what each command returned, beside it (docs/design/33 D7): the worker sent the long one cut to its head, with its length
+    expect(grep.outputs![0]).toEqual({ text: 'email/2026-03-05.md:3:林晓将入职澜舟科技\n', chars: 'email/2026-03-05.md:3:林晓将入职澜舟科技\n'.length });
+    expect(grep.outputs![1]!.text.length).toBe(2000);
+    expect(grep.outputs![1]!.chars).toBeGreaterThan(5000);
+    expect(answers.find((a) => a.system === 'agent-knode')!.outputs).toEqual([{ text: '{"entities":[{"name":"林晓"}]}', chars: 28 }]);
     // the judge's calls went to the worker's claude slot
     const scored = store.allScores().filter((s) => s.worker);
     expect(scored.length).toBeGreaterThan(0);
@@ -378,6 +387,39 @@ describe('an evaluation run with remote workers', () => {
     expect(audit).toMatch(/"evalSession":"[0-9a-f-]{36}".*"tool":"knode_ls"/);
     expect(audit).toMatch(/"tool":"knode_secret".*"status":403/);
   }, 60_000);
+
+  it('gives arm B\'s search over the rag index to a session on a worker, through serve', async () => {
+    const res = await runEval({ ...common, packs: [packDir], systems: ['agent-rag'], runDir: path.join(runs, 'agent-rag'), remote: remoteOpts() });
+    const answers = new RunStore(res.runDir).allAnswers();
+    expect(answers.length).toBeGreaterThan(0);
+    expect(answers.filter((a) => a.error).map((a) => a.error)).toEqual([]);
+    for (const a of answers) {
+      expect(a.worker).toBe('laptop/w1');
+      expect(a.commands![0]).toBe('mcp:knode.search {"query":"林晓 澜舟科技","k":2}');
+      // the hits came back from the run's index over serve's lease-bound route, and the answer cites the first
+      const hits = JSON.parse(a.outputs![0]!.text) as { doc: string; passage: string; score: number }[];
+      expect(hits).toHaveLength(2);
+      expect(a.text).toContain(`[doc: ${hits[0].doc}]`);
+      expect(a.retrieved).toContain(hits[0].doc);
+    }
+    const audit = fs.readFileSync(path.join(root, '.knode', 'remote-audit.jsonl'), 'utf8');
+    expect(audit).toMatch(/"evalSession":"[0-9a-f-]{36}".*"tool":"search"/);
+  }, 120_000);
+
+  it('runs arm D on a worker: the wiki and the sources as its folder, knode\'s six retrieval tools through serve and no other', async () => {
+    const res = await runEval({ ...common, packs: [packDir], systems: ['agent-knode-full'], runDir: path.join(runs, 'agent-knode-full'), remote: remoteOpts(), reuseBuildsFrom: e2eDir });
+    const answers = new RunStore(res.runDir).allAnswers();
+    expect(answers.length).toBeGreaterThan(0);
+    expect(answers.filter((a) => a.error).map((a) => a.error)).toEqual([]);
+    for (const a of answers) {
+      expect(a.worker).toBe('laptop/w1');
+      expect(a.text).toMatch(/^folder: raw,wiki; knode_search: answered; knode_read: refused/);
+      expect(a.commands).toEqual(['mcp:knode.knode_search {"query":"林晓","k":2}']);
+      expect(a.outputs![0]!.chars).toBeGreaterThan(0);
+    }
+    const audit = fs.readFileSync(path.join(root, '.knode', 'remote-audit.jsonl'), 'utf8');
+    expect(audit).toMatch(/"tool":"knode_read".*"status":403/);
+  }, 120_000);
 
   it('revokes a session\'s token and stops it on the worker when the run is cancelled', async () => {
     await stopWorker(w1);

@@ -1058,6 +1058,36 @@ const SESSION_TIMEOUT_CAP_MS = 6 * 3_600_000;
 const sessionTimeoutMs = Math.min(SESSION_TIMEOUT_CAP_MS, Number(args.sessionTimeoutMs ?? SESSION_TIMEOUT_CAP_MS) || SESSION_TIMEOUT_CAP_MS);
 const SESSION_RENEW_MS = Math.max(1_000, Number(args.sessionRenewMs ?? 30_000));
 const STDERR_KEEP = 64 * 1024;
+// characters of a command's or MCP call's output an evaluation session sends back (docs/design/33 D7); the run keeps
+// the same head of each, with the full length (src/eval/trace.ts TOOL_OUTPUT_HEAD)
+const EVAL_OUTPUT_HEAD = 2000;
+
+/**
+ * An evaluation session's event line as it goes back to the run: a finished command or MCP call whose output is
+ * longer than the head the run keeps carries only that head, with the full length in `knode_output_chars`; every
+ * other line is sent as Codex wrote it. A run reads either (a worker from before this sends whole outputs).
+ */
+function cutEvalEvent(line) {
+  if (!line.startsWith('{') || !line.includes('"item.completed"')) return line;
+  let ev;
+  try {
+    ev = JSON.parse(line);
+  } catch {
+    return line;
+  }
+  const item = ev.item;
+  if (ev.type !== 'item.completed' || !item || typeof item !== 'object') return line;
+  if (item.type === 'command_execution' && typeof item.aggregated_output === 'string' && item.aggregated_output.length > EVAL_OUTPUT_HEAD) {
+    return JSON.stringify({ ...ev, item: { ...item, aggregated_output: item.aggregated_output.slice(0, EVAL_OUTPUT_HEAD), knode_output_chars: item.aggregated_output.length } });
+  }
+  if (item.type === 'mcp_tool_call' && item.result && Array.isArray(item.result.content)) {
+    const texts = item.result.content.map((b) => (b && typeof b.text === 'string' ? b.text : JSON.stringify(b)));
+    const text = texts.join('\n');
+    if (text.length <= EVAL_OUTPUT_HEAD) return line;
+    return JSON.stringify({ ...ev, item: { ...item, result: { content: [{ type: 'text', text: text.slice(0, EVAL_OUTPUT_HEAD) }] }, knode_output_chars: text.length } });
+  }
+  return line;
+}
 
 /** The session as this worker will run it, or why it will not. */
 function checkSession(task, family) {
@@ -1650,15 +1680,23 @@ async function evalSlot(slot, n) {
         const pinned = pinnedCatalog(catalog);
         const cmd = evalSessionCommand(sess, cwd, out, pinned);
         proc = runSessionProcess(cmd.bin, cmd.argv, sess.prompt, cwd, cmd.env, sess.timeoutMs, (text) => {
-          pendingOut += text;
           lineBuf += text;
           let nl;
           while ((nl = lineBuf.indexOf('\n')) >= 0) {
-            onLine(lineBuf.slice(0, nl));
+            const line = lineBuf.slice(0, nl);
+            onLine(line);
+            // whole lines go back, a long tool output cut to the head the run keeps
+            pendingOut += cutEvalEvent(line) + '\n';
             lineBuf = lineBuf.slice(nl + 1);
           }
         });
         result = await proc.done;
+        // a last line without its newline goes back as it is
+        if (lineBuf) {
+          onLine(lineBuf);
+          pendingOut += cutEvalEvent(lineBuf);
+          lineBuf = '';
+        }
         if (!pinned) await refreshCatalog(catalog);
         result.lastMessage = fs.existsSync(out) ? fs.readFileSync(out, 'utf8') : null;
       } catch (err) {
