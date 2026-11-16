@@ -21,7 +21,8 @@ describe('chained questions', () => {
     'Who handled the first P1 incident this year? Which project does that person own, and when did it launch?',
     'Who fixed INC-001? What project do they lead now?',
     'An engineer fixed INC-001 and later moved teams. When did their new project launch?',
-    'Which team owns Atlas? Who leads that team?',
+    // past tense: isListQuestion reads "which team owns" as a which-plural, so the list route keeps it
+    'Which team built Atlas? Who leads that team?',
   ];
   it.each(chains)('walks relations for %s', (q) => {
     expect(isChainQuestion(q), q).toBe(true);
@@ -51,5 +52,33 @@ describe('chained questions', () => {
     expect(classifyQuestion('Which P1 incidents did the Platform team have this year? Give each incident\'s ID.').kind).toBe('list');
     expect(classifyQuestion('How many incidents did the Platform team report? Which were they?').kind).toBe('aggregate');
     expect(classifyQuestion('风险R-01从提出到关闭经历了什么？按时间列出每一步（谁、哪一周）。').kind).toBe('timeline');
+  });
+
+  // found by an independent review (2026-11-16), each one sent to the walk and so losing its count or list
+  const reviewed: [string, string][] = [
+    ['宁德时代的人均产值是多少，它在行业里排第几', 'aggregate'], // 的人均 is not "the person who"
+    ['哪家公司今年营收最高，它的净利润是多少', 'aggregate'], // a superlative the count route computes
+    ['中国的人工智能公司有哪些，它们的估值一共多少', 'aggregate'], // a plural back to a list
+    ['给我讲一个关于茅台的故事，它最近股价怎么样', 'lookup'], // a storytelling 一个, and 它 is 茅台
+    ['List all incidents in 2025. Who fixed them?', 'list'], // they are the list
+  ];
+  it.each(reviewed)('is not a chain: %s', (q, kind) => {
+    expect(isChainQuestion(q), q).toBe(false);
+    expect(classifyQuestion(q)).toMatchObject({ kind });
+  });
+
+  it('gives a question that is both a list or count and a chain the route of whatever finds the thing', () => {
+    // the count is what identifies the company: the count route
+    expect(classifyQuestion('哪家银行的存款利率最高？那家银行的总部在哪？').kind).toBe('aggregate');
+    expect(classifyQuestion('Which suppliers delivered late last quarter? Who manages that supplier?').kind).toBe('list');
+    // the list or count is asked of the person the first part finds: the walk
+    expect(classifyQuestion('谁修复了INC-001？他今年还修复过哪些事故？')).toMatchObject({ kind: 'multihop', by: 'rule:chain' });
+    expect(classifyQuestion('Who fixed INC-001? How many incidents has that engineer fixed this year?')).toMatchObject({ kind: 'multihop', by: 'rule:chain' });
+  });
+
+  it('reads 那几个 as "those", not as a count', () => {
+    const q = '西湖边办公的那几个组的甲方里，送快递的那一家记作甲；甲头一回闹出来的故障记作乙；乙事后领了改进活儿的人记作丙；丙走后顶了其位置的人记作丁。问：丁叫什么名字？只回答这一问。';
+    expect(classifyQuestion(q)).toMatchObject({ kind: 'multihop', by: 'rule:chain' });
+    expect(classifyQuestion('平台组今年出了几起事故？').kind).toBe('aggregate');
   });
 });

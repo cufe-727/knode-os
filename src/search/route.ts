@@ -41,7 +41,7 @@ const TIMELINE = [
 ];
 
 const AGGREGATE = [
-  /多少|几[次个家条篇份项位年月天]|总共|一共|合计|总数|总额|平均|最多|最少|最高|最低|排名|占比|增长了?多少|频率/,
+  /多少|(?<![那这第])几[次个家条篇份项位年月天起名人种类款]|总共|一共|合计|总数|总额|平均|最多|最少|最高|最低|排名|占比|增长了?多少|频率/,
   /\bhow (many|much|often)\b|\bcount\b|\bnumber of\b|\btotal\b|\bsum\b|\baverage\b|\bmean\b|\b(most|least|highest|lowest|largest|smallest)\b|\brank(ed|ing)?\b|\bpercentage\b/i,
 ];
 
@@ -62,51 +62,119 @@ const MULTIHOP = [
 ];
 
 /**
- * A chain of questions: one part introduces something it does not name, by
- * asking for it ("是谁处理好的？", "哪个项目？", "who fixed INC-7?") or by
- * describing it ("提出风险R-03的人", "修复它的工程师", "一起由客户升级的事故",
- * "an engineer"), and a later clause asks about it by a back-reference ("此人",
- * "那个项目", "同一个客户", "新负责人", "that person", "their project"). The
- * benchmark's deep-hop and nonlexical-hop questions are all of this shape, and
- * none of them matched MULTIHOP, which wants the hops inside one noun phrase.
+ * A chain of questions: a later clause asks about something an earlier clause
+ * identifies only by description, so it has to be found first. The earlier
+ * part asks for it ("是谁处理好的？", "哪个项目？", "who fixed INC-7?"),
+ * describes it ("提出风险R-03的人", "一起由客户升级的事故", "an engineer"),
+ * or labels it ("…的那一家记作甲"); the later clause refers back ("此人",
+ * "那个项目", "同一个客户", "新负责人", "that person", "甲"). The benchmark's
+ * deep-hop and nonlexical-hop questions are all of this shape, and none of
+ * them matched MULTIHOP, which wants the hops inside one noun phrase.
  *
- * A back-reference to something the question names ("What is Atlas? When did
- * it launch?") is not a chain: "it", "its" and a bare "其" are not read as
- * back-references, and an introducer must come before the back-reference.
- * Which-questions over a plural ("which incidents … ? Which were they") are
- * lists, not chains.
+ * Not chains (an independent review, 2026-11-16, found each one walked):
+ *   - a pronoun for something the question names ("给我讲一个关于茅台的故事，
+ *     它…", "What is Atlas? When did it launch?"): a bare 他 / 她 / 它 / he /
+ *     she / they counts only after a clause that opens with the question word
+ *     (谁 / 哪家 … / who / which …), whose answer it then stands for; "it",
+ *     "its" and a bare 其 never count;
+ *   - a plural back to a list (它们, 他们, those, "List all incidents. Who
+ *     fixed them?"): they / them / their count only after a clause opening
+ *     with who, never after a list;
+ *   - an introducer that is part of a longer word (的人均, 的人工智能, 的人民币)
+ *     or an indefinite that is not a person or a thing to find ("讲一个关于…
+ *     的故事"): introducers are words, and 一个 / 一起 introduce only the
+ *     nouns the walk can find (人, 项目, 客户, 事故 …);
+ *   - a question whose list or count is what finds the thing ("哪家公司今年
+ *     营收最高，它的净利润…", "Which suppliers were late? Who manages that
+ *     supplier?"): the cue comes before the back-reference, and the count or
+ *     list route computes it. When the list or count is asked of the thing
+ *     found ("谁修复了INC-1？他今年修复过哪些事故？") it is a chain: the
+ *     enumeration would have nothing named to enumerate.
  */
+const ENTITY_NOUN = '(?:人|工程师|同事|员工|负责人|项目|客户|甲方|供应商|事故|故障|隐患|风险|公司|企业|产品|团队|小组|组|部门|合同|订单)';
+
+/** Introducers that may stand anywhere in an earlier clause; an explicit back-reference may follow any of them. */
 const CHAIN_INTRO = [
-  // an interrogative that asks for a person or a thing, not a time or an amount
-  /谁|哪(?:一)?[个位家起项名组件条]|哪些人/,
-  // an indefinite one, or a description of one: "一起由客户升级的事故", "提出R-03的人", "升级的那起事故", "换了负责人"
-  /[一另]\s*[起个位名家项件条](?![月日年周])|的(?:人|工程师|同事|员工|那位|那个|那起|那一起)|换了?\S{0,3}(?:负责人|owner)/,
-  /\bwho(?:m|se)?\b|\bwhich\s+(?!\w+s\b)(?!(?:is|are|was|were|has|have|had|does|do|did|will|would|can|could|this|these|those|of)\b)\w+|\b(?:a|an|another|some|one)\s+(?:[\w-]+\s+)?(?:person|engineer|employee|colleague|project|team|customer|client|incident|risk|company|owner|manager)\b/i,
+  // an interrogative that asks for one person or thing, not a time or an amount
+  /谁|哪(?:一)?[个位家起项名组件条](?!些)/,
+  // a description: "提出R-03的人" (not 的人均 / 的人工智能 / 的人民币 …), "修复它的工程师", "升级的那起事故", "换了负责人"
+  /的(?:人(?![均工民口才数员事气们类生物格性力体群权身脉选家心])|工程师|同事|员工|那位|那个|那起|那一起|那一家|那家)|换了?\S{0,3}负责人/,
+  // an indefinite one of what the walk can find: "一起由客户升级的事故", "另一个组", "一个项目" (not "一个关于茅台的故事")
+  new RegExp(`[一另]\\s*[起个位名家项件]\\s*(?:[^，。？?；;、\\s]{0,12}?的)?${ENTITY_NOUN}`),
+  /\bwho(?:m|se)?\b(?!\s+(?:are|were)\b)|\bwhich\s+(?!\w+s\b)(?!(?:is|are|was|were|has|have|had|does|do|did|will|would|can|could|this|these|those|of|one|ones)\b)\w+|\b(?:a|an|another|some|one)\s+(?:[\w-]+\s+)?(?:person|engineer|employee|colleague|project|team|customer|client|supplier|vendor|incident|risk|company|owner|manager)\b|\bthe\s+(?:person|engineer|employee|one|team|customer|owner|company)\s+(?:who|that|which)\b/i,
 ];
 
-/** A reference back to something an earlier clause introduced. */
+/**
+ * A clause that opens with the question word or with an indefinite one ("An
+ * engineer fixed…", "有一家公司…"): a bare pronoun in a later clause stands for
+ * its answer.
+ */
+const CHAIN_OPENING = [
+  new RegExp(`^\\s*(?:请问|那么|并且|而且|又|是|由)?\\s*(?:谁|哪(?:一)?[个位家名项件组](?!些)|有?[一另][个位名家起项件]\\s*(?:[^，。？?；;、\\s]{0,12}?的)?${ENTITY_NOUN})`),
+  /^\s*(?:and\s+|then\s+|so\s+)?(?:who(?:m)?\b(?!\s+(?:are|were)\b)|which\s+(?!\w+s\b)\w+|(?:a|an|another|one)\s+(?:[\w-]+\s+)?(?:person|engineer|employee|colleague|customer|client|supplier|vendor|company|owner|manager)\b)/i,
+];
+
+/** A reference back that names what it refers to as one thing: needs an introducer in an earlier clause. */
 const CHAIN_BACK = [
-  /此人|该人|这个人|那个人|这位|那位|(?<![其吉])[他她]|(?<!其)它|对方|同一(?![周天日月年时期次类种样]|[个位家起名项件]?(?:问题|事))|那(?:一)?[个位家起项名件条组]|该(?:项目|组|客户|事故|风险|员工|工程师|同事)|新(?:的)?负责人|前者|后者/,
-  /\b(?:that|this|the same)\s+(?:person|engineer|employee|colleague|project|team|customer|client|incident|risk|company|owner|manager|one)\b|\b(?:he|she|him|her|his|hers|they|them|their|theirs)\b|\bthe new (?:owner|lead|manager|assignee)\b|\bthe (?:former|latter)\b/i,
+  /此人|该人|这个人|那个人|这位|那位|对方|同一(?![周天日月年时期次类种样]|[个位家起名项件]?(?:问题|事))|那(?:一)?[个位家起项名件条组](?!些)|该(?:项目|组|客户|事故|风险|员工|工程师|同事|公司)|新(?:的)?负责人|前者|后者|其(?:位置|名下)/,
+  /\b(?:that|this|the same)\s+(?:person|engineer|employee|colleague|project|team|customer|client|supplier|vendor|incident|risk|company|owner|manager|one)\b|\bthe new (?:owner|lead|manager|assignee)\b|\bthe (?:former|latter)\b/i,
 ];
 
-/** Where a clause ends: a sentence or a comma, a dash, a semicolon, a line. */
-const CLAUSE_END = /[。？?！!；;，,—\n]|\.\s/g;
+/** A bare pronoun: stands for the answer of a clause that opened with the question word. */
+const CHAIN_PRONOUN = [/(?<![其吉])[他她](?!们)|(?<!其)它(?!们)/, /\b(?:he|she|him|her|his|hers|they|them|their|theirs)\b/i];
 
-/** True when a later clause refers back to something an earlier part introduced without naming it. */
-export function isChainQuestion(question: string): boolean {
-  const ends = [...question.matchAll(CLAUSE_END)].map((m) => (m.index ?? 0) + m[0].length);
-  if (ends.length === 0) return false;
-  for (const start of ends) {
-    const rest = question.slice(start);
-    for (const re of CHAIN_BACK) {
-      const m = re.exec(rest);
-      if (!m) continue;
-      const before = question.slice(0, start + (m.index ?? 0));
-      if (CHAIN_INTRO.some((intro) => intro.test(before))) return true;
+/** A label the question gives what it describes, used again later: "…的那一家记作甲；甲头一回…". */
+const CHAIN_LABEL = /(?:记作|记为|称作|称为|叫作)\s*[“"「]?([甲乙丙丁戊己庚辛壬癸]|[A-Z])(?![A-Za-z])/g;
+
+/** Where a clause ends: a sentence or a comma, a dash, a colon, a semicolon, a line. */
+const CLAUSE_END = /[。？?！!；;，,：:—\n]|\.\s/g;
+
+/** The characters of a question the router reads: a long paste is cut to its head and its tail, where the question is. */
+const HEAD_CHARS = 400;
+const TAIL_CHARS = 200;
+
+/** A question as the router reads it: at most HEAD_CHARS + TAIL_CHARS characters. */
+export function routedText(question: string): string {
+  return question.length <= HEAD_CHARS + TAIL_CHARS ? question : `${question.slice(0, HEAD_CHARS)}\n${question.slice(-TAIL_CHARS)}`;
+}
+
+/** Where the clause that refers back starts, or -1 when the question is no chain. */
+function chainAt(question: string): number {
+  const starts = [0];
+  for (const m of question.matchAll(CLAUSE_END)) starts.push((m.index ?? 0) + m[0].length);
+  const labels = new Set<string>();
+  let introduced = false;
+  let asked = false;
+  for (let i = 0; i < starts.length; i++) {
+    const at = starts[i];
+    const clause = question.slice(at, starts[i + 1] ?? question.length);
+    if (i > 0) {
+      const back = (introduced && CHAIN_BACK.some((re) => re.test(clause)))
+        || (asked && CHAIN_PRONOUN.some((re) => re.test(clause)))
+        || [...labels].some((l) => clause.includes(l));
+      if (back) return at;
     }
+    if (CHAIN_INTRO.some((re) => re.test(clause))) introduced = true;
+    if (CHAIN_OPENING.some((re) => re.test(clause))) asked = true;
+    for (const m of clause.matchAll(CHAIN_LABEL)) labels.add(m[1]);
   }
-  return false;
+  return -1;
+}
+
+/** A count or a list cue: what the aggregate and list routes compute. */
+function countsOrLists(text: string): boolean {
+  return AGGREGATE.some((re) => re.test(text)) || isListQuestion(text);
+}
+
+/**
+ * True when a later clause asks about something an earlier part identified
+ * only by description, and that part is not itself a count or a list (which
+ * the enumeration answers).
+ */
+export function isChainQuestion(question: string): boolean {
+  const text = routedText(question);
+  const at = chainAt(text);
+  return at >= 0 && !countsOrLists(text.slice(0, at));
 }
 
 const MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
