@@ -71,3 +71,18 @@ An independent review of main 7a299bf found confident wrong figures on finance-s
 Replaying the 10× pack with computed sets on showed the first numeric fix had lost a setting's history (a later change superseding a period-less value, a revert flagged as a correction, supersession chained across divisions by a merged setting code) and split "万" from "万用户"; fixed in b7e8682 with tests. The timeline cue 最早…最后 / first…last that routes "When did the first quarter results come out last year?" to the timeline came from 114f0c7 (route.ts) and is left to the routing work.
 
 At 113,000 entities (60,000 organisations, 40,000 people; one company with 400 reports and 10,000 claims, 2,000 customers; PGlite): a scoped list question computes its set in 350–440 ms, `ask` takes about 590 ms with computed sets on and 230 ms off; a question naming no scope exits in about 1 ms.
+
+## 4. After the re-check of 2026-11-16 (same branch, from 79793bf)
+
+The default (computed sets off, second round on) was judged safe to deploy; computed sets on were not. Fixed, one commit each with its test:
+
+- **Second round, words** (e147c30, d0b9d2e): missing words are `Intl.Segmenter`'s words (`questionWords`), less stop words, interrogatives, deictics, counting words, dates and numbers, and the kind of answer an interrogative asks for ("哪家公司"); never pairs of characters across a word boundary ("度毛"). A lookup reads further only from the entities it names, taking only what holds a word it missed; a chain also from the entities its first round reached, and only when it misses a word or its step has no passage or fact of its own.
+- **Second round, hubs** (39eb1a5): a hub's passages are ranked by the question (vector index) and by its missing words (keyword index) before any cut; the bounded pool of other mentions comes after.
+- **A figure is its claim's subject's** (eb4b34a): another organisation's figure stated in the scope's report is left out and said; a document whose organisations tie has no owner.
+- **Units** (0ee8e55): a unit is a scale and a base; one base compares across scales; a bare scale never merges two currencies.
+- **Periods** (9e13edc, c99b9a7): a window is tested on the period a figure covers, groups are by that period with its year, the scope's own figure keeps its parts' out, figures of one period that disagree are left out, and a total says how many of its window's periods it covers.
+- **Budget** (bb7d1bf): pre-emptive per statement; the sources read is indexed (5,000 customers: 1.1 s -> 0.33 s); today is the local date.
+- **Evaluation** (e435265): `KNODE_EVAL_ASK_COMPUTED` and `KNODE_EVAL_ASK_NOW` turn computed sets on for a run.
+
+`multihopAnswer` keeps the computed-sets gate; what a chain's set is scoped to is the relation walk's to decide.
+
