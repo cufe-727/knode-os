@@ -203,7 +203,7 @@ describe.skipIf(!ready)('an evaluation on PostgreSQL', () => {
     // where the index was, on the run and on the build, and nothing of it in the workspace's own directory
     expect(store.meta()!.database).toEqual({ kind: 'postgres', at: `postgres ${server.host === 'localhost' ? '127.0.0.1' : server.host}:${server.port}/${runDatabase}`, poolSize: 3 });
     const schema = schemaOf(first)!;
-    expect(schema).toMatch(/^eval_ws_[0-9a-f]{8}$/);
+    expect(schema).toMatch(/^eval_[a-z0-9_]+_[0-9a-f]{8}$/);
     const ws = runWorkspaceDir(first, 'fixture-life');
     expect(fs.existsSync(path.join(ws, '.knode', 'db'))).toBe(false);
     expect(await chunks(schema)).toBeGreaterThan(0);
@@ -219,7 +219,7 @@ describe.skipIf(!ready)('an evaluation on PostgreSQL', () => {
     const lines: string[] = [];
     const reuse = path.join(tmp, 'runs', 'pg-reuse');
     await runEval({ packs: [packDir], systems: ['knode-ask', 'agent-knode'], runDir: reuse, quota: false, suites: ['usage', 'update'], skipScoring: true, databaseUrl, reuseBuildsFrom: base, onProgress: (m) => lines.push(m), overrides: { chat: new ScriptedBackend(), judge, embedder } });
-    expect(lines.some((l) => /cloned schema eval_ws_\w+ into eval_ws_\w+/.test(l))).toBe(true);
+    expect(lines.some((l) => /cloned schema eval_\w+ into eval_\w+/.test(l))).toBe(true);
     const store = new RunStore(reuse);
     expect((store.allBuilds().find((b) => b.system === 'knode')!.notes as { reusedFrom?: string }).reusedFrom).toBe('pg-base');
     expect(store.allAnswers().filter((a) => a.error)).toEqual([]);
@@ -238,7 +238,7 @@ describe.skipIf(!ready)('an evaluation on PostgreSQL', () => {
     const lines: string[] = [];
     const again = path.join(tmp, 'runs', 'pg-again');
     await runEval({ packs: [packDir], systems: ['knode-ask'], runDir: again, quota: false, suites: ['usage'], skipScoring: true, databaseUrl, reuseBuildsFrom: gone, onProgress: (m) => lines.push(m), overrides: { chat: new ScriptedBackend(), judge, embedder } });
-    expect(lines.some((l) => /cannot reuse the build of pg-gone \(the reused build's schema eval_ws_\w+ is not in .*\): building afresh/.test(l))).toBe(true);
+    expect(lines.some((l) => /cannot reuse the build of pg-gone \(the reused build's schema eval_\w+ is not in .*\): building afresh/.test(l))).toBe(true);
     const store = new RunStore(again);
     const build = store.allBuilds().find((b) => b.system === 'knode')!;
     expect(build.ok).toBe(true);

@@ -211,3 +211,66 @@ describe('the evaluation viewer', () => {
     expect(() => assertViewerListeners({ ...rootCtx.config.server, host: '127.0.0.1', tls: null })).not.toThrow();
   });
 });
+
+/* -------------------------- on a PostgreSQL server -------------------------- */
+
+// reached as the other PostgreSQL tests reach one (KNODE_TEST_PG_HOST / _PORT / _USER / _PASSWORD), skipped without it
+const pgServer = {
+  host: process.env.KNODE_TEST_PG_HOST ?? '127.0.0.1',
+  port: Number(process.env.KNODE_TEST_PG_PORT ?? 5432),
+  user: process.env.KNODE_TEST_PG_USER ?? os.userInfo().username,
+  password: process.env.KNODE_TEST_PG_PASSWORD ?? '',
+};
+const pgDatabase = `knode_eval_test_${Math.floor(Date.now() / 1000)}_${crypto.randomBytes(4).toString('hex')}`;
+const pgUrl = `postgres://${encodeURIComponent(pgServer.user)}${pgServer.password ? `:${encodeURIComponent(pgServer.password)}` : ''}@${pgServer.host}:${pgServer.port}/${pgDatabase}`;
+async function adminQuery(sql: string): Promise<boolean> {
+  const { default: pg } = await import('pg');
+  const pool = new pg.Pool({ ...pgServer, user: pgServer.user || undefined, ...(pgServer.password ? {} : { password: undefined }), database: 'postgres', max: 1, connectionTimeoutMillis: 2000 });
+  try {
+    await pool.query(sql);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await pool.end().catch(() => {});
+  }
+}
+const pgReady = await adminQuery(`SELECT 1 FROM pg_available_extensions WHERE name = 'vector'`);
+
+describe.skipIf(!pgReady)('the evaluation viewer on PostgreSQL', () => {
+  const pgRoot = path.join(tmp, 'pg-root');
+  const pgRun = path.join(tmp, 'runs', 'viewed-pg');
+  afterAll(async () => {
+    await adminQuery(`DROP DATABASE IF EXISTS "${pgDatabase}" WITH (FORCE)`);
+  });
+
+  it('opens a build read-only on a pool that refuses writes, and leaves every table as it was', async () => {
+    await runEval({
+      packs: [packDir], systems: ['knode-ask'], runDir: pgRun, quota: false, suites: ['usage'], skipScoring: true, databaseUrl: pgUrl, evalRoot: pgRoot,
+      overrides: { chat: new ScriptedBackend(), judge: scriptedJudge(), embedder },
+    });
+    const build = runWorkspaceDir(pgRun, 'fixture-life');
+    expect(build.startsWith(pgRoot)).toBe(true);
+    const before = await digest(build);
+    const ctx = await createContext(pgRoot);
+    const reg = new WorkspaceContextRegistry(pgRoot, { templateConfig: () => ctx.config, evaluation: { owner: 'eval' } });
+    const viewer = createApp(ctx, () => {}, reg, { evaluation: true });
+    try {
+      const h = headers(path.basename(build));
+      const listed = await (await viewer.request('/api/workspaces', { headers: { 'x-knode-user': 'anyone' } })).json() as { evaluation: { openable: boolean; index: { kind: string; schema: string } } }[];
+      expect(listed[0].evaluation).toMatchObject({ openable: true, index: { kind: 'postgres' } });
+      for (const url of ['/api/stats', '/api/claims', '/api/entities', `/api/search?q=${encodeURIComponent('林晓')}`, `/api/graph?q=${encodeURIComponent('林晓')}`, '/api/file?path=raw/docs/email/2026-03-05.md']) {
+        expect((await viewer.request(url, { headers: h })).status, url).toBe(200);
+      }
+      expect((await viewer.request('/api/sync', { method: 'POST', headers: h })).status).toBe(409);
+      // the pool itself refuses a write
+      const opened = (await reg.openContexts())[0];
+      expect(opened.store.readOnly).toBe(true);
+      await expect(opened.store.query(`INSERT INTO meta (key, value) VALUES ('x', '1'::jsonb)`)).rejects.toThrow(/read-only transaction/);
+    } finally {
+      await reg.closeAll();
+      await ctx.store.close();
+    }
+    expect(await digest(build)).toEqual(before);
+  }, 300_000);
+});
