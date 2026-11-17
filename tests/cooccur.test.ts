@@ -226,3 +226,69 @@ describe('derived co-occurrence, against every mention row', () => {
     }
   });
 });
+
+/**
+ * The derivation reads the mentions of the seeds' documents. When the planner
+ * could not tell how many documents that is, it took the mentions for a
+ * handful of rows and joined them to themselves in a nested loop: on a copy of
+ * the finance workspace twelve entities took 200 s (497,439 mention rows
+ * expected as 3,307; 3.1 billion comparisons), against 2 s once it knew.
+ */
+describe('derived co-occurrence, planned on the size it reads', () => {
+  const dataDir = path.join(tmp, 'ws-plan');
+  const DOCS = 100;
+  let ctx: AppContext;
+
+  beforeAll(async () => {
+    initDataDir(dataDir);
+    for (let i = 0; i < DOCS; i++) {
+      const others = Array.from({ length: 12 }, (_, k) => `[[Peer ${(i * 7 + k) % 60}]]`).join(', ');
+      write(dataDir, `raw/docs/plan/n${i}.md`, `# note ${i}\n\n[[Hub]] is seen with ${others}.\n`);
+    }
+    ctx = await createContext(dataDir);
+    await sync(ctx, { llmGraph: false });
+    await ctx.store.exec('ANALYZE');
+  }, 120_000);
+  afterAll(async () => {
+    await ctx?.store.close();
+  });
+
+  it('gives the planner the number of mention rows it will read', async () => {
+    const { store } = ctx;
+    const seen: { sql: string; params?: unknown[] }[] = [];
+    const spy = { query: <T>(sql: string, params?: unknown[]) => { seen.push({ sql, params }); return store.query<T>(sql, params); } };
+    const co = await coOccurringEntities(spy as never, ['hub']);
+    expect(co.length).toBeGreaterThan(0);
+
+    const main = seen.find((s) => /doc_mentions AS MATERIALIZED/.test(s.sql))!;
+    expect(main).toBeDefined();
+    const [{ n: actual }] = await store.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM entity_mentions WHERE document_id IN (SELECT document_id FROM entity_mentions WHERE entity_id = 'hub')`,
+    );
+    expect(actual).toBeGreaterThan(DOCS * 10);
+    const [row] = await store.query<Record<string, unknown>>(`EXPLAIN (FORMAT JSON) ${main.sql}`, main.params);
+    const plan = Object.values(row)[0] as unknown;
+    const tree = (typeof plan === 'string' ? JSON.parse(plan) : plan) as { Plan: PlanNode }[];
+    interface PlanNode { 'Subplan Name'?: string; 'Plan Rows': number; Plans?: PlanNode[] }
+    const find = (n: PlanNode): PlanNode | null => n['Subplan Name'] === 'CTE doc_mentions' ? n : (n.Plans ?? []).map(find).find(Boolean) ?? null;
+    const cte = find(tree[0].Plan);
+    expect(cte).not.toBeNull();
+    // within a few times of what is there, not the handful an array of unknown length is taken for
+    expect(cte!['Plan Rows']).toBeGreaterThan(actual / 4);
+  });
+
+  it('finds the same neighbours as before', async () => {
+    const co = await coOccurringEntities(ctx.store, ['hub'], { perEntity: 5 });
+    expect(co).toHaveLength(5);
+    for (const x of co) {
+      expect(x.source).toBe('hub');
+      const [{ documents, chunks }] = await ctx.store.query<{ documents: number; chunks: number }>(
+        `SELECT count(DISTINCT a.document_id)::int AS documents, count(DISTINCT a.chunk_id) FILTER (WHERE a.chunk_id = b.chunk_id)::int AS chunks
+         FROM entity_mentions a JOIN entity_mentions b ON b.document_id = a.document_id WHERE a.entity_id = 'hub' AND b.entity_id = $1`,
+        [x.target],
+      );
+      expect({ documents: x.documents, chunks: x.chunks }).toEqual({ documents, chunks });
+    }
+    expect(co.map((x) => x.weight)).toEqual([...co.map((x) => x.weight)].sort((a, b) => b - a));
+  });
+});
