@@ -264,6 +264,7 @@ export function registerEvalCommands(program: Command): void {
     .option('--config-from <workspace>', 'knode workspace whose embedder the run uses (read-only)')
     .option('--database-url <url>', `PostgreSQL for knode's indexes, one schema per build (default: $KNODE_EVAL_DATABASE_URL, else the database knode_eval on the server the run's config names; PGlite when that config is on PGlite). Never the --config-from workspace's own database`)
     .option('--pglite', "keep knode's indexes in embedded PGlite whatever the config names (comparing with runs before 2026-11-14)")
+    .option('--root <dir>', 'the evaluation root a new run keeps its knode builds in, one workspace per pack (default: $KNODE_EVAL_ROOT, else ~/knode-eval/server; made on first use). A resumed run keeps its own')
     .option('--replay-only', "spend nothing: a model call or embedding not in the run's caches fails instead (rebuilding from another run's copied cache/; leave agents and scoring out)")
     .option('--embedding <kind>', 'workspace | local', 'workspace')
     .option('--embedding-endpoint <url>', "embed on this OpenAI-compatible endpoint (a local bge-m3, say) under the workspace embedder's identity, once it reproduces the vectors the run holds")
@@ -333,6 +334,7 @@ export function registerEvalCommands(program: Command): void {
         configFrom: opts.configFrom,
         databaseUrl: opts.databaseUrl,
         pglite: opts.pglite,
+        evalRoot: opts.root,
         replayOnly: opts.replayOnly,
         chatConnection: opts.chatConnection,
         embedding: opts.embedding,
@@ -378,9 +380,38 @@ export function registerEvalCommands(program: Command): void {
       // child processes and embedder timers can keep the loop alive after a run: it is over
       process.exit(process.exitCode ?? 0);
     });
+  const rootCmd = evalCmd.command('root').description('the evaluation root: where runs keep their knode builds as workspaces, and `serve --data <root>` shows them read-only (docs/design/35)');
+  rootCmd
+    .command('init')
+    .description('make the evaluation root (marked server.evaluation, viewer port 12040, nothing that runs or reaches out on its own); refused on a live root or its database')
+    .option('--root <dir>', 'where (default: $KNODE_EVAL_ROOT, else ~/knode-eval/server)')
+    .option('--config-from <workspace>', 'the live workspace whose database the root must not share (default: the default data root)')
+    .option('--database-url <url>', 'PostgreSQL for the root (default: $KNODE_EVAL_DATABASE_URL, else knode_eval on the server the live config names; PGlite when that config is on PGlite)')
+    .option('--pglite', 'keep the root on embedded PGlite')
+    .action(async (opts: { root?: string; configFrom?: string; databaseUrl?: string; pglite?: boolean }) => {
+      const { defaultConfig } = await import('../config.js');
+      const { evalDatabase } = await import('./database.js');
+      const { evalRootDir, initEvalRoot, liveDatabase } = await import('./root.js');
+      const live = liveDatabase(opts.configFrom);
+      const database = evalDatabase(opts.pglite ? { ...defaultConfig().database, kind: 'pglite' } : live, { url: opts.databaseUrl });
+      const dir = evalRootDir(opts.root);
+      const { root, created } = initEvalRoot(dir, { database, live, liveLabel: opts.configFrom ? `the --config-from workspace (${opts.configFrom})` : 'the default data root' });
+      console.log(`${created ? 'made' : 'already there:'} the evaluation root ${root.dir} (builds filed under "${root.owner}", index on ${root.config.database.kind})`);
+      if (created) console.log(`next: an account to sign in with (\`knode-os user add <name> --admin --data ${root.dir}\`), then \`knode-os serve --data ${root.dir}\``);
+    });
+  evalCmd
+    .command('adopt <runDir>')
+    .description("copy the knode builds of a run made before evaluation roots into the root as workspaces, for the viewer; the run directory is not changed (docs/design/35 §3)")
+    .option('--root <dir>', 'the evaluation root (default: $KNODE_EVAL_ROOT, else ~/knode-eval/server; made when missing)')
+    .option('--database-url <url>', 'the evaluation database, for a run on PostgreSQL whose workspaces name the URL by an environment variable')
+    .action(async (runDir: string, opts: { root?: string; databaseUrl?: string }) => {
+      const { adoptRun } = await import('./adopt.js');
+      const adopted = await adoptRun(runDir, { root: opts.root, url: opts.databaseUrl, log: (m) => console.log(`  ${m}`) });
+      console.log(`${adopted.length} build(s) of ${path.resolve(runDir)} in the evaluation root`);
+    });
   evalCmd
     .command('drop [runDir]')
-    .description("drop a run's knode indexes (its schemas in the evaluation database, or its embedded databases) and the tasks and results serve keeps for it; its records stay. --orphaned: drop the evaluation schemas whose run directory is gone")
+    .description("drop a run's knode builds — its workspaces in the evaluation root, folder and index, or (a run made before roots) its indexes — and the tasks and results serve keeps for it; its records stay. --orphaned: drop the evaluation schemas whose workspace directory is gone")
     .option('--database-url <url>', 'the evaluation database (default: what the run\'s workspaces name, or $KNODE_EVAL_DATABASE_URL)')
     .option('--config-from <workspace>', 'with --orphaned: the workspace whose server holds the evaluation database knode_eval')
     .option('--orphaned', 'drop evaluation schemas whose workspace directory no longer exists')

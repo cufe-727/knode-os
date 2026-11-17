@@ -223,6 +223,7 @@ function workspaceSchema(dataDir: string, cfg: DatabaseConfig): string {
 export async function openPostgres(dataDir: string, cfg: DatabaseConfig): Promise<Backend> {
   const database = postgresDatabaseName(cfg);
   const schema = workspaceSchema(dataDir, cfg);
+  if (cfg.readOnly) return openPostgresReadOnly(cfg, database, schema);
   try {
     await ensureDatabase(cfg, database);
   } catch (err) {
@@ -242,6 +243,27 @@ export async function openPostgres(dataDir: string, cfg: DatabaseConfig): Promis
     ...postgresPoolConfig(cfg, { database }),
     options: `-c search_path=${schema},public`,
   });
+  return new PostgresBackend(pool);
+}
+
+/**
+ * A workspace's schema opened for reading only (docs/design/35 §4): nothing
+ * is created — a missing database or schema is an error, not an empty index —
+ * and every connection of the pool starts with `default_transaction_read_only`
+ * on, so a statement that would write fails instead.
+ */
+async function openPostgresReadOnly(cfg: DatabaseConfig, database: string, schema: string): Promise<Backend> {
+  const pool = new pg.Pool({
+    ...postgresPoolConfig(cfg, { database }),
+    options: `-c search_path=${schema},public -c default_transaction_read_only=on`,
+  });
+  try {
+    const { rows } = await pool.query('SELECT 1 FROM pg_namespace WHERE nspname = $1', [schema]);
+    if (!rows.length) throw new Error(`no schema ${schema} in ${describePostgres(cfg)}/${database}: this workspace's index is not there`);
+  } catch (err) {
+    await pool.end().catch(() => undefined);
+    throw err;
+  }
   return new PostgresBackend(pool);
 }
 
@@ -591,12 +613,16 @@ export function pgliteOpenInProcess(dataDir: string, cfg?: Pick<DatabaseConfig, 
  * nothing to install or run. One open per database directory, across
  * processes (see above): a second open throws, naming who has it.
  */
-export async function openPglite(dataDir: string, cfg?: Pick<DatabaseConfig, 'path'>): Promise<Backend> {
+export async function openPglite(dataDir: string, cfg?: Pick<DatabaseConfig, 'path' | 'readOnly'>): Promise<Backend> {
   const dir = pgliteDir(dataDir, cfg);
+  // read-only: an index that is not there is not made (PGlite would create an empty one)
+  if (cfg?.readOnly && !fs.existsSync(path.join(dir, 'PG_VERSION'))) throw new Error(`no embedded index at ${dir}`);
   const claim = claimPgliteDir(dir);
   let db: PGlite;
   try {
     db = await PGlite.create(dir, { extensions: { vector } });
+    // the session's transactions read only: a statement that would write fails (docs/design/35 §4)
+    if (cfg?.readOnly) await db.exec('SET default_transaction_read_only = on');
   } catch (err) {
     claim.release();
     throw err;

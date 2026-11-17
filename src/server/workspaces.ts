@@ -7,6 +7,7 @@ import { initDataDir } from '../fs/datadir.js';
 import { syncWorkspaceSettings } from '../global-settings.js';
 import { loadPlugins } from '../plugins/loader.js';
 import { assertBackendDroppable, dropBackend } from '../store/backend.js';
+import { EvaluationView, evaluationListing, openEvaluationWorkspace } from './evaluation.js';
 
 export type WorkspaceKind = 'personal' | 'team';
 
@@ -24,6 +25,8 @@ export interface WorkspaceSummary {
   name: string;
   kind: 'personal';
   createdAt: string;
+  /** An evaluation build (docs/design/35): what built it, its state, its size, and whether the viewer can open it. */
+  evaluation?: EvaluationView;
 }
 
 export interface WorkspaceHeaders {
@@ -45,6 +48,12 @@ export interface WorkspaceContextRegistryOptions {
   templateConfig?: KnodeConfig | (() => KnodeConfig);
   log?: (msg: string) => void;
   onCreate?: (ctx: AppContext, scope: WorkspaceScope) => void | WorkspaceCleanup | Promise<void | WorkspaceCleanup>;
+  /**
+   * An evaluation root (docs/design/35 §4): every account sees the builds
+   * filed under `owner`, each opened read-only and changed in no way — no
+   * settings shared into it, no workspace made, cleared or repaired.
+   */
+  evaluation?: { owner: string };
 }
 
 interface WorkspaceManifest extends WorkspaceSummary {
@@ -184,7 +193,22 @@ export class WorkspaceContextRegistry {
     private readonly options: WorkspaceContextRegistryOptions = {},
   ) {}
 
+  /** An evaluation root's viewer: every scope is read from its owner's builds, and nothing is written. */
+  get evaluation(): { owner: string } | null {
+    return this.options.evaluation ?? null;
+  }
+
+  /** The folder a scope opens; in an evaluation root, the build of that id whoever asks. */
+  dataDirOf(scope: WorkspaceScope): string {
+    const ev = this.options.evaluation;
+    if (!ev) return workspaceDataDir(this.rootDataDir, scope);
+    if (scope.kind !== 'personal') throw new Error('an evaluation root has no Team workspaces');
+    return workspaceDataDir(this.rootDataDir, { ...scope, user: ev.owner, relativeDir: `users/${ev.owner}/workspaces/${scope.slug}` });
+  }
+
   listUserWorkspaces(username: string): WorkspaceSummary[] {
+    // an evaluation root lists its builds to everyone, grouped by run, and changes nothing to do it
+    if (this.options.evaluation) return evaluationListing(this.rootDataDir, this.options.evaluation.owner);
     const user = workspaceSlug(username, 'username');
     const parent = userWorkspacesDir(this.rootDataDir, user);
     fs.mkdirSync(parent, { recursive: true });
@@ -207,6 +231,7 @@ export class WorkspaceContextRegistry {
   }
 
   createUserWorkspace(username: string, workspaceName: string): WorkspaceSummary {
+    if (this.options.evaluation) throw new Error('evaluation workspaces are read-only: a run makes them');
     const user = workspaceSlug(username, 'username');
     const name = String(workspaceName || '').normalize('NFKC').trim();
     const id = workspaceSlug(name, 'workspace name');
@@ -236,7 +261,12 @@ export class WorkspaceContextRegistry {
   }
 
   get(scope: WorkspaceScope): Promise<AppContext> {
-    const dataDir = workspaceDataDir(this.rootDataDir, scope);
+    let dataDir: string;
+    try {
+      dataDir = this.dataDirOf(scope);
+    } catch (err) {
+      return Promise.reject(err);
+    }
     if (this.resetting.has(dataDir)) return Promise.reject(new Error('workspace is being cleared'));
     let pending = this.contexts.get(dataDir);
     if (!pending) {
@@ -253,7 +283,11 @@ export class WorkspaceContextRegistry {
   }
 
   exists(scope: WorkspaceScope): boolean {
-    return fs.existsSync(workspaceDataDir(this.rootDataDir, scope));
+    try {
+      return fs.existsSync(this.dataDirOf(scope));
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -261,6 +295,7 @@ export class WorkspaceContextRegistry {
    * storage backend keeps that — then recreate only its empty skeleton.
    */
   async reset(scope: WorkspaceScope): Promise<void> {
+    if (this.options.evaluation) throw new Error('evaluation workspaces are read-only: `knode-os eval drop <runDir>` removes a run\'s builds');
     const dataDir = workspaceDataDir(this.rootDataDir, scope);
     if (scope.kind === 'team' && dataDir !== path.resolve(this.rootDataDir, 'teams', scope.slug)) {
       throw new Error('clear a shared workspace from its owner\'s personal workspace, not its Team alias');
@@ -393,6 +428,13 @@ export class WorkspaceContextRegistry {
   }
 
   private async open(dataDir: string, scope: WorkspaceScope): Promise<AppContext> {
+    // a build of an evaluation root: opened read-only when it can be, never initialized, repaired or given settings
+    if (this.options.evaluation) {
+      const ctx = await openEvaluationWorkspace(this.rootDataDir, dataDir, this.template());
+      const cleanup = await this.options.onCreate?.(ctx, scope);
+      if (cleanup) this.cleanups.set(dataDir, cleanup);
+      return ctx;
+    }
     const configFile = path.join(dataDir, CONFIG_FILE);
     if (!fs.existsSync(configFile)) this.initialize(dataDir, scope, new Date().toISOString());
     // the server's settings, before anything reads the config

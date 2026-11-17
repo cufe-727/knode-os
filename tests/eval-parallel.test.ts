@@ -22,6 +22,7 @@ import { KNODE_AGENT_TOOLS, knodeAsk } from '../src/eval/systems/knode.js';
 import type { SystemEnv } from '../src/eval/systems/types.js';
 import { startToolHost } from '../src/eval/toolhost.js';
 import { ScriptedBackend, scriptedJudge } from './helpers/eval-scripted.js';
+import { runWorkspaceDir } from '../src/eval/root.js';
 
 /**
  * docs/design/31 D2: knode's answers run in parallel on one open context.
@@ -177,7 +178,7 @@ describe('answering leaves the index as built', () => {
       runId: 'no-tracking', pack, staged, workDir: new RunStore(base).workDir(pack.manifest.id, 'knode'), shim, meter,
       quota: new QuotaGuard({ enabled: false }), models: { model: '', buildEffort: 'low', answerEffort: 'medium' }, log: () => {},
     };
-    const ws = path.join(env.workDir, 'ws');
+    const ws = runWorkspaceDir(base, pack.manifest.id);
     const sys = knodeAsk();
     try {
       await sys.reopen!(env);
@@ -236,7 +237,7 @@ describe('answering leaves the index as built', () => {
 
 describe("the build's tool host", () => {
   it('lists exactly what the stdio server gives an agent, answers only its token, and leaves the index as built', async () => {
-    const ws = path.join(new RunStore(base).workDir('fixture-life', 'knode'), 'ws');
+    const ws = runWorkspaceDir(base, 'fixture-life');
     // `knode-os mcp` as a session used to start it, narrowed the way Codex's enabled_tools narrowed it
     const stdio = new Client({ name: 'test', version: '0' });
     await stdio.connect(new StdioClientTransport({

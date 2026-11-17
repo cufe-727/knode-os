@@ -77,6 +77,14 @@ export interface RunMeta {
   stuck?: { kind: string; label: string; family: string; model: string; eligible: string; pool: string | null; system: string | null; task: string | null; workers: string[]; lastError: string; at: string }[];
   /** Where knode's indexes lived (docs/design/31 D1): `pglite`, or `postgres` with its server and database (never credentials). Absent: a run from before, on PGlite. */
   database?: { kind: string; at: string; poolSize?: number };
+  /**
+   * Where the run keeps its knode builds (docs/design/35): `root`, one
+   * workspace per pack in the evaluation root `evalRoot`, each pointed at by
+   * `work/<pack>/<group>/workspace.json`. Absent: a run made before, its builds
+   * in `work/<pack>/<group>/ws`.
+   */
+  workspaces?: 'root';
+  evalRoot?: string;
   /** What knode-ask was asked beyond its defaults (KNODE_EVAL_ASK_COMPUTED / KNODE_EVAL_ASK_NOW, docs/design/34): `{}` when neither was set. Absent: no knode-ask in the run. */
   askOptions?: { computed?: boolean; now?: string };
 }

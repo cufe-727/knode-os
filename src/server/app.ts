@@ -181,6 +181,7 @@ import {
 import { queryEntities } from '../store/entities.js';
 import { WorkspaceContextRegistry, WorkspaceScope, resolveWorkspaceScope, workspaceDataDir } from './workspaces.js';
 import { loadOrCreateMcpToken, McpWorkspaceTokens, mountMcp } from './mcp-http.js';
+import { viewerToolOptions } from './evaluation.js';
 import { applyClaimMerge, listClaimMerges, unmergeClaim } from '../graph/claim-merge.js';
 import { applyMerge, listMerges, unmergeEntity } from '../graph/merge.js';
 import { auditDuplicateEntities } from '../graph/dedupe.js';
@@ -546,6 +547,21 @@ export const SEARCH_PARTIAL_HEADER = 'x-knode-search-partial';
  */
 export const SEARCH_ROUTE_K_MAX = 100;
 
+/** What every refused route of an evaluation root's viewer answers (409). */
+export const EVALUATION_READ_ONLY = 'evaluation workspaces are read-only';
+
+/** Requests that only read though they are not GETs: the viewer serves them. */
+const VIEWER_READING_POSTS = new Set(['/api/entities/mentions']);
+/** GETs that write (a report file, a subscription's cursor) or start work (research): the viewer refuses them. */
+const VIEWER_WRITING_GETS = [/^\/api\/learning$/, /^\/api\/research\//, /^\/api\/subscriptions\/[^/]+\/changes$/];
+
+/** Whether an evaluation root's viewer answers this request with 409 (docs/design/35 §4). */
+export function viewerRefuses(method: string, pathname: string): boolean {
+  const m = method.toUpperCase();
+  if (m === 'GET' || m === 'HEAD' || m === 'OPTIONS') return VIEWER_WRITING_GETS.some((re) => re.test(pathname));
+  return !VIEWER_READING_POSTS.has(pathname);
+}
+
 export function createApp(
   rootCtx: AppContext,
   log: (msg: string) => void = console.log,
@@ -558,6 +574,12 @@ export function createApp(
     mcpTokens?: McpWorkspaceTokens;
     /** An evaluation run's work offered to remote workers (src/work/eval.ts); absent outside `serve`. */
     evalWork?: EvalWork | null;
+    /**
+     * An evaluation root's viewer (docs/design/35 §4): every route that would
+     * change a workspace answers 409, `/mcp` has only the reading tools, and
+     * there is no remote API.
+     */
+    evaluation?: boolean;
   } = {},
 ) {
   const app = new Hono<AppEnv>();
@@ -579,6 +601,15 @@ export function createApp(
   /** 400 for a request the caller can fix (a bad time window, an unknown kind), 500 otherwise. */
   const status = (e: unknown, fallback: 400 | 500 = 500): 400 | 500 => (e instanceof TemporalError ? 400 : fallback);
   const requestCtx = (c: { get: (key: 'workspaceContext') => AppContext }) => c.get('workspaceContext');
+
+  // an evaluation root's builds are read, never changed: refused here, before a workspace is even opened
+  if (opts.evaluation) {
+    app.use('/api/*', async (c, next) => {
+      if (c.req.path.startsWith('/api/auth/')) return next();
+      if (viewerRefuses(c.req.method, c.req.path)) return c.json({ error: EVALUATION_READ_ONLY, reason: 'read-only' }, 409);
+      return next();
+    });
+  }
 
   app.use('/api/*', async (c, next) => {
     if (c.req.path === '/api/health' || c.req.path === '/api/workspaces' || c.req.path.startsWith('/api/auth/')) return next();
@@ -604,6 +635,8 @@ export function createApp(
       c.set('workspaceContext', await workspaceContexts.get(scope));
       await next();
     } catch (e) {
+      // an evaluation build the viewer does not open (still building, held by its run, another schema version): said, not a sign-in matter
+      if (opts.evaluation && e instanceof Error && / is not opened: /.test(e.message)) return c.json({ ...err(e), reason: 'not-opened' }, 409);
       return c.json(err(e), 401);
     }
   });
@@ -616,6 +649,8 @@ export function createApp(
       path: mcpConfig?.path || '/mcp',
       token: loadOrCreateMcpToken(rootCtx.dataDir),
       registry: workspaceContexts,
+      // the viewer's: reading tools only, and reading leaves no trace
+      ...(opts.evaluation ? { tools: viewerToolOptions() } : {}),
       workspaceTokens: opts.mcpTokens,
       // the data root's token names its workspace in headers: with sign-in on, an
       // account's own, or a team it has been given — as the REST routes hold it
@@ -631,7 +666,7 @@ export function createApp(
   }
 
   // labeling and knowledge access for other machines (src/remote), token-authenticated
-  if (rootCtx.config.server.remote?.enabled !== false) {
+  if (rootCtx.config.server.remote?.enabled !== false && !opts.evaluation) {
     mountRemoteApi(app, {
       rootDataDir: rootCtx.dataDir,
       registry: workspaceContexts,
