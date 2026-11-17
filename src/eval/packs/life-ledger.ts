@@ -209,7 +209,6 @@ export function ledgerEvents(c: LedgerContext, x: Extras): ScriptEvent[] {
     const [week, d] = at;
     out.push({ stress: 0, joy: 0, entities: [me], ...rest, week, id: `L${String(++n).padStart(3, '0')}-${e.cat}`, date: iso(D(week, d)) });
   };
-  const runnerKey = personKey(k, 'runner', lang);
 
   // runs: a weekday run most weeks, a weekend run that grows to the long run, rest after the knee goes
   for (let w = 1; w <= 12; w++) {

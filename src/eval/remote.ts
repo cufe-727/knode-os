@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { loadConfig } from '../config.js';
-import { effortFor, renderCliPrompt, speedFor } from '../llm/cli.js';
+import { effortFor, renderCliPrompt } from '../llm/cli.js';
 import { jsonFromReply, LlmClient } from '../llm/client.js';
 import type { ChatMessage } from '../llm/client.js';
 import type { CallUsage } from '../llm/usage.js';

@@ -3,7 +3,7 @@ import path from 'node:path';
 import { KnodeConfig } from '../config.js';
 import { AppContext } from '../context.js';
 import { safePath } from '../fs/files.js';
-import { agentWebCapable, DEFAULT_CONNECTION, ExecutorId, ResearchAgent, resolveAgentSpec, withModel } from '../research/agent.js';
+import { agentWebCapable, DEFAULT_CONNECTION, ExecutorId, ResearchAgent, resolveAgentSpec } from '../research/agent.js';
 import { AgentDefinition } from '../research/agents.js';
 import { Effort, Speed, WebAccess } from '../research/profile.js';
 import { clearCancelled, JobCancelledError, killAgentsFor, launchSession, SessionResult, transcriptPathFor } from '../research/launch.js';

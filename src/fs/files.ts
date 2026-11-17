@@ -101,10 +101,6 @@ export function listTree(dataDir: string, rel = '.', maxDepth = 8, opts: { dirsO
   return node;
 }
 
-export function readFileText(dataDir: string, rel: string): string {
-  return fs.readFileSync(safePath(dataDir, rel), 'utf8');
-}
-
 export interface CappedText {
   content: string;
   /** Size of the file on disk, not of `content`. */

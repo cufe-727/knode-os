@@ -11,6 +11,7 @@ import { EvalStoreBusyError, EvalTaskStore } from './eval-store.js';
 import type { EvalStoreOptions, StoredTask } from './eval-store.js';
 import { isEvalKind } from './kinds.js';
 import type { EvalKind, WorkKind } from './kinds.js';
+import { tokenMatches } from '../digest.js';
 
 /**
  * An evaluation run's model work as leased work (docs/design/27 §8).
@@ -280,12 +281,6 @@ export function evalFamilyOf(backend: string): EvalFamily | null {
 /** The backend a piece ran on, as records keep it: the CLI and the model, whoever's account. */
 export function evalBackend(agent: Pick<EvalAgent, 'family' | 'model'>): string {
   return `${agent.family}-cli:${agent.model || 'default'}`;
-}
-
-function tokenMatches(presented: string, expected: string): boolean {
-  const a = Buffer.from(presented);
-  const b = Buffer.from(expected);
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 /** Why a session's answer is the worker's failure (D11), or null when it is a result, however poor. */

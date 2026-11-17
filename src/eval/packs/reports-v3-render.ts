@@ -1,7 +1,7 @@
 import { cnNum } from './separation.js';
 import {
   corpusMonths, corpusQuarters, customerNameAt, dayOf, fmtMetric, iso, Lang, leadOf, metricActual, metricReported, monthName, ownerAt, progressAt,
-  projectNameAt, quarterKey, quarterName, rosterOf, V3_CORPUS, V3_WEEKS, V3Division, V3Incident, V3Person, V3Team, weekName, weeksOfMonth, weeksOfQuarter, ymKey,
+  projectNameAt, quarterName, rosterOf, V3_CORPUS, V3_WEEKS, V3Division, V3Incident, V3Team, weekName, weeksOfMonth, weeksOfQuarter, ymKey,
 } from './reports-v3.js';
 
 /**

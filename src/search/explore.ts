@@ -6,6 +6,7 @@ import { ResolvedScopeFilter } from '../store/resolver.js';
 import { Params } from '../store/temporal.js';
 import { ClaimItem, GraphEdge, SearchResult } from '../types.js';
 import { ExplainedSearch, queryTerms, SearchMode, searchExplained } from './search.js';
+import { likeEscape } from '../store/entities.js';
 
 /**
  * Explore → Search: what a query matches, channel by channel, so a person can
@@ -162,11 +163,6 @@ export async function exploreSearch(store: Store, embedder: EmbeddingProvider, q
 export interface SearchSuggestions {
   entities: { id: string; name: string; type: string; mentionCount: number; wikiPath: string | null; alias: string | null }[];
   documents: { path: string; title: string | null }[];
-}
-
-/** `%`, `_` and the escape itself as literal characters of a LIKE pattern. */
-function likeEscape(text: string): string {
-  return text.replace(/[\\%_]/g, (m) => `\\${m}`);
 }
 
 /**

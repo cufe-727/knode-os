@@ -2,7 +2,7 @@ import { LedgerEvent, readLedger } from './ledger.js';
 
 import { CitedFile, citedBy, CitingPage, citesOf } from './citations.js';
 import { readDeps } from './deps.js';
-import { scopesForKey, scopeById } from './scope.js';
+import { scopesForKey } from './scope.js';
 import { Store } from '../store/db.js';
 import { DepRow, ScopeRow } from './types.js';
 
@@ -113,10 +113,6 @@ export async function historyOf(store: Store, dataDir: string, target: string): 
     return false;
   });
   return { key, scopes, events };
-}
-
-export async function describeScope(store: Store, id: string): Promise<ScopeRow | null> {
-  return scopeById(store, id);
 }
 
 function iso(v: unknown): string {

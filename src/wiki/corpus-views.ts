@@ -1,4 +1,3 @@
-import crypto from 'node:crypto';
 import path from 'node:path';
 import { okfGenerated } from '../okf/index.js';
 import { excerptOf, lastOpener } from '../search/excerpts.js';
@@ -6,6 +5,7 @@ import { gramQuery, MATCH_INDEXES, matchIndexReady, termGrams } from '../store/g
 import { Store } from '../store/db.js';
 import { Params, toDateString, toIso } from '../store/temporal.js';
 import type { PageGenerator, PagePlan } from './pages.js';
+import { sha16 } from '../digest.js';
 
 /**
  * Pages across documents: what no entity page holds because it is about many
@@ -33,10 +33,6 @@ import type { PageGenerator, PagePlan } from './pages.js';
  */
 
 export type CorpusPageKind = 'mentions' | 'mentions_index' | 'timeline' | 'timelines_index' | 'disagreements' | 'disagreements_index';
-
-function sha16(value: unknown): string {
-  return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 16);
-}
 
 const meta = (view: CorpusPageKind, inputs: Record<string, string[]>) => ({ view, inputs });
 const oneLine = (s: string) => s.replace(/\s+/g, ' ').trim();
@@ -166,8 +162,6 @@ export async function familyOf(store: Store, root: { id: string; name: string })
   return rows.filter((e) => extendsName(e.name, root.name)).slice(0, MENTION_VARIANTS);
 }
 
-/** A paragraph opening a numbered unit, and the number it gives: 第二十五条, Article 12, § 4. */
-const UNIT_OPENER = /^\s*(?:第[一二三四五六七八九十百千零〇两\d]+条|article\s+\d+|art\.\s*\d+|§\s*\d+|section\s+\d+)/i;
 const LOCATOR = /^(?:…\s*)?(第[一二三四五六七八九十百千零〇两\d]+条|article\s+\d+|art\.\s*\d+|§\s*\d+|section\s+\d+)/i;
 
 interface MentionDoc { path: string; title: string; sha: string; names: [string, number][]; locators: string[]; excerpt: string | null }

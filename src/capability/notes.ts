@@ -42,10 +42,6 @@ export function declaredCapabilities(frontmatter: Record<string, unknown>): stri
   return [...new Set(stringList(raw))];
 }
 
-export function isCapabilityDoc(frontmatter: Record<string, unknown>): boolean {
-  return declaredCapabilities(frontmatter).length > 0;
-}
-
 /** Structured notes a capability document contributes, one per declared capability. */
 export function parseCapabilityNotes(parsed: ParsedMarkdown): CapabilityNoteDecl[] {
   const fm = parsed.frontmatter;

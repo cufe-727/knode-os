@@ -1,13 +1,10 @@
-import fs from 'node:fs';
 import path from 'node:path';
-import { safePath } from '../fs/files.js';
-import { archivedPath } from '../lineage/scope.js';
 import { Store } from '../store/db.js';
 import { toDateString } from '../store/temporal.js';
 import {
   datedClaimCounts, DISAGREEMENTS_PAGE, disagreements, extendsName, MENTION_BROAD_CORPUS, MENTION_BROAD_SHARE, MENTION_MIN_DOCS, rootsOf, timelinePeriods, usableName,
 } from './corpus-views.js';
-import { archivePage, PagesContext, regeneratePage } from './pages.js';
+import { PagesContext, regeneratePage, restoreArchived } from './pages.js';
 
 /**
  * Creating and refreshing the pages across documents (./corpus-views.ts):
@@ -28,16 +25,6 @@ export interface CorpusPassOptions {
 
 /** Mention pages a focused pass creates at most: each is a file the next sync indexes and embeds. */
 const MENTION_PAGES_PER_PASS = 30;
-
-/** Bring an archived copy back so human-written parts survive re-creation (as pages.ts does for its own). */
-function restoreArchived(dataDir: string, pagePath: string): void {
-  const abs = safePath(dataDir, pagePath);
-  const archived = safePath(dataDir, archivedPath(pagePath));
-  if (!fs.existsSync(abs) && fs.existsSync(archived)) {
-    fs.mkdirSync(path.dirname(abs), { recursive: true });
-    fs.renameSync(archived, abs);
-  }
-}
 
 async function livePages(store: Store, kind: string): Promise<string[]> {
   return (await store.query<{ path: string }>(`SELECT path FROM pages WHERE kind = $1 AND status <> 'archived' ORDER BY path`, [kind])).map((r) => r.path);

@@ -246,12 +246,3 @@ export function openZip(absPath: string): ZipArchive {
   }
 }
 
-/** Open, use, close. */
-export function withZip<T>(absPath: string, use: (zip: ZipArchive) => T): T {
-  const zip = openZip(absPath);
-  try {
-    return use(zip);
-  } finally {
-    zip.close();
-  }
-}

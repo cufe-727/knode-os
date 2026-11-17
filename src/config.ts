@@ -7,7 +7,6 @@ import { agentFileNames, isValidAgentName, readAgentFile, renameProfileAgents, u
 
 /** The embedding providers knode-os ships with; a plugin may register more (docs/design/11). */
 export const BUILTIN_EMBEDDING_PROVIDERS = ['openai', 'ark-multimodal', 'local'] as const;
-export type BuiltinEmbeddingProvider = (typeof BUILTIN_EMBEDDING_PROVIDERS)[number];
 
 export interface EmbeddingConfig {
   /**

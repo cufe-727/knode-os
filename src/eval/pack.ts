@@ -276,6 +276,28 @@ export function seededKey(seed: string | number, id: string): string {
   return crypto.createHash('sha256').update(`${seed}|${id}`).digest('hex');
 }
 
+/** A ten-character id from its parts: the same parts give the same id. */
+export function shortHash(...parts: string[]): string {
+  return crypto.createHash('sha1').update(parts.join('|')).digest('hex').slice(0, 10);
+}
+
+/** Items in the order a seed gives them. */
+export function bySeed<T>(items: T[], seed: string | number, key: (t: T) => string): T[] {
+  return [...items].sort((a, b) => seededKey(seed, key(a)).localeCompare(seededKey(seed, key(b))));
+}
+
+/** Items in a seeded round-robin over strata: every stratum is drawn once before any is drawn twice. */
+export function stratified<T>(items: T[], stratum: (t: T) => string, key: (t: T) => string, seed: string | number): T[] {
+  const groups = new Map<string, T[]>();
+  for (const t of items) (groups.get(stratum(t)) ?? groups.set(stratum(t), []).get(stratum(t))!).push(t);
+  const lists = [...groups.entries()]
+    .sort((a, b) => seededKey(seed, a[0]).localeCompare(seededKey(seed, b[0])))
+    .map(([, list]) => list.sort((a, b) => seededKey(seed, key(a)).localeCompare(seededKey(seed, key(b)))));
+  const out: T[] = [];
+  for (let round = 0; out.length < items.length; round++) for (const l of lists) if (round < l.length) out.push(l[round]);
+  return out;
+}
+
 export interface StagedCorpus {
   /** The directory a system reads — a fresh temp directory with nothing else in its parent. */
   dir: string;
@@ -345,16 +367,6 @@ export function stageUpdate(pack: LoadedPack, staged: StagedCorpus, batch: strin
     if (!present.has(f)) staged.docs.push({ path: f, kind: 'update' });
   }
   return files;
-}
-
-/** Copy planted injection documents into a staged corpus (robustness suite). */
-export function stageInjections(pack: LoadedPack, staged: StagedCorpus): string[] {
-  for (const f of pack.injections) {
-    const to = path.join(staged.dir, f);
-    fs.mkdirSync(path.dirname(to), { recursive: true });
-    fs.copyFileSync(path.join(pack.dir, 'injections', f), to);
-  }
-  return pack.injections;
 }
 
 /** Bytes a directory takes, recursively. */

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { INTENTS_DIR } from '../fs/layout.js';
-import { readMatter } from '../markdown.js';
+import { readMatter, stringList } from '../markdown.js';
 
 /**
  * Intent specs — the configurable half of the Context Compiler.
@@ -88,19 +88,13 @@ export function parseYaml(text: string): Record<string, unknown> {
   }
 }
 
-function strings(v: unknown): string[] {
-  if (typeof v === 'string') return v.trim() ? [v.trim()] : [];
-  if (!Array.isArray(v)) return [];
-  return v.map(String).map((s) => s.trim()).filter(Boolean);
-}
-
 function parseSlot(raw: unknown): SlotSpec | null {
   if (!raw || typeof raw !== 'object') return null;
   const o = raw as Record<string, unknown>;
   const id = typeof o.id === 'string' ? o.id.trim() : '';
   if (!id) return null;
   const fill = o.fill === 'local' || o.fill === 'live' || o.fill === 'either' ? o.fill : 'either';
-  const from = strings(o.from).filter((f): f is SlotSpec['from'][number] =>
+  const from = stringList(o.from).filter((f): f is SlotSpec['from'][number] =>
     ['entity', 'claims', 'documents', 'graph', 'datasets'].includes(f));
   const freshness = Number(o.freshnessSeconds ?? o.freshness_seconds);
   return {
@@ -109,10 +103,10 @@ function parseSlot(raw: unknown): SlotSpec | null {
     fill,
     description: typeof o.description === 'string' ? o.description : undefined,
     from: from.length > 0 ? from : ['documents'],
-    claimTypes: strings(o.claimTypes ?? o.claim_types),
-    capabilityKinds: strings(o.capabilityKinds ?? o.capability_kinds)
+    claimTypes: stringList(o.claimTypes ?? o.claim_types),
+    capabilityKinds: stringList(o.capabilityKinds ?? o.capability_kinds)
       .filter((k): k is NonNullable<SlotSpec['capabilityKinds']>[number] => ['table', 'endpoint', 'metric', 'tool'].includes(k)),
-    capabilityHints: strings(o.capabilityHints ?? o.capability_hints),
+    capabilityHints: stringList(o.capabilityHints ?? o.capability_hints),
     freshnessSeconds: Number.isFinite(freshness) && freshness > 0 ? freshness : null,
   };
 }
@@ -133,9 +127,9 @@ export function parseIntent(text: string, relPath: string): IntentSpec | null {
     title: typeof fm.title === 'string' ? fm.title : id,
     path: relPath,
     match: {
-      keywords: strings(match.keywords),
-      patterns: strings(match.patterns),
-      entityTypes: strings(match.entityTypes ?? match.entity_types),
+      keywords: stringList(match.keywords),
+      patterns: stringList(match.patterns),
+      entityTypes: stringList(match.entityTypes ?? match.entity_types),
     },
     slots,
     budget: {

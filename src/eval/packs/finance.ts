@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { seededKey } from '../pack.js';
+import { stratified } from '../pack.js';
 import type { CorpusDoc, Task, TaskType } from '../types.js';
 import { finishDocpack } from './docpack.js';
 import { hfRows } from './fetch.js';
@@ -25,18 +25,6 @@ import { PackWriter } from './writer.js';
  */
 
 type Doc = CorpusDoc & { text: string };
-
-/** Items in a seeded round-robin over strata: every stratum is drawn once before any is drawn twice. */
-function stratified<T>(items: T[], stratum: (t: T) => string, key: (t: T) => string, seed: string | number): T[] {
-  const groups = new Map<string, T[]>();
-  for (const t of items) (groups.get(stratum(t)) ?? groups.set(stratum(t), []).get(stratum(t))!).push(t);
-  const lists = [...groups.entries()]
-    .sort((a, b) => seededKey(seed, a[0]).localeCompare(seededKey(seed, b[0])))
-    .map(([, list]) => list.sort((a, b) => seededKey(seed, key(a)).localeCompare(seededKey(seed, key(b)))));
-  const out: T[] = [];
-  for (let round = 0; out.length < items.length; round++) for (const l of lists) if (round < l.length) out.push(l[round]);
-  return out;
-}
 
 /* -------------------------------- finance-us -------------------------------- */
 

@@ -24,14 +24,12 @@ export type Lang = 'zh' | 'en';
 
 export const V3_WEEKS = 130;
 export const V3_CORPUS = 122;
-export const V3_BATCHES = 4;
 const START = Date.UTC(2024, 0, 1); // Monday of 2024-W01
 const DAY = 86_400_000;
 
 export const dayOf = (week: number, d = 0) => new Date(START + ((week - 1) * 7 + d) * DAY);
 export const iso = (d: Date) => d.toISOString().slice(0, 10);
 export const weeksUpTo = (n: number) => Array.from({ length: n }, (_, i) => i + 1);
-export const inCorpus = (w: number) => w >= 1 && w <= V3_CORPUS;
 
 /** The ISO week of a report (by its Thursday, as ISO 8601 counts). */
 export function isoWeek(week: number): { year: number; week: number } {
@@ -620,4 +618,3 @@ export const metricActual = (s: V3Division, team: string, week: number) => s.tea
 /** A team's weekly figure as its own report gave it. */
 export const metricReported = (s: V3Division, team: string, week: number) => s.metricFixes.find((f) => f.team === team && f.week === week)?.reported ?? metricActual(s, team, week);
 export const fmtMetric = (lang: Lang, t: V3Team, v: number) => (t.metric.unit === '%' ? `${v}%` : lang === 'zh' ? `${v}万` : `${v}k`);
-export const personByName = (s: V3Division, name: string, team?: string) => s.people.find((p) => p.name === name && (!team || p.team === team || p.move?.team === team));

@@ -19,14 +19,6 @@ export function emptyPropagation(): Propagation {
   return { dirtyPages: [], archivedPages: [], staleSuggestions: [] };
 }
 
-export function mergePropagation(a: Propagation, b: Propagation): Propagation {
-  return {
-    dirtyPages: [...new Set([...a.dirtyPages, ...b.dirtyPages])],
-    archivedPages: [...new Set([...a.archivedPages, ...b.archivedPages])],
-    staleSuggestions: [...new Set([...a.staleSuggestions, ...b.staleSuggestions])],
-  };
-}
-
 export async function readDeps(q: Queryable, artifact: { kind: ArtifactKind; id: string }): Promise<DepRow[]> {
   return q.query<DepRow>(
     `SELECT input_kind, input_id, required, input_sha FROM deps WHERE artifact_kind = $1 AND artifact_id = $2 ORDER BY input_kind, input_id`,

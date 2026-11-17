@@ -14,7 +14,6 @@ import { ScopeKind } from './types.js';
  * contain document content — only keys, hashes and ids.
  */
 
-export const LEDGER_DIR = 'ledger';
 export const LEDGER_EVENTS = 'ledger/events.jsonl';
 
 export interface LedgerScopeRef {

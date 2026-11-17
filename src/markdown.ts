@@ -146,3 +146,10 @@ export function markdownMeta(head: string): MarkdownMeta | null {
   if (tags.length) meta.tags = tags.slice(0, 20);
   return Object.keys(meta).length ? meta : null;
 }
+
+/** A frontmatter or YAML value as a list of non-empty trimmed strings: one string is a list of one. */
+export function stringList(v: unknown): string[] {
+  if (typeof v === 'string') return v.trim() ? [v.trim()] : [];
+  if (!Array.isArray(v)) return [];
+  return v.map(String).map((s) => s.trim()).filter(Boolean);
+}

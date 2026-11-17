@@ -4,7 +4,7 @@ import path from 'node:path';
 import { cliCommand, cliFailureText, CODEX_SERVICES_OFF, cursorModel, effortFor, readCursorStream, resolveExecutable, runProcess, speedFor } from '../llm/cli.js';
 import { catalogArgs, codexCatalog, configuredCodexModel, withCodexCatalog } from '../llm/codex-catalog.js';
 import { externalDirs, opencodeConfig, OpencodeAgentConfig, opencodeEffort, opencodeEnv, opencodeModelRef, OpencodeRule, opencodeRunArgs, readOpencodeStream } from '../llm/opencode.js';
-import { AgentProvider, CliAgent, CliEndpoint, ResearchAgent } from './agent.js';
+import { CliAgent, CliEndpoint, ResearchAgent } from './agent.js';
 import { Effort, Freshness, NativeAgentSpec, Speed } from './profile.js';
 import type { ExtraMcpServer } from './sources.js';
 import { McpEndpoint, RunWorkspace } from './workspace.js';
@@ -320,10 +320,6 @@ export function sessionEnv(input: { mcp: McpEndpoint; jobId: string; outputPath:
     KNODE_WS_ID: input.mcp.headers['x-knode-workspace-id'] ?? '',
     KNODE_WS_NAME: input.mcp.headers['x-knode-workspace-name'] ?? '',
   };
-}
-
-export function agentEnv(input: LaunchInput): NodeJS.ProcessEnv {
-  return sessionEnv({ mcp: input.mcp, jobId: input.jobId, outputPath: input.ws.outputPath, worksetId: input.ws.worksetId, extraMcp: input.extraMcp });
 }
 
 /* ------------------------------------------------------------------ adapters */

@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import pg from 'pg';
 import { DatabaseConfig, defaultConfig, resolveSecret } from '../config.js';
-import { dropBackend, postgresDatabaseName, postgresPoolConfig, schemaNameFor } from '../store/backend.js';
+import { dropBackend, postgresDatabaseName, postgresPoolConfig, schemaNameFor, quoteIdent } from '../store/backend.js';
 import { Store } from '../store/db.js';
 
 /**
@@ -134,10 +134,6 @@ export function evalSchema(ws: string, cfg: DatabaseConfig): string {
   return schemaNameFor(ws, cfg.schemaPrefix || 'ws');
 }
 
-function quote(name: string): string {
-  return `"${name.replace(/"/g, '""')}"`;
-}
-
 async function withPool<T>(cfg: DatabaseConfig, fn: (pool: pg.Pool) => Promise<T>): Promise<T> {
   const pool = new pg.Pool(postgresPoolConfig(cfg, { database: postgresDatabaseName(cfg), max: 1 }));
   try {
@@ -150,7 +146,7 @@ async function withPool<T>(cfg: DatabaseConfig, fn: (pool: pg.Pool) => Promise<T
 /** Label a build's schema with its workspace directory (the orphan listing reads it back). */
 export async function markSchema(cfg: DatabaseConfig, ws: string): Promise<string> {
   const schema = evalSchema(ws, cfg);
-  await withPool(cfg, (pool) => pool.query(`COMMENT ON SCHEMA ${quote(schema)} IS ${pg.escapeLiteral(SCHEMA_COMMENT + path.resolve(ws))}`));
+  await withPool(cfg, (pool) => pool.query(`COMMENT ON SCHEMA ${quoteIdent(schema)} IS ${pg.escapeLiteral(SCHEMA_COMMENT + path.resolve(ws))}`));
   return schema;
 }
 
@@ -173,7 +169,7 @@ export async function cloneSchema(cfg: DatabaseConfig, from: string, ws: string,
   if (from === to) throw new Error(`the reused build's schema ${from} is this workspace's own`);
   const exists = await withPool(cfg, async (pool) => {
     const { rows } = await pool.query('SELECT 1 FROM pg_namespace WHERE nspname = $1', [from]);
-    if (rows.length) await pool.query(`DROP SCHEMA IF EXISTS ${quote(to)} CASCADE`);
+    if (rows.length) await pool.query(`DROP SCHEMA IF EXISTS ${quoteIdent(to)} CASCADE`);
     return rows.length > 0;
   });
   if (!exists) throw new Error(`the reused build's schema ${from} is not in ${describeDatabase(cfg)}`);
@@ -210,23 +206,23 @@ export async function cloneSchema(cfg: DatabaseConfig, from: string, ws: string,
     }
     let rows = 0;
     await client.query('BEGIN');
-    await client.query(`TRUNCATE ${mine.map((t) => `${quote(to)}.${quote(t)}`).join(', ')}`);
+    await client.query(`TRUNCATE ${mine.map((t) => `${quoteIdent(to)}.${quoteIdent(t)}`).join(', ')}`);
     for (const t of order) {
       const cols = (await client.query<{ name: string; identity: string }>(
         `SELECT a.attname AS name, a.attidentity AS identity FROM pg_attribute a
          WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = '' ORDER BY a.attnum`,
-        [`${quote(to)}.${quote(t)}`],
+        [`${quoteIdent(to)}.${quoteIdent(t)}`],
       )).rows;
-      const list = cols.map((c) => quote(c.name)).join(', ');
+      const list = cols.map((c) => quoteIdent(c.name)).join(', ');
       const overriding = cols.some((c) => c.identity === 'a') ? ' OVERRIDING SYSTEM VALUE' : '';
-      const r = await client.query(`INSERT INTO ${quote(to)}.${quote(t)} (${list})${overriding} SELECT ${list} FROM ${quote(from)}.${quote(t)}`);
+      const r = await client.query(`INSERT INTO ${quoteIdent(to)}.${quoteIdent(t)} (${list})${overriding} SELECT ${list} FROM ${quoteIdent(from)}.${quoteIdent(t)}`);
       rows += r.rowCount ?? 0;
     }
     for (const { name } of (await client.query<{ name: string }>(`SELECT sequencename AS name FROM pg_sequences WHERE schemaname = $1`, [from])).rows) {
-      const [s] = (await client.query<{ last_value: string | null; is_called: boolean }>(`SELECT last_value, is_called FROM ${quote(from)}.${quote(name)}`)).rows;
-      if (s?.last_value != null) await client.query('SELECT setval($1::regclass, $2, $3)', [`${quote(to)}.${quote(name)}`, s.last_value, s.is_called]);
+      const [s] = (await client.query<{ last_value: string | null; is_called: boolean }>(`SELECT last_value, is_called FROM ${quoteIdent(from)}.${quoteIdent(name)}`)).rows;
+      if (s?.last_value != null) await client.query('SELECT setval($1::regclass, $2, $3)', [`${quoteIdent(to)}.${quoteIdent(name)}`, s.last_value, s.is_called]);
     }
-    await client.query(`COMMENT ON SCHEMA ${quote(to)} IS ${pg.escapeLiteral(SCHEMA_COMMENT + path.resolve(ws))}`);
+    await client.query(`COMMENT ON SCHEMA ${quoteIdent(to)} IS ${pg.escapeLiteral(SCHEMA_COMMENT + path.resolve(ws))}`);
     await client.query('COMMIT');
     return { schema: to, tables: order.length, rows };
   } catch (err) {
@@ -261,7 +257,7 @@ export async function orphanedEvalSchemas(cfg: DatabaseConfig): Promise<EvalSche
 /** Drop one evaluation schema by name, refusing any other. */
 export async function dropEvalSchema(cfg: DatabaseConfig, schema: string): Promise<void> {
   if (!isEvalSchema(schema)) throw new Error(`refusing to drop ${schema}: not an evaluation schema`);
-  await withPool(cfg, (pool) => pool.query(`DROP SCHEMA IF EXISTS ${quote(schema)} CASCADE`));
+  await withPool(cfg, (pool) => pool.query(`DROP SCHEMA IF EXISTS ${quoteIdent(schema)} CASCADE`));
 }
 
 /**

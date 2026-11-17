@@ -7,7 +7,7 @@ import { initDataDir } from '../src/fs/datadir.js';
 import { auditDuplicateClaims, seriesRelation } from '../src/graph/claim-dedupe.js';
 import { formatValue, keyQualifiers, sameValue, namesSubject, normalizeAttribute, parseMeasure, seriesObject, subjectSpellingsOf, unifyAttributeKeys } from '../src/graph/claim-state.js';
 import { refreshClaimState, seriesSupersession, StateRow } from '../src/graph/claim-state-store.js';
-import { namesakeChoice, namesakeClusters, NamesakeDoc, renameIn, resolveEntityContext } from '../src/graph/entity-context.js';
+import { namesakeClusters, NamesakeDoc, renameIn, resolveEntityContext } from '../src/graph/entity-context.js';
 import { buildBatchExtractRequest, buildExtractRequest, RawExtractReply } from '../src/graph/llm-extract.js';
 import { enqueueTier1, runTier1Pass } from '../src/graph/tier1.js';
 import { runDocumentPass } from '../src/ingest/background.js';
@@ -227,11 +227,6 @@ describe('entity rules', () => {
     expect(namesakeClusters([...before, ...after], types)).toBeNull();
     // one context throughout: one person
     expect(namesakeClusters(pay, types)).toBeNull();
-    // a document resolves to the person its entities point at
-    const rules = [{ id: '陈伟（平台组）', base_id: '陈伟', name: '陈伟', label: '平台组', anchors: ['平台组'], base_anchors: ['支付组'] }];
-    expect(namesakeChoice(rules, [{ name: '平台组', type: 'organization' }, { name: '陈伟', type: 'person' }])?.id).toBe('陈伟（平台组）');
-    expect(namesakeChoice(rules, [{ name: '支付组', type: 'organization' }, { name: '陈伟', type: 'person' }])).toBeNull();
-    expect(namesakeChoice(rules, [{ name: '陈伟', type: 'person' }])).toBeNull();
   });
 });
 

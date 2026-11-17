@@ -15,7 +15,7 @@ import { refineWiki } from '../../wiki/refine.js';
 import { isolatedCopy, runAgent } from '../agent.js';
 import { formatTag } from '../meter.js';
 import { currentRemote } from '../placement.js';
-import { dirBytes, listFiles } from '../pack.js';
+import { listFiles } from '../pack.js';
 import { citationsIn } from '../prompts.js';
 import type { Citation, KnowledgeUnit } from '../types.js';
 import { AGENT_BRIEF, armBrief } from './agents.js';
@@ -26,7 +26,6 @@ import { recordAgent, shimClient, SystemEnv, SystemUnderTest } from './types.js'
 import { evalTempDir } from '../tmp.js';
 import { startToolHost, ToolHost } from '../toolhost.js';
 import { cloneSchema, describeDatabase, dropEvalWorkspace, evalDatabase, markSchema, storableDatabase } from '../database.js';
-import { embeddingIdentity } from '../../config.js';
 import { assertNoLeak } from '../leak.js';
 import { claimWriter, EvalRootPlacement, EvaluationInfo, newEvalManifest, placeEvalWorkspace, readEvalManifest, readWorkspacePointer, releaseWriter, updateEvaluation, writeEvalManifest, writeWorkspacePointer } from '../root.js';
 
@@ -991,7 +990,3 @@ async function exportUnits(s: KnodeState): Promise<KnowledgeUnit[]> {
   return units;
 }
 
-/** Bytes of the knowledge base a knode build left (index, wiki and sidecars, not the copied sources). */
-export function knodeKbBytes(ws: string): number {
-  return dirBytes(path.join(ws, '.knode')) + dirBytes(path.join(ws, 'wiki')) + dirBytes(path.join(ws, '.sidecar'));
-}

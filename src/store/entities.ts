@@ -88,7 +88,7 @@ export function extractorFamily(extractor: string): string {
 }
 
 /** `%`, `_` and the escape itself as literal characters of a LIKE pattern. */
-function likeEscape(text: string): string {
+export function likeEscape(text: string): string {
   return text.replace(/[\\%_]/g, (m) => `\\${m}`);
 }
 

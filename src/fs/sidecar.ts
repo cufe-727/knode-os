@@ -355,10 +355,6 @@ export function readSidecarFromDir(absDir: string): Sidecar | null {
   return { version: SIDECAR_VERSION, meta, extraction: { tier0, tier1 }, usage };
 }
 
-export function readSidecar(dataDir: string, key: string): Sidecar | null {
-  return readSidecarFromDir(sidecarDir(dataDir, key));
-}
-
 /**
  * Remove everything this sidecar owns. Only the known files and `views/` are
  * deleted, so a nested sidecar of a longer key (`raw/docs/notes` next to
@@ -558,10 +554,6 @@ export function writeSourceSummaryPart(dataDir: string, key: string, sha: string
   writeAtomic(path.join(sidecarDir(dataDir, key), SOURCE_SUMMARY_PARTS_FILE), `${JSON.stringify({ parts: Object.fromEntries(parts) }, null, 2)}\n`);
 }
 
-export function clearSourceSummaryParts(dataDir: string, key: string): void {
-  fs.rmSync(path.join(sidecarDir(dataDir, key), SOURCE_SUMMARY_PARTS_FILE), { force: true });
-}
-
 /**
  * Failed attempts at a document's summary page, counted for the content they
  * were made on, so the background pass stops retrying a document that keeps
@@ -686,16 +678,6 @@ export function translationLanguages(dataDir: string, key: string): string[] {
     if (m) out.add(m[1]);
   }
   return [...out].sort();
-}
-
-/** Forget a document's translations into `language`, or into every language. */
-export function clearTranslations(dataDir: string, key: string, language?: string): void {
-  if (language === undefined) {
-    fs.rmSync(path.join(sidecarDir(dataDir, key), TRANSLATIONS_DIR), { recursive: true, force: true });
-    return;
-  }
-  fs.rmSync(translationFile(dataDir, key, language), { force: true });
-  fs.rmSync(translationPartsFile(dataDir, key, language), { force: true });
 }
 
 /* ------------------------------- helpers ------------------------------- */

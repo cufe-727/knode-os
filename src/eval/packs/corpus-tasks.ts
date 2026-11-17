@@ -1,7 +1,6 @@
-import crypto from 'node:crypto';
 import { mapLimit } from '../../bench/util.js';
 import type { LlmClient } from '../../llm/client.js';
-import { foldSpace, seededKey } from '../pack.js';
+import { foldSpace, seededKey, shortHash as hash } from '../pack.js';
 import type { GoldFact, GoldItem, ListSpec, Task } from '../types.js';
 import { CORPUS_TASK_MIN_DOCS, DEEP_HOP_MIN } from '../types.js';
 import { DocText, oracleCheck } from './gold.js';
@@ -75,7 +74,6 @@ export interface CorpusPlan {
   maxDocs?: number;
 }
 
-const hash = (...parts: string[]) => crypto.createHash('sha1').update(parts.join('|')).digest('hex').slice(0, 10);
 const norm = (s: string) => s.toLowerCase().replace(/\s+/g, '');
 const langName = (lang: string) => (lang === 'zh' ? 'Chinese' : 'English');
 const CJK = /[㐀-鿿]/;

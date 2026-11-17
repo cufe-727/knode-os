@@ -93,12 +93,6 @@ export function holm(ps: number[], alpha = 0.05): boolean[] {
   return out;
 }
 
-/** Brier score of stated confidences against outcomes (lower is better). */
-export function brier(pairs: { confidence: number; correct: boolean }[]): number {
-  if (!pairs.length) return NaN;
-  return mean(pairs.map((p) => (Math.min(1, Math.max(0, p.confidence)) - (p.correct ? 1 : 0)) ** 2));
-}
-
 export function round(x: number, digits = 3): number {
   if (!Number.isFinite(x)) return x;
   const f = 10 ** digits;

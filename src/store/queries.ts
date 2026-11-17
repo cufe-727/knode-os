@@ -44,11 +44,6 @@ export async function knowledgeStats(store: Store): Promise<KnowledgeStats> {
   return row;
 }
 
-/** Mark every document pending (legacy helper; `sync` re-applies whatever changed). */
-export async function markAllDocumentsPending(store: Store): Promise<void> {
-  await store.query(`UPDATE documents SET status = 'pending' WHERE status = 'indexed'`);
-}
-
 export async function listEntities(store: Store, q?: string): Promise<EntityRow[]> {
   if (q) {
     return store.query<EntityRow>(

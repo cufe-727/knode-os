@@ -1,9 +1,7 @@
 import crypto from 'node:crypto';
-import fs from 'node:fs';
 import { AppContext } from '../context.js';
 import { loadSourceText } from '../ingest/source.js';
 import { LlmProvider } from '../config.js';
-import { safePath } from '../fs/files.js';
 import { llmExtract } from '../graph/llm-extract.js';
 import { LlmClient } from '../llm/client.js';
 import { mapLimit, mdTable, summarizeLatency, writeReport } from './util.js';

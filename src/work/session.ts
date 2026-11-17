@@ -4,6 +4,7 @@ import path from 'node:path';
 import { FailureKind } from '../labeling/failures.js';
 import { CompleteResult, SessionAnswer, TaskOutcome, WorkerIdentity } from '../labeling/scheduler.js';
 import { noFailures, SessionWorkTask, SourceStatus, WorkSource, WorkTask } from './broker.js';
+import { tokenMatches } from '../digest.js';
 
 /**
  * Research agent sessions as leased work (docs/design/27).
@@ -157,12 +158,6 @@ const MAX_STDERR_BYTES = 64 * 1024;
 export function familyOf(backend: string): SessionFamily | null {
   const family = backend.split(':')[0].trim().toLowerCase();
   return (SESSION_FAMILIES as readonly string[]).includes(family) ? (family as SessionFamily) : null;
-}
-
-function tokenMatches(presented: string, expected: string): boolean {
-  const a = Buffer.from(presented);
-  const b = Buffer.from(expected);
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 export class SessionSource implements WorkSource {

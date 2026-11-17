@@ -137,14 +137,6 @@ export function initEvalRoot(dir: string, opts: { database: DatabaseConfig; live
   return { root: { dir: abs, owner, config }, created };
 }
 
-/** The root a command reads (`eval drop`, `eval adopt`'s target): it must be one. */
-export function openEvalRoot(dir: string): EvalRoot {
-  const abs = path.resolve(dir);
-  if (!isEvaluationRoot(abs)) throw new Error(`${abs} is not an evaluation root (no ${CONFIG_FILE} with server.evaluation: true) — \`knode-os eval root init\` makes one`);
-  const config = loadConfig(abs, { readOnly: true });
-  return { dir: abs, owner: evalOwner(config), config };
-}
-
 /* ------------------------------ naming ------------------------------ */
 
 /** A run's id in workspace names: its directory's name, with its parent's when that is not `runs` (`separation-2026-11/run-10x`). */

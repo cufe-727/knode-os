@@ -9,6 +9,7 @@ import { mcpInstructions } from '../mcp/instructions.js';
 import { KnodeToolOptions, registerKnodeTools } from '../mcp/tools.js';
 import { AppContext } from '../context.js';
 import { resolveWorkspaceScope, WorkspaceContextRegistry, WorkspaceScope } from './workspaces.js';
+import { tokenMatches } from '../digest.js';
 
 /**
  * MCP over Streamable HTTP, mounted on the same Hono app as the REST API.
@@ -113,13 +114,6 @@ function presentedToken(req: Request): string | null {
   const header = req.headers.get('x-knode-token');
   if (header) return header.trim();
   return new URL(req.url).searchParams.get('token');
-}
-
-function tokenMatches(presented: string | null, expected: string): boolean {
-  if (!presented) return false;
-  const a = Buffer.from(presented);
-  const b = Buffer.from(expected);
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 /** Headers first (what Claude Code / Cursor send), query parameters as the fallback for URL-only clients. */

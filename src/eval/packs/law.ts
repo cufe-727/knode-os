@@ -1,12 +1,11 @@
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { runProcess } from '../../llm/cli.js';
-import { foldSpace, seededKey } from '../pack.js';
+import { foldSpace, bySeed, shortHash as hid } from '../pack.js';
 import type { CorpusDoc, Task } from '../types.js';
 import { finishDocpack } from './docpack.js';
 import { fetchCached, hfRows } from './fetch.js';
-import type { TaskPlan } from './gold.js';
+import { scaledPlan } from './gold.js';
 import { registerRecipe, RecipeContext } from './index.js';
 import { PackWriter } from './writer.js';
 
@@ -32,17 +31,6 @@ import { PackWriter } from './writer.js';
  */
 
 type Doc = CorpusDoc & { text: string };
-
-const hid = (...parts: string[]) => crypto.createHash('sha1').update(parts.join('|')).digest('hex').slice(0, 10);
-
-const bySeed = <T>(items: T[], seed: string | number, key: (t: T) => string) =>
-  [...items].sort((a, b) => seededKey(seed, key(a)).localeCompare(seededKey(seed, key(b))));
-
-/** A small build drafts proportionally fewer tasks. */
-function scaledPlan(plan: TaskPlan, docs: number, full: number): TaskPlan {
-  const f = Math.min(1, docs / full);
-  return Object.fromEntries(Object.entries(plan).map(([k, n]) => [k, n ? Math.max(1, Math.round(n * f)) : 0]));
-}
 
 /* --------------------------------- law-cn --------------------------------- */
 

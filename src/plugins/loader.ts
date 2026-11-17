@@ -109,7 +109,3 @@ async function importPlugin(url: string, spec: PluginSpec, log?: (msg: string) =
   return candidate.name.trim();
 }
 
-/** Tests: forget which modules were loaded, so a reset registry can load them again. */
-export function resetLoadedPlugins(): void {
-  loaded.clear();
-}

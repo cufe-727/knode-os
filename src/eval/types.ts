@@ -65,7 +65,6 @@ export const SEPARATION_TASK_TYPES: readonly TaskType[] = ['stale', 'lookalike',
  *              term and none of the stale values in `meta.stale` (numbers within `meta.tolerance`)
  */
 export const SCORINGS = ['judge', 'exact', 'count', 'keypoints', 'set', 'label', 'choice', 'abstain', 'value'] as const;
-export type Scoring = (typeof SCORINGS)[number];
 
 export const DOMAINS = ['research', 'medicine', 'law', 'finance', 'literature', 'personal', 'synthetic', 'public', 'fixture'] as const;
 
@@ -112,7 +111,6 @@ export const CorpusDocSchema = z.object({
 export type CorpusDoc = z.infer<typeof CorpusDocSchema>;
 
 export const EvidenceRefSchema = z.object({ doc: z.string(), quote: z.string().optional() });
-export type EvidenceRef = z.infer<typeof EvidenceRefSchema>;
 
 /** How directly a synthetic signal is written into the sources. */
 export const SIGNALS = ['explicit', 'implicit', 'latent'] as const;
@@ -203,7 +201,6 @@ export const ClosedWorldSchema = z.object({
   terms: z.array(z.string()).default([]),
   prefixes: z.array(z.string()).default([]),
 });
-export type ClosedWorld = z.infer<typeof ClosedWorldSchema>;
 
 export const TaskSchema = z.object({
   id: z.string(),
@@ -258,11 +255,6 @@ export function emptyUsage(): Usage {
     calls: 0, failedCalls: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningTokens: 0,
     weightedTokens: 0, costUsd: 0, llmMs: 0, embeddingTokens: 0, embeddingCalls: 0, replayedCalls: 0,
   };
-}
-
-export function addUsage(into: Usage, u: Partial<Usage>): Usage {
-  for (const k of Object.keys(into) as (keyof Usage)[]) into[k] += u[k] ?? 0;
-  return into;
 }
 
 export interface Citation {

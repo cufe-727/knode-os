@@ -136,20 +136,6 @@ export function textOf(el: XmlElement | undefined): string {
   return all(el).trim();
 }
 
-/** Every element with this local name, at any depth. */
-export function findAll(el: XmlElement, name: string): XmlElement[] {
-  const want = name.toLowerCase();
-  const out: XmlElement[] = [];
-  const visit = (e: XmlElement) => {
-    for (const c of e.children) {
-      if (local(c.name) === want) out.push(c);
-      visit(c);
-    }
-  };
-  visit(el);
-  return out;
-}
-
 const escapeText = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 /** The markup inside an element, serialized again (Atom's type="xhtml" content). */
