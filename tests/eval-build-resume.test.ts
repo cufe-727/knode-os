@@ -16,6 +16,7 @@ import { RunStore } from '../src/eval/runstore.js';
 import { KEEP_ALIVE_MS, startShim, type ChatBackend, type ChatRequest } from '../src/eval/shim.js';
 import { emptyUsage } from '../src/eval/types.js';
 import { ScriptedBackend, scriptedJudge } from './helpers/eval-scripted.js';
+import { runWorkspaceDir } from '../src/eval/root.js';
 
 /*
  * A knode build that survives a failed request (docs/design/33): the 10× build stopped with
@@ -148,7 +149,7 @@ describe('a resumed run continues a knode build an outage stopped', () => {
     closing.push(ep.close);
     const embedder = () => createEmbeddingProvider({ provider: 'openai', baseUrl: `${ep.url}/v1`, apiKey: '', model: 'fake-384', dimensions: 384, batchSize: 4, sendDimensions: false });
     const runDir = path.join(tmp, 'run');
-    const progressOf = () => JSON.parse(fs.readFileSync(path.join(runDir, 'work', 'fixture-life', 'knode', 'ws', '.knode', 'eval-build.json'), 'utf8')) as { attempts: number; done: string[] };
+    const progressOf = () => JSON.parse(fs.readFileSync(path.join(runWorkspaceDir(runDir, 'fixture-life'), '.knode', 'eval-build.json'), 'utf8')) as { attempts: number; done: string[] };
     const run = (backend: ScriptedBackend) => runEval({
       packs: [packDir], systems: ['knode-ask'], runDir, quota: false, suites: ['usage'], types: ['single-hop'], judgeAudit: 0,
       overrides: { chat: backend, judge: scriptedJudge(), embedder: embedder() },

@@ -26,6 +26,9 @@ import { recordAgent, shimClient, SystemEnv, SystemUnderTest } from './types.js'
 import { evalTempDir } from '../tmp.js';
 import { startToolHost, ToolHost } from '../toolhost.js';
 import { cloneSchema, describeDatabase, dropEvalWorkspace, evalDatabase, markSchema, storableDatabase } from '../database.js';
+import { embeddingIdentity } from '../../config.js';
+import { assertNoLeak } from '../leak.js';
+import { claimWriter, EvalRootPlacement, EvaluationInfo, newEvalManifest, placeEvalWorkspace, readEvalManifest, readWorkspacePointer, releaseWriter, updateEvaluation, writeEvalManifest, writeWorkspacePointer } from '../root.js';
 
 /**
  * knode-os as a system under test (docs/design/23 §3): a fresh workspace per
@@ -49,6 +52,10 @@ import { cloneSchema, describeDatabase, dropEvalWorkspace, evalDatabase, markSch
 
 interface KnodeState {
   ws: string;
+  /** Where the run keeps its builds (docs/design/35): absent for a run made before, whose build is `<workDir>/ws`. */
+  placement: EvalRootPlacement | null;
+  /** The run's own directory for this pack and group (`workspace.json` is kept there). */
+  workDir: string;
   /**
    * The open context, held as the promise of it: answers that start together
    * share one open instead of each opening the index (docs/design/31 F2 — on
@@ -116,14 +123,46 @@ export function evalPassSettings(): { concurrency: number; batchSize: number } {
   return { concurrency, batchSize: Math.max(KNODE_EVAL_BATCH, Math.ceil((concurrency * KNODE_EVAL_BATCH) / Math.max(1, KNODE_EVAL_CONCURRENCY))) };
 }
 
+/**
+ * Where a run's build of a pack is: what `work/<pack>/<group>/workspace.json`
+ * names, else — in an evaluation root (docs/design/35 §3) — the folder the run
+ * gets there, else, for a run made before builds lived in a root, `<workDir>/ws`.
+ */
+function workspaceOf(env: SystemEnv): string {
+  const pointer = readWorkspacePointer(env.workDir);
+  if (pointer) return pointer.dir;
+  if (!env.evalRoot) return path.join(env.workDir, 'ws');
+  return placeEvalWorkspace(env.evalRoot, env.pack.manifest.id, path.basename(env.workDir));
+}
+
 /** One state per working directory: a run's pack, never another run's of the same pack. */
 function stateFor(env: SystemEnv): KnodeState {
   let s = states.get(env.workDir);
   if (!s) {
-    s = { ws: path.join(env.workDir, 'ws'), ctx: null, closing: null, hosts: new Map(), pageSources: new Map() };
+    s = { ws: workspaceOf(env), placement: env.evalRoot ?? null, workDir: env.workDir, ctx: null, closing: null, hosts: new Map(), pageSources: new Map() };
     states.set(env.workDir, s);
   }
   return s;
+}
+
+/** A build in the root that another run's manifest names is not this run's to open or change. */
+function assertOwnWorkspace(s: KnodeState): void {
+  if (!s.placement) return;
+  const m = readEvalManifest(s.ws);
+  if (!m) throw new Error(`${s.ws} has no evaluation manifest: not a build of this run`);
+  if (path.resolve(m.evaluation.run) !== path.resolve(s.placement.run)) {
+    throw new Error(`the workspace ${s.ws} is the build of ${m.evaluation.run}, not of this run (${s.placement.run})`);
+  }
+}
+
+/** The manifest's state, in the root layout only. */
+function setState(s: KnodeState, change: (e: EvaluationInfo) => EvaluationInfo): void {
+  if (s.placement) updateEvaluation(s.ws, change);
+}
+
+function withoutError(e: EvaluationInfo): EvaluationInfo {
+  const { error: _error, ...rest } = e;
+  return rest as EvaluationInfo;
 }
 
 /**
@@ -181,6 +220,8 @@ function open(s: KnodeState): Promise<AppContext> {
   const closing = s.closing;
   const opening = (async () => {
     if (closing) await closing;
+    // the run holds its build while it has it open: the viewer lists it and does not open it (docs/design/35 §4)
+    if (s.placement) claimWriter(s.ws);
     const ctx = await createContext(s.ws);
     // the index as built, for every answer: the store finishes its own upkeep in the background after it opens, and
     // until the substring indexes are marked ready the keyword channel takes another path that scores differently
@@ -260,7 +301,13 @@ async function recordIndex(s: KnodeState, ctx: AppContext): Promise<IndexRecord>
   const cfg = ctx.config.database;
   const rec: IndexRecord = { kind: cfg.kind, workspace: path.resolve(s.ws), ...(cfg.kind === 'postgres' ? { schema: await markSchema(cfg, s.ws) } : {}) };
   fs.writeFileSync(indexRecordFile(s), JSON.stringify(rec, null, 2));
+  pointTo(s, rec);
   return rec;
+}
+
+/** The run's record of where its build is (`work/<pack>/<group>/workspace.json`), in the root layout. */
+function pointTo(s: KnodeState, rec: Pick<IndexRecord, 'kind' | 'schema'>): void {
+  if (s.placement) writeWorkspacePointer(s.workDir, { dir: path.resolve(s.ws), kind: rec.kind, ...(rec.schema ? { schema: rec.schema } : {}) });
 }
 
 /**
@@ -274,6 +321,7 @@ async function adoptIndex(s: KnodeState, env: SystemEnv, cfg: KnodeConfig): Prom
   const kind = cfg.database.kind;
   if (kind !== 'postgres') {
     if (rec && rec.kind !== kind) throw new Error(`the build's index is on ${rec.kind}; this run keeps its indexes on ${kind}`);
+    pointTo(s, { kind });
     return;
   }
   if (!rec?.schema || rec.kind !== 'postgres') throw new Error(`the build's index is on ${rec?.kind ?? 'pglite (it has no index record)'}; this run keeps its indexes on ${describeDatabase(cfg.database)}`);
@@ -281,6 +329,7 @@ async function adoptIndex(s: KnodeState, env: SystemEnv, cfg: KnodeConfig): Prom
   const t0 = Date.now();
   const cloned = await cloneSchema(cfg.database, rec.schema, s.ws, cfg.embedding.dimensions);
   fs.writeFileSync(indexRecordFile(s), JSON.stringify({ kind, schema: cloned.schema, workspace: path.resolve(s.ws) } satisfies IndexRecord, null, 2));
+  pointTo(s, { kind, schema: cloned.schema });
   env.log(`knode: cloned schema ${rec.schema} into ${cloned.schema} (${cloned.tables} tables, ${cloned.rows} rows, ${Date.now() - t0} ms)`);
 }
 
@@ -470,10 +519,48 @@ function knodeSystem(id: string, label: string, kind: SystemUnderTest['kind'], a
     },
     async build(env) {
       const s = stateFor(env);
+      try {
+        const built = await buildWorkspace(s, env);
+        setState(s, (e) => ({ ...withoutError(e), state: 'built' }));
+        return built;
+      } catch (err) {
+        // the build's folder says it failed, for the viewer's list (a resume continues it, or builds it again)
+        if (s.placement && readEvalManifest(s.ws)) setState(s, (e) => ({ ...e, state: 'failed', error: (err instanceof Error ? err.message : String(err)).slice(0, 500) }));
+        throw err;
+      }
+    },
+    async reopen(env) {
+      const s = stateFor(env);
+      if (!fs.existsSync(path.join(s.ws, 'knode.config.json'))) throw new Error(`no knode workspace to reopen at ${s.ws}`);
+      assertOwnWorkspace(s);
+      // the shim's port changed since the build: repoint the workspace at this run's shim (and its database)
+      const config = evalWorkspaceConfig(env);
+      fs.writeFileSync(path.join(s.ws, 'knode.config.json'), JSON.stringify(config, null, 2));
+      await adoptIndex(s, env, config);
+      readPageSources(s);
+    },
+    async release(env) {
+      await close(stateFor(env));
+    },
+    async finish(env) {
+      const s = stateFor(env);
+      await close(s);
+      // held from the first open to here: between a pack's answers and its batches the run reopens it, and a viewer
+      // that opened it meanwhile would hold its embedded index
+      if (s.placement && fs.existsSync(s.ws)) releaseWriter(s.ws);
+    },
+    ...extra,
+  };
+}
+
+/** Build (or continue building) a run's knode workspace: in its evaluation root, or in the run directory for a run made before. */
+async function buildWorkspace(s: KnodeState, env: SystemEnv): Promise<{ notes?: Record<string, unknown>; kbDir?: string }> {
       await close(s);
       const prior = resumableProgress(s, env);
       const config = evalWorkspaceConfig(env);
       if (prior) {
+        assertOwnWorkspace(s);
+        setState(s, (e) => ({ ...withoutError(e), state: 'building' }));
         // an earlier attempt's workspace: kept, and pointed at this run's shim (its port changed) and database
         fs.writeFileSync(path.join(s.ws, 'knode.config.json'), JSON.stringify(config, null, 2));
         await adoptIndex(s, env, config);
@@ -481,11 +568,20 @@ function knodeSystem(id: string, label: string, kind: SystemUnderTest['kind'], a
       } else {
         fs.rmSync(s.ws, { recursive: true, force: true });
         fs.mkdirSync(s.ws, { recursive: true });
+        // a workspace of the evaluation root, made as the root's own are: its manifest, filed under the root's owner
+        if (s.placement) {
+          writeEvalManifest(s.ws, newEvalManifest(s.placement, s.ws, {
+            pack: env.pack.manifest.id, packVersion: env.pack.manifest.version, group: path.basename(s.workDir), fingerprint: buildFingerprint(env),
+            models: { build: env.models.model || 'codex (its default model)', embedding: `${config.embedding.model} (${config.embedding.dimensions})` },
+          }));
+        }
         fs.writeFileSync(path.join(s.ws, 'knode.config.json'), JSON.stringify(config, null, 2));
         // a build starts empty: on PostgreSQL the workspace's schema outlives its directory (an earlier, failed build)
         if (config.database.kind === 'postgres') await dropEvalWorkspace(s.ws, config.database);
         fs.cpSync(env.staged.dir, path.join(s.ws, 'raw', 'docs'), { recursive: true });
       }
+      // only the staged corpus: never a gold, holdout or task file of the pack (docs/design/35 D7)
+      assertNoLeak(s.ws, env.pack.dir, 'after staging');
       const progress: BuildProgress = prior
         ? { ...prior, done: [...prior.done], attempts: prior.attempts + 1 }
         : { fingerprint: buildFingerprint(env), startedAt: new Date().toISOString(), attempts: 1, done: [] };
@@ -536,23 +632,9 @@ function knodeSystem(id: string, label: string, kind: SystemUnderTest['kind'], a
           ...counts, database: describeDatabase(ctx.config.database), ...(index.schema ? { schema: index.schema } : {}), ...passes, passConcurrency: ctx.config.extraction.concurrency, judgeConcurrency: ctx.config.review?.directConcurrency ?? 1, passBatch: ctx.config.extraction.batchSize, wikiPages: pages, refined, indexed: synced.indexed, stageMs: { sync: tSync, documentPasses: tPasses, wiki: Date.now() - t0 - tSync - tPasses },
           // a resumed build: what the earlier attempts had done, and what this one found already there
           ...(prior ? { resumed: { startedAt: prior.startedAt, attempt: progress.attempts, phasesDone: prior.done, before } } : {}),
+          ...(s.placement ? { workspace: path.resolve(s.ws) } : {}),
         },
       };
-    },
-    async reopen(env) {
-      const s = stateFor(env);
-      if (!fs.existsSync(path.join(s.ws, 'knode.config.json'))) throw new Error(`no knode workspace to reopen at ${s.ws}`);
-      // the shim's port changed since the build: repoint the workspace at this run's shim (and its database)
-      const config = evalWorkspaceConfig(env);
-      fs.writeFileSync(path.join(s.ws, 'knode.config.json'), JSON.stringify(config, null, 2));
-      await adoptIndex(s, env, config);
-      readPageSources(s);
-    },
-    async release(env) {
-      await close(stateFor(env));
-    },
-    ...extra,
-  };
 }
 
 /**
@@ -610,13 +692,23 @@ export function knodeAsk(options: { computed?: boolean; now?: string } = askOpti
     async exportKnowledge(env) {
       return exportUnits(stateFor(env));
     },
-    async update(_files, env) {
+    async update(_files, env, batch) {
       const s = stateFor(env);
+      assertOwnWorkspace(s);
       const ctx = await open(s);
-      fs.cpSync(env.staged.dir, path.join(s.ws, 'raw', 'docs'), { recursive: true });
-      await sync(ctx, { datasources: false });
-      await drain(ctx, env);
-      readPageSources(s);
+      // the batch is applied in place: the manifest says so while it is, and which batches the workspace holds after
+      setState(s, (e) => ({ ...withoutError(e), state: 'updating' }));
+      try {
+        fs.cpSync(env.staged.dir, path.join(s.ws, 'raw', 'docs'), { recursive: true });
+        assertNoLeak(s.ws, env.pack.dir, `after update batch ${batch ?? ''}`.trim());
+        await sync(ctx, { datasources: false });
+        await drain(ctx, env);
+        readPageSources(s);
+      } catch (err) {
+        setState(s, (e) => ({ ...e, state: 'failed', error: `update ${batch ?? ''}: ${(err instanceof Error ? err.message : String(err)).slice(0, 500)}` }));
+        throw err;
+      }
+      setState(s, (e) => ({ ...withoutError(e), state: 'built', batchesApplied: batch && !e.batchesApplied.includes(batch) ? [...e.batchesApplied, batch] : e.batchesApplied }));
     },
   });
 }
@@ -635,7 +727,19 @@ export function knodeSag(): SystemUnderTest {
 /** Close every knode workspace a run holds open under `dir` (a run that ends, or is cancelled, mid-pack). */
 export async function closeKnodeStates(dir: string): Promise<void> {
   const root = path.resolve(dir) + path.sep;
-  for (const [workDir, s] of states) if (path.resolve(workDir).startsWith(root)) await close(s).catch(() => {});
+  for (const [workDir, s] of states) {
+    if (!path.resolve(workDir).startsWith(root)) continue;
+    await close(s).catch(() => {});
+    // and lets go of it: a build the run ended with is the viewer's to open
+    if (s.placement) {
+      try {
+        releaseWriter(s.ws);
+      } catch {
+        // its folder is gone (dropped)
+      }
+    }
+    states.delete(workDir);
+  }
 }
 
 export function agentKnode(): SystemUnderTest {

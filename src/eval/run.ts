@@ -28,6 +28,8 @@ import type { Placed } from './meter.js';
 import { closeAdapters } from './systems/external.js';
 import { askOptionsFromEnv, closeKnodeStates } from './systems/knode.js';
 import { describeDatabase, EVAL_POOL_MAX, evalDatabase, orphanedEvalSchemas, sameDatabase } from './database.js';
+import { EvalRootPlacement, evalRootDir, evalRunId, initEvalRoot, liveDatabase, newEvalManifest, placeEvalWorkspace, readEvalManifest, readWorkspacePointer, WORKSPACE_POINTER, writeEvalManifest, writeWorkspacePointer } from './root.js';
+import { SCHEMA_VERSION } from '../store/migrations.js';
 import { makeSystems } from './systems/index.js';
 import { removeHeldTempDirs, sweepStaleTempDirs } from './tmp.js';
 import { boundedOutputs, boundedTrace } from './trace.js';
@@ -61,6 +63,20 @@ export interface RunOptions {
   databaseUrl?: string;
   /** Keep knode's indexes in embedded PGlite whatever the config names (a comparison with earlier runs, design 31 D5). */
   pglite?: boolean;
+  /**
+   * The evaluation root a new run keeps its knode builds in, one workspace per
+   * pack (docs/design/35): default `KNODE_EVAL_ROOT`, else
+   * `<KNODE_EVAL_HOME>/server`, made on first use. A resumed run keeps the
+   * root it started with.
+   */
+  evalRoot?: string;
+  /**
+   * Where a new run's knode builds go: `root` (the default) or, as before
+   * evaluation roots, `run` — `<run>/work/<pack>/knode/ws`. A resumed run keeps
+   * the layout it started with (`run.json` `workspaces`). Tests, and a
+   * comparison with the old layout.
+   */
+  workspacesIn?: 'root' | 'run';
   /**
    * Spend nothing: a model call or an embedding not in the run's caches fails
    * instead of reaching a model or the embedder (a rebuild from another run's
@@ -390,6 +406,19 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
   if (previous && previous.kind !== database.kind) {
     throw new Error(`run ${path.basename(runDir)} keeps its indexes on ${previous.at}; this run would keep them on ${describeDatabase(database)} — results on two backends are not pooled: resume it on ${previous.kind}, or start a new run`);
   }
+  // where the knode builds go (docs/design/35): a new run's into the evaluation root, a run made before stays as it was
+  const layout: 'root' | 'run' = store.meta() ? (store.meta()!.workspaces === 'root' ? 'root' : 'run') : (opts.workspacesIn ?? 'root');
+  const rootPlace: EvalRootPlacement | null = layout === 'root'
+    ? (() => {
+      const { root } = initEvalRoot(opts.evalRoot ? evalRootDir(opts.evalRoot) : store.meta()?.evalRoot ?? evalRootDir(), {
+        database, live: opts.configFrom ? sourceDatabase : liveDatabase(), liveLabel: opts.configFrom ? `the --config-from workspace (${opts.configFrom})` : 'the default data root',
+      });
+      return {
+        root: root.dir, owner: root.owner, run: runDir, runId: evalRunId(runDir), fraction, seed,
+        builtWith: { version: knodeVersion(), commit: gitSha()?.slice(0, 12) ?? null, schema: SCHEMA_VERSION },
+      };
+    })()
+    : null;
   const configured = opts.overrides?.embedder
     ?? (opts.embedding === 'local' || !workspaceConfig
       ? createEmbeddingProvider({ provider: 'local', baseUrl: '', apiKey: '', model: '', dimensions: 384, batchSize: 64, sendDimensions: false })
@@ -482,7 +511,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
 
     if (opts.reuseBuildsFrom) {
       const groups = new Set(makeSystems(opts.systems).map((sys) => sys.group).filter((g) => !opts.rebuild?.includes(g)));
-      const n = reuseBuilds(store, path.resolve(opts.reuseBuildsFrom), opts.packs, `${embedder.model} (${embedder.dimensions})`, fraction, seed, groups);
+      const n = reuseBuilds(store, path.resolve(opts.reuseBuildsFrom), opts.packs, `${embedder.model} (${embedder.dimensions})`, fraction, seed, groups, rootPlace);
       progress(`reusing ${n.builds} builds and ${n.vectors} embedding vectors from ${opts.reuseBuildsFrom}${opts.rebuild?.length ? `; building ${opts.rebuild.join(', ')} afresh` : ''}`);
       if (n.updated.length) progress(`building again, since ${opts.reuseBuildsFrom} updated them after building: ${n.updated.join(', ')}`);
       store.log('builds reused', { from: opts.reuseBuildsFrom, ...n });
@@ -514,6 +543,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
       judge: { connection: opts.judgeChain ?? opts.judgeProvider ?? 'claude-cli', label: judgeClient.label },
       embedding: `${embedder.model} (${embedder.dimensions})`,
       database: { kind: database.kind, at: describeDatabase(database), ...(database.kind === 'postgres' ? { poolSize: database.poolSize } : {}) },
+      ...(rootPlace ? { workspaces: 'root' as const, evalRoot: rootPlace.root } : {}),
       fraction,
       seed,
       limit: opts.limit ?? null,
@@ -636,6 +666,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
           models,
           log: (m) => progress(`[${pack.manifest.id}/${group}] ${m}`),
           database,
+          ...(rootPlace ? { evalRoot: rootPlace } : {}),
         };
         if (!(await buildGroup(store, meter, env, group, members, fraction, seed, progress, stop.signal))) {
           failed.add(group);
@@ -675,7 +706,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
         const tasks = updateTasks.filter((t) => t.afterUpdate === batch);
         for (const [group, members] of groups) {
           if (failed.has(group)) continue;
-          const env: SystemEnv = { runId: meta.id, pack, staged, workDir: store.workDir(pack.manifest.id, group), shim: packShim, meter, quota, models, log: (m) => progress(`[${pack.manifest.id}/${group}] ${m}`), database };
+          const env: SystemEnv = { runId: meta.id, pack, staged, workDir: store.workDir(pack.manifest.id, group), shim: packShim, meter, quota, models, log: (m) => progress(`[${pack.manifest.id}/${group}] ${m}`), database, ...(rootPlace ? { evalRoot: rootPlace } : {}) };
           const updater = members.find((s) => s.update);
           const key = recordKey('update', pack.manifest.id, group, batch, fraction, seed);
           if (updater && !store.build(key)) {
@@ -685,7 +716,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
             let error: string | undefined;
             const stuckMark = remote.stuck.length;
             try {
-              await withPieceTag({ system: group }, () => updater.update!(files, env));
+              await withPieceTag({ system: group }, () => updater.update!(files, env, batch));
             } catch (err) {
               ok = false;
               error = err instanceof Error ? err.message : String(err);
@@ -707,6 +738,11 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
           }
           for (const s of members) await s.release?.(env);
         }
+      }
+      // done with the pack: its builds are let go of (the viewer may open them)
+      for (const [group, members] of groups) {
+        const env: SystemEnv = { runId: meta.id, pack, staged, workDir: store.workDir(pack.manifest.id, group), shim: packShim, meter, quota, models, log: (m) => progress(`[${pack.manifest.id}/${group}] ${m}`), database, ...(rootPlace ? { evalRoot: rootPlace } : {}) };
+        for (const s of members) await s.finish?.(env);
       }
     };
     // a pack the embedding budget cut short waits for it to open, then goes on where it stopped
@@ -786,7 +822,7 @@ export async function runEval(opts: RunOptions): Promise<RunResult> {
  * A build the other run updated (`<group>@<batch>`, applied in place) is left
  * out and listed in `updated`: its work directory holds the updated corpus.
  */
-export function reuseBuilds(store: RunStore, from: string, packDirs: string[], embedding: string, fraction: number, seed: string | number, groups?: Set<string>): { builds: number; vectors: number; updated: string[] } {
+export function reuseBuilds(store: RunStore, from: string, packDirs: string[], embedding: string, fraction: number, seed: string | number, groups?: Set<string>, rootPlace?: EvalRootPlacement | null): { builds: number; vectors: number; updated: string[] } {
   const src = new RunStore(from);
   const meta = src.meta();
   if (!meta) throw new Error(`--reuse-builds-from: not a run directory: ${from}`);
@@ -803,9 +839,42 @@ export function reuseBuilds(store: RunStore, from: string, packDirs: string[], e
         continue;
       }
       const work = path.join(from, 'work', pack.manifest.id, b.system);
+      const dest = store.workDir(pack.manifest.id, b.system);
+      // the build's workspace: in the other run's evaluation root (`workspace.json`), or in its run directory (`ws`)
+      const pointer = readWorkspacePointer(work);
+      const sourceWs = pointer?.dir ?? (fs.existsSync(path.join(work, 'ws', 'knode.config.json')) ? path.join(work, 'ws') : null);
       // not an index lock (src/store: `.knode/db.lock`, the pid that holds a PGlite directory open): it is the
       // other run's process, and the copy is this run's to open
-      if (fs.existsSync(work)) fs.cpSync(work, store.workDir(pack.manifest.id, b.system), { recursive: true, filter: (src) => path.basename(src) !== 'db.lock' });
+      const notLock = (src: string) => path.basename(src) !== 'db.lock';
+      if (fs.existsSync(work)) {
+        fs.cpSync(work, dest, {
+          recursive: true,
+          // the workspace goes where this run keeps its builds, below; the other run's pointer to its own is not this run's
+          filter: (src) => notLock(src) && src !== path.join(work, WORKSPACE_POINTER) && !(rootPlace && sourceWs && src === path.join(work, 'ws')),
+        });
+      }
+      if (sourceWs && fs.existsSync(sourceWs) && rootPlace) {
+        // a workspace of this run's own in the root, its manifest this run's; the index is made its own when it is reopened
+        const ws = placeEvalWorkspace(rootPlace, pack.manifest.id, b.system);
+        fs.rmSync(ws, { recursive: true, force: true });
+        fs.cpSync(sourceWs, ws, { recursive: true, filter: (src) => notLock(src) && !/\.workspace\.json\.\d+\.tmp$/.test(src) });
+        const theirs = readEvalManifest(sourceWs)?.evaluation;
+        const made = newEvalManifest(rootPlace, ws, {
+          pack: pack.manifest.id, packVersion: pack.manifest.version, group: b.system, fingerprint: theirs?.fingerprint, models: theirs?.models, state: 'built',
+        });
+        const { writer: _writer, ...evaluation } = made.evaluation;
+        writeEvalManifest(ws, { ...made, evaluation: { ...evaluation, builtWith: theirs?.builtWith ?? evaluation.builtWith, reusedFrom: path.resolve(from) } as typeof evaluation });
+        let index: { kind?: string; schema?: string } = {};
+        try {
+          index = JSON.parse(fs.readFileSync(path.join(ws, '.knode', 'eval-index.json'), 'utf8')) as typeof index;
+        } catch {
+          // no record: the reopen says what is missing
+        }
+        writeWorkspacePointer(dest, { dir: ws, kind: index.kind ?? 'pglite', ...(index.schema ? { schema: index.schema } : {}) });
+      } else if (sourceWs && pointer && fs.existsSync(sourceWs)) {
+        // a run made before keeps its builds in its own directory, whatever the other run did
+        fs.cpSync(sourceWs, path.join(dest, 'ws'), { recursive: true, filter: (src) => notLock(src) && !/\.workspace\.json\.\d+\.tmp$/.test(src) });
+      }
       store.putBuild({ ...b, notes: { ...b.notes, reusedFrom: meta.id, builtAt: b.at } });
       builds++;
     }

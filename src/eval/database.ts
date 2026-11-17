@@ -281,29 +281,63 @@ export async function dropEvalWorkspace(ws: string, cfg: DatabaseConfig): Promis
 }
 
 /**
- * `knode-os eval drop <run-dir>`: every knode index the run's builds left —
- * each build workspace's schema in the evaluation database, or its embedded
- * database. The records, answers and scores stay; a build whose index is
- * dropped is no longer reusable. `url` overrides the database the workspaces'
- * configs name (needed when theirs carried a password: it lived only in the
- * run's process).
+ * `knode-os eval drop <run-dir>`: every knode build the run left. A build in
+ * the evaluation root (docs/design/35 §3, `work/<pack>/<group>/workspace.json`)
+ * goes whole — its index, then its folder — and never one whose manifest
+ * names another run, nor one a live process holds. A build of a run made
+ * before roots (`work/<pack>/<group>/ws`) loses its index, as it always did:
+ * its schema in the evaluation database, or its embedded database. The
+ * records, answers and scores stay; a dropped build is no longer reusable.
+ * `url` overrides the database the workspaces' configs name (needed when
+ * theirs carried a password: it lived only in the run's process).
  */
 export async function dropRun(runDir: string, opts: { url?: string; log?: (m: string) => void } = {}): Promise<string[]> {
   const { loadConfig } = await import('../config.js');
-  const work = path.join(path.resolve(runDir), 'work');
+  const { liveWriter, readEvalManifest, readWorkspacePointer, WORKSPACE_POINTER } = await import('./root.js');
+  const run = path.resolve(runDir);
+  const work = path.join(run, 'work');
   const dropped: string[] = [];
   if (!fs.existsSync(work)) return dropped;
+  const configOf = (ws: string) => {
+    const own = loadConfig(ws, { readOnly: true }).database;
+    const cfg = opts.url ? evalDatabase(own, { url: opts.url }) : own;
+    if (cfg.kind === 'postgres' && cfg.url?.startsWith('env:') && !process.env[cfg.url.slice(4)]) {
+      throw new Error(`${ws}: its database URL was in the run's environment (${cfg.url.slice(4)}), not in its config — pass --database-url`);
+    }
+    return cfg;
+  };
+  const said = (what: string, cfg: DatabaseConfig) => (what === cfg.kind ? `its ${what} index` : `schema ${what} in ${describeDatabase(cfg)}`);
   for (const pack of fs.readdirSync(work)) {
     for (const group of fs.readdirSync(path.join(work, pack))) {
-      const ws = path.join(work, pack, group, 'ws');
-      if (!fs.existsSync(path.join(ws, 'knode.config.json'))) continue;
-      const own = loadConfig(ws).database;
-      const cfg = opts.url ? evalDatabase(own, { url: opts.url }) : own;
-      if (cfg.kind === 'postgres' && cfg.url?.startsWith('env:') && !process.env[cfg.url.slice(4)]) {
-        throw new Error(`${ws}: its database URL was in the run's environment (${cfg.url.slice(4)}), not in its config — pass --database-url`);
+      const workDir = path.join(work, pack, group);
+      const pointer = readWorkspacePointer(workDir);
+      if (pointer) {
+        const ws = pointer.dir;
+        if (!fs.existsSync(ws)) {
+          opts.log?.(`${pack}/${group}: ${ws} is gone already`);
+          fs.rmSync(path.join(workDir, WORKSPACE_POINTER), { force: true });
+          continue;
+        }
+        const manifest = readEvalManifest(ws);
+        if (!manifest || path.resolve(manifest.evaluation.run) !== run) {
+          opts.log?.(`${pack}/${group}: left ${ws} alone — its manifest names ${manifest ? manifest.evaluation.run : 'no run'}, not this one`);
+          continue;
+        }
+        const writer = liveWriter(manifest.evaluation);
+        if (writer && writer.pid !== process.pid) throw new Error(`${ws} is held by process ${writer.pid} (since ${writer.since}): stop that run first`);
+        const cfg = configOf(ws);
+        const what = await dropEvalWorkspace(ws, cfg);
+        fs.rmSync(ws, { recursive: true, force: true });
+        fs.rmSync(path.join(workDir, WORKSPACE_POINTER), { force: true });
+        opts.log?.(`${pack}/${group}: dropped the workspace ${manifest.id} and ${said(what, cfg)}`);
+        dropped.push(what);
+        continue;
       }
+      const ws = path.join(workDir, 'ws');
+      if (!fs.existsSync(path.join(ws, 'knode.config.json'))) continue;
+      const cfg = configOf(ws);
       const what = await dropEvalWorkspace(ws, cfg);
-      opts.log?.(`${pack}/${group}: dropped ${what === cfg.kind ? `its ${what} index` : `schema ${what} in ${describeDatabase(cfg)}`}`);
+      opts.log?.(`${pack}/${group}: dropped ${said(what, cfg)}`);
       dropped.push(what);
     }
   }

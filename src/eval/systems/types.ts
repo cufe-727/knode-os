@@ -1,4 +1,5 @@
 import type { DatabaseConfig, LlmEffort } from '../../config.js';
+import type { EvalRootPlacement } from '../root.js';
 import type { EmbeddingProvider } from '../../ingest/embeddings.js';
 import { ChatMessage, LlmClient } from '../../llm/client.js';
 import type { CallUsage } from '../../llm/usage.js';
@@ -39,6 +40,11 @@ export interface SystemEnv {
   log: (msg: string) => void;
   /** Where knode's indexes live for this run (src/eval/database.ts); absent, the default's evaluation database. */
   database?: DatabaseConfig;
+  /**
+   * The evaluation root the run keeps its builds in (docs/design/35); absent
+   * for a run made before, whose builds stay in its own directory.
+   */
+  evalRoot?: EvalRootPlacement;
 }
 
 export interface SystemAnswer {
@@ -81,10 +87,12 @@ export interface SystemUnderTest {
   answer?(task: Task, prompt: string, env: SystemEnv): Promise<SystemAnswer>;
   retrieve?(query: string, k: number, env: SystemEnv): Promise<string[]>;
   exportKnowledge?(env: SystemEnv): Promise<KnowledgeUnit[]>;
-  /** Apply an update batch already copied into the staged corpus. */
-  update?(files: string[], env: SystemEnv): Promise<void>;
+  /** Apply an update batch (`batch`, e.g. "01") already copied into the staged corpus. */
+  update?(files: string[], env: SystemEnv, batch?: string): Promise<void>;
   /** Close what it holds open for this pack once its group is done with it (packs run concurrently). */
   release?(env: SystemEnv): Promise<void>;
+  /** The run is done with this pack — its answers and every update batch: let go of the build (docs/design/35: the viewer may open it). */
+  finish?(env: SystemEnv): Promise<void>;
 }
 
 /** A client that reaches the run's model through the shim, tagged so the meter can attribute the call. */

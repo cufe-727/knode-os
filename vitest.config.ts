@@ -10,6 +10,8 @@ export default defineConfig({
     // Codex catalog copies off: a Codex stub must not read ~/.codex or write ~/.knode-os
     // (tests/codex-catalog.test.ts turns them on, in folders of its own)
     env: { KNODE_DATABASE_KIND: 'pglite', KNODE_CODEX_CATALOG_HOURS: '0' },
+    // each test file's evaluation runs keep their builds in a root of their own, never ~/knode-eval/server
+    setupFiles: ['tests/setup-eval-root.ts'],
     // sessions' worktrees live under .claude/worktrees, each with its own copy of
     // tests/: run from the main checkout, the suite would run every copy too.
     // tmp/ (gitignored) holds scratch downloads such as other projects' sources,

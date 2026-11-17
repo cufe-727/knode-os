@@ -12,6 +12,7 @@ import { writeReport } from '../src/eval/report.js';
 import { runEval } from '../src/eval/run.js';
 import { RunStore } from '../src/eval/runstore.js';
 import { ScriptedBackend, scriptedJudge } from './helpers/eval-scripted.js';
+import { runWorkspaceDir } from '../src/eval/root.js';
 
 /**
  * docs/design/31 D1: evaluation workspaces on the product's backend, in a
@@ -203,7 +204,7 @@ describe.skipIf(!ready)('an evaluation on PostgreSQL', () => {
     expect(store.meta()!.database).toEqual({ kind: 'postgres', at: `postgres ${server.host === 'localhost' ? '127.0.0.1' : server.host}:${server.port}/${runDatabase}`, poolSize: 3 });
     const schema = schemaOf(first)!;
     expect(schema).toMatch(/^eval_ws_[0-9a-f]{8}$/);
-    const ws = path.join(store.workDir('fixture-life', 'knode'), 'ws');
+    const ws = runWorkspaceDir(first, 'fixture-life');
     expect(fs.existsSync(path.join(ws, '.knode', 'db'))).toBe(false);
     expect(await chunks(schema)).toBeGreaterThan(0);
     expect((await listEvalSchemas(evalDatabase(defaultConfig().database, { url: databaseUrl }))).find((s) => s.schema === schema)?.workspace).toBe(path.resolve(ws));
@@ -223,7 +224,7 @@ describe.skipIf(!ready)('an evaluation on PostgreSQL', () => {
     expect((store.allBuilds().find((b) => b.system === 'knode')!.notes as { reusedFrom?: string }).reusedFrom).toBe('pg-base');
     expect(store.allAnswers().filter((a) => a.error)).toEqual([]);
     expect(store.allAnswers().some((a) => a.system === 'knode-ask' && a.batch === '02')).toBe(true);
-    const record = JSON.parse(fs.readFileSync(path.join(store.workDir('fixture-life', 'knode'), 'ws', '.knode', 'eval-index.json'), 'utf8')) as { schema: string };
+    const record = JSON.parse(fs.readFileSync(path.join(runWorkspaceDir(reuse, 'fixture-life'), '.knode', 'eval-index.json'), 'utf8')) as { schema: string };
     expect(record.schema).not.toBe(schemaOf(base));
     // the update batches grew the clone, not the base
     expect(await chunks(record.schema)).toBeGreaterThan(before);
@@ -257,7 +258,9 @@ describe.skipIf(!ready)('an evaluation on PostgreSQL', () => {
     expect((await listEvalSchemas(cfg)).map((s) => s.schema)).not.toContain(schema);
     // a run directory deleted outright: its schema is listed at the next run's start, and only dropped on request
     const other = schemaOf(path.join(tmp, 'runs', 'pg-reuse'));
-    const otherRecord = JSON.parse(fs.readFileSync(path.join(new RunStore(path.join(tmp, 'runs', 'pg-reuse')).workDir('fixture-life', 'knode'), 'ws', '.knode', 'eval-index.json'), 'utf8')) as { schema: string };
+    const otherRecord = JSON.parse(fs.readFileSync(path.join(runWorkspaceDir(path.join(tmp, 'runs', 'pg-reuse'), 'fixture-life'), '.knode', 'eval-index.json'), 'utf8')) as { schema: string };
+    // a run's builds live in the evaluation root (docs/design/35): its workspace folder deleted outright orphans the schema
+    fs.rmSync(runWorkspaceDir(path.join(tmp, 'runs', 'pg-reuse'), 'fixture-life'), { recursive: true, force: true });
     fs.rmSync(path.join(tmp, 'runs', 'pg-reuse'), { recursive: true, force: true });
     expect((await orphanedEvalSchemas(cfg)).map((s) => s.schema)).toEqual([otherRecord.schema]);
     expect(other).toBeDefined();
