@@ -400,6 +400,16 @@ export function registerEvalCommands(program: Command): void {
       if (created) console.log(`next: an account to sign in with (\`knode-os user add <name> --admin --data ${root.dir}\`), then \`knode-os serve --data ${root.dir}\``);
     });
   evalCmd
+    .command('adopt <runDir>')
+    .description("copy the knode builds of a run made before evaluation roots into the root as workspaces, for the viewer; the run directory is not changed (docs/design/35 §3)")
+    .option('--root <dir>', 'the evaluation root (default: $KNODE_EVAL_ROOT, else ~/knode-eval/server; made when missing)')
+    .option('--database-url <url>', 'the evaluation database, for a run on PostgreSQL whose workspaces name the URL by an environment variable')
+    .action(async (runDir: string, opts: { root?: string; databaseUrl?: string }) => {
+      const { adoptRun } = await import('./adopt.js');
+      const adopted = await adoptRun(runDir, { root: opts.root, url: opts.databaseUrl, log: (m) => console.log(`  ${m}`) });
+      console.log(`${adopted.length} build(s) of ${path.resolve(runDir)} in the evaluation root`);
+    });
+  evalCmd
     .command('drop [runDir]')
     .description("drop a run's knode builds — its workspaces in the evaluation root, folder and index, or (a run made before roots) its indexes — and the tasks and results serve keeps for it; its records stay. --orphaned: drop the evaluation schemas whose workspace directory is gone")
     .option('--database-url <url>', 'the evaluation database (default: what the run\'s workspaces name, or $KNODE_EVAL_DATABASE_URL)')
