@@ -1100,6 +1100,8 @@ export function websearchText(query: string): string {
 const KEYWORD_FETCH_TERMS = 8;
 /** A term found in this many chunks is counted, and listed, no further. */
 const KEYWORD_DF_CAP = 1000;
+/** Chunks of one term read at most while looking for `KEYWORD_DF_CAP` of them in scope (`hitsInScope`). */
+const SCOPE_SCAN_CAP = 50 * KEYWORD_DF_CAP;
 const BM25_K1 = 1.2;
 const BM25_B = 0.75;
 
@@ -1260,6 +1262,38 @@ async function keywordSearch(store: Store, query: string, k: number, sides: Side
 
 const candidateColumns = (sides: SideSql) => `c.id AS chunk_id, c.document_id, d.path, d.title, d.doc_date, c.content, ${sides.generated('d')} AS generated`;
 
+/**
+ * SQL for at most `cap` chunks that hold what `holds` asks of `chunks c` (a
+ * gram-index match, as a rule) and belong to a document `cond` is true of —
+ * the cap counted among those, not before them. Taken before, a cap fills
+ * with whatever the index lists first: for a word a repository or an archive
+ * folder is full of, 1,000 chunks the search then throws away, and none of
+ * the ones it was for (until 2026-11-17).
+ *
+ * The lookup is a subquery of its own and each chunk's document is looked up
+ * beside it (a `LIMIT` and an `OFFSET 0` keep both where they are): the index
+ * answers first, documents are read by key one chunk at a time, and reading
+ * stops at the cap. Joined directly, a planner without statistics (PGlite
+ * never analyzes) starts from `documents` and evaluates `match_grams` on
+ * every chunk.
+ *
+ * What it costs is a document read for every chunk passed over on the way
+ * to the cap: nothing more than before where most chunks are in scope, and
+ * every chunk of the term where few are (measured on PGlite, 40,000 chunks,
+ * a term in 20,003 of them: 22 ms searching everything, 50 ms searching a
+ * folder of three documents). `SCOPE_SCAN_CAP` bounds that for a term of
+ * a very large index: past it the list is again a sample.
+ *
+ * `select` reads `m.id`, `m.document_id` and the columns `doc` names off
+ * `documents d`, as `d.<name>`.
+ */
+export function hitsInScope(q: { select: string; holds: string; doc: string; cond: string; cap: string }): string {
+  return `SELECT ${q.select}
+     FROM (SELECT c.id, c.document_id FROM chunks c WHERE ${q.holds} LIMIT ${SCOPE_SCAN_CAP}) m
+     CROSS JOIN LATERAL (SELECT ${q.doc} FROM documents d WHERE d.id = m.document_id AND ${q.cond} OFFSET 0) d
+     LIMIT ${q.cap}`;
+}
+
 interface TermLists {
   /** Chunks holding each term, counted up to `KEYWORD_DF_CAP`. */
   df: number[];
@@ -1276,6 +1310,13 @@ interface TermLists {
  * live and in scope. The index holds a superset of the substring matches (a
  * Latin term's trigrams can sit in different words), near enough for a weight
  * and corrected when the text is scored.
+ *
+ * The count is of the whole corpus, since a term's weight is. A list that
+ * stopped at the cap is a sample of the term's chunks, taken before the
+ * search's conditions: when most of it is outside the search it says little
+ * of what is inside, and the term is listed again among the documents in
+ * scope (`hitsInScope`). A sample that mostly stayed is kept as it is, so a
+ * search of everything pays for one lookup a term, as before.
  *
  * The index lookups run in a materialized CTE, away from the join with
  * `documents`. Joined directly, a planner without statistics (PGlite never
@@ -1307,7 +1348,33 @@ async function termLists(store: Store, terms: string[], sides: SideSql, asOf?: T
     if (r.id === null) df[r.i] = r.df ?? 0;
     else listed.push({ i: r.i, id: r.id, generated: r.generated === true });
   }
-  return { df, listed, picked: rarestTerms(df) };
+  const picked = rarestTerms(df);
+  const kept = new Map<number, number>();
+  for (const r of listed) kept.set(r.i, (kept.get(r.i) ?? 0) + 1);
+  const again = picked.filter((i) => df[i] >= KEYWORD_DF_CAP && (kept.get(i) ?? 0) < KEYWORD_DF_CAP / 2);
+  if (again.length === 0) return { df, listed, picked };
+
+  const q = new Params();
+  const scope = searchable('d', q, sides, asOf, filter);
+  const limit = q.add(KEYWORD_DF_CAP);
+  const inScope = await store.query<{ i: number; id: string; generated: boolean }>(
+    again
+      .map((i) => `(${hitsInScope({
+        select: `${i} AS i, m.id, d.generated`,
+        holds: `${expr} @@ ${q.add(gramQuery([termGrams(terms[i])], 1))}::tsquery`,
+        doc: `${sides.generated('d')} AS generated`,
+        cond: scope,
+        cap: limit,
+      })})`)
+      .join(' UNION ALL '),
+    q.list,
+  );
+  const relisted = new Set(again);
+  return {
+    df,
+    listed: [...listed.filter((r) => !relisted.has(r.i)), ...inScope.map((r) => ({ i: r.i, id: r.id, generated: r.generated === true }))],
+    picked,
+  };
 }
 
 /**
@@ -1346,8 +1413,7 @@ async function listedCandidates(
     const lim = p.add(pool);
     const cond = searchable('d', p, sides, asOf, filter);
     const rows = await store.query<{ id: string; generated: boolean }>(
-      `WITH hit AS MATERIALIZED (SELECT c.id, c.document_id FROM chunks c WHERE ${MATCH_INDEXES.chunks.expr('c')} @@ $1::tsquery LIMIT ${lim})
-       SELECT h.id, ${sides.generated('d')} AS generated FROM hit h JOIN documents d ON d.id = h.document_id WHERE ${cond}`,
+      hitsInScope({ select: 'm.id, d.generated', holds: `${MATCH_INDEXES.chunks.expr('c')} @@ $1::tsquery`, doc: `${sides.generated('d')} AS generated`, cond, cap: lim }),
       p.list,
     );
     for (const r of rows) {
@@ -1509,15 +1575,17 @@ export async function chunksForTerms(
   if (indexServes(store, terms)) {
     const expr = MATCH_INDEXES.chunks.expr('c');
     const cap = p.add(KEYWORD_DF_CAP);
-    const lists = terms.map((t, i) => `(SELECT ${i} AS i, c.id, c.document_id FROM chunks c WHERE ${expr} @@ ${p.add(gramQuery([phraseGrams(t)], 1))}::tsquery LIMIT ${cap})`);
     const cond = searchable('d', p, sides, opts.asOf, opts.filter);
     const out = p.add(opts.exclude);
-    const hits = await store.query<{ i: number; id: string }>(
-      `WITH hit AS MATERIALIZED (${lists.join(' UNION ALL ')})
-       SELECT h.i, h.id FROM hit h JOIN documents d ON d.id = h.document_id
-       WHERE ${cond} AND NOT ${sides.generated('d')} AND h.id <> ALL(${out}::text[])`,
-      p.list,
-    );
+    // each term's chunks among the sources this search may read, outside `exclude`: the cap counts those
+    const lists = terms.map((t, i) => `(${hitsInScope({
+      select: `${i} AS i, m.id`,
+      holds: `${expr} @@ ${p.add(gramQuery([phraseGrams(t)], 1))}::tsquery AND c.id <> ALL(${out}::text[])`,
+      doc: '1 AS held',
+      cond: `${cond} AND NOT ${sides.generated('d')}`,
+      cap,
+    })})`);
+    const hits = await store.query<{ i: number; id: string }>(lists.join(' UNION ALL '), p.list);
     const weight = new Map<string, number>();
     for (const h of hits) weight.set(h.id, (weight.get(h.id) ?? 0) + idf[h.i]);
     const ids = new Set<string>();
