@@ -9,13 +9,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
  */
 
 const timing = { reviewMs: 0 };
-const calls: { reviews: number; judges: unknown[] } = { reviews: 0, judges: [] };
+const calls: { reviews: number; judges: unknown[]; order: string[]; after: unknown[] } = { reviews: 0, judges: [], order: [], after: [] };
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 vi.mock('../src/graph/dedupe.js', () => ({
   auditDuplicateEntities: async (ctx: { judge?: unknown }) => {
     calls.reviews++;
     calls.judges.push(ctx.judge);
+    calls.order.push('entities');
     await sleep(timing.reviewMs);
     return { suggested: 0, autoMerged: 0, llmRejected: 0, leftToPerson: 0 };
   },
@@ -23,7 +24,15 @@ vi.mock('../src/graph/dedupe.js', () => ({
 vi.mock('../src/graph/claim-dedupe.js', () => ({
   auditDuplicateClaims: async (ctx: { judge?: unknown }) => {
     calls.judges.push(ctx.judge);
+    calls.order.push('claims');
     return { merged: 0, suggested: 0, conflicts: 0, leftToPerson: 0 };
+  },
+}));
+vi.mock('../src/ingest/after-extraction.js', () => ({
+  afterExtraction: async (_ctx: unknown, written: unknown) => {
+    calls.order.push('after');
+    calls.after.push(written);
+    return { superseded: 0, summaries: [], entityPages: [], corpusPages: [] };
   },
 }));
 vi.mock('../src/wiki/pages.js', () => ({
@@ -47,6 +56,8 @@ afterEach(() => {
   for (const stop of stops.splice(0)) stop();
   calls.reviews = 0;
   calls.judges = [];
+  calls.order = [];
+  calls.after = [];
 });
 
 describe('the follow-up loop', () => {
@@ -111,6 +122,30 @@ describe('the follow-up loop', () => {
     expect(pauses).toBe(1);
     followUp.setActive(true);
     expect(pauses).toBe(1);
+  });
+});
+
+describe('what a review does with what the slots wrote', () => {
+  it('runs the steps after extraction for it, once both audits are done — as a document pass does', async () => {
+    timing.reviewMs = 5;
+    // a review of the test before may still be on its way out
+    await sleep(50);
+    calls.order = [];
+    calls.after = [];
+    let taken = 0;
+    const scheduler = {
+      takeFinished: () => (taken++ === 0
+        ? { written: 2, failed: 0, documents: ['raw/docs/a.md', 'raw/docs/b.md'], entityIds: ['e1', 'e2', 'e1'], claimIds: ['c1', 'c1', 'c2'] }
+        : { written: 0, failed: 1, documents: [], entityIds: [], claimIds: [] }),
+    };
+    const followUp = startFollowUp(ctx, scheduler as never, { reviewIntervalMs: 20 });
+    stops.push(followUp.stop);
+    await sleep(200);
+    expect(taken).toBeGreaterThan(1);
+    // supersession and the pages follow the merges: a claim merged into another takes no part in a series
+    expect(calls.order.slice(0, 3)).toEqual(['entities', 'claims', 'after']);
+    // each id once; and a round that wrote nothing (only gave up on a document) has nothing to run them for
+    expect(calls.after).toEqual([{ entityIds: ['e1', 'e2'], claimIds: ['c1', 'c2'], documents: ['raw/docs/a.md', 'raw/docs/b.md'] }]);
   });
 });
 

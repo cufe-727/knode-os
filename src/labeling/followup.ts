@@ -1,6 +1,7 @@
 import { AppContext } from '../context.js';
 import { auditDuplicateClaims } from '../graph/claim-dedupe.js';
 import { auditDuplicateEntities } from '../graph/dedupe.js';
+import { afterExtraction } from '../ingest/after-extraction.js';
 import { EmbeddingProvider } from '../ingest/embeddings.js';
 import { refreshNavigationIfChanged } from '../wiki/navigation.js';
 import { reconcileViews } from '../wiki/pages.js';
@@ -11,9 +12,12 @@ import { LabelingScheduler } from './scheduler.js';
  * What follows extraction in `serve`, now that extraction runs continuously
  * (src/labeling/scheduler.ts) instead of in passes: every
  * `extraction.intervalMinutes`, the duplicate-entity and duplicate-claim
- * audits over what was written since the last round, then the views that
- * depend on it — the Resolve and Merge-claims steps of the old pass
- * (docs/design/09, 10). A review offers all its judge calls at once (`judge`,
+ * audits over what was written since the last round — the Resolve and
+ * Merge-claims steps of the old pass (docs/design/09, 10) — then what a pass
+ * does after them (src/ingest/after-extraction.ts): supersession among the
+ * subjects of the new claims, those claims on their documents' summary pages,
+ * entity pages and the pages across documents; then the views that depend on
+ * all of it. A review offers all its judge calls at once (`judge`,
  * src/work/judge.ts), so `serve`'s judge slots and remote workers answer them
  * side by side instead of one after another.
  *
@@ -114,6 +118,12 @@ export function startFollowUp(ctx: AppContext, scheduler: LabelingScheduler, opt
       } catch (err) {
         log(`claim merge failed: ${err instanceof Error ? err.message : err}`);
       }
+    }
+    if (batch.written > 0) {
+      // after the merges, as in a pass: a claim merged into another takes no part in a series
+      const after = await afterExtraction(ctx, { entityIds: [...new Set(batch.entityIds)], claimIds: [...new Set(batch.claimIds)], documents: batch.documents }, { onProgress: log });
+      if (after.superseded) parts.push(`${after.superseded} supersession marks updated`);
+      if (after.entityPages.length || after.corpusPages.length) parts.push(`pages: ${after.entityPages.length} entity, ${after.corpusPages.length} across documents`);
     }
     log(`document pass: ${parts.join('; ')}`);
     const views = await reconcileViews(ctx, { actor: 'tier1', llm: false, onProgress: log });
