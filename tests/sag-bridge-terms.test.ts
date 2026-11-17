@@ -70,7 +70,9 @@ describe('the terms of the seeds', () => {
  * entity walk can reach it.
  *
  *   s1  the seed: the Kestrel project and its lead, Halvard Lindqvist
+ *   s2  the direct route's second: the project again, not a seed
  *   a1  Halvard Lindqvist's earlier post       reached by the name only
+ *   e1  a passage about him without the name   reached by the one entity extraction did link
  *   x1  a passage with none of it
  *   w1  a generated page that holds the name   never put forward by a term
  */
@@ -109,10 +111,22 @@ describe('SAG with bridge terms', () => {
     fs.mkdirSync(path.join(tmp, '.knode'), { recursive: true });
     store = await Store.open(tmp, embedder.dimensions);
     await addChunk('s1', 'The Kestrel project is led by Halvard Lindqvist.', { vector: [1, 0, 0, 0] });
+    await addChunk('s2', 'The Kestrel project slipped a week.');
     await addChunk('a1', 'Before that, Halvard Lindqvist ran the Oslo depot for six years.');
+    await addChunk('e1', 'The depot in Bergen answers to him.');
     await addChunk('x1', 'Ferry timetables changed for the winter.');
     await addChunk('w1', 'Halvard Lindqvist: a person named in two documents.', { kind: 'view', root: 'wiki' });
+    await store.query(`INSERT INTO entities (id, name, type, mention_count) VALUES ('p1', 'Halvard Lindqvist', 'person', 2)`);
+    for (const id of ['s1', 'e1']) {
+      await store.query(`INSERT INTO entity_mentions (entity_id, chunk_id, document_id) VALUES ('p1', $1, $2)`, [id, `d-${id}`]);
+    }
     await store.indexing;
+  });
+
+  it('ranks what the entity walk reached after the direct route\'s places, with no bridge terms at all', async () => {
+    const results = await search(store, embedder, 'Who leads the Kestrel project?', { mode: 'sag', k: 8, track: false, sag: sag(0) });
+    expect(results.map((r) => r.chunkId)).toEqual(['s1', 's2', 'e1']);
+    expect(results[2].trace).toMatchObject({ route: 'sag', bridgeEntities: ['Halvard Lindqvist'] });
   });
 
   afterAll(async () => {
@@ -135,6 +149,13 @@ describe('SAG with bridge terms', () => {
     // the unrelated passage and the generated page are not put forward
     const bridged = results.filter((r) => r.trace?.bridgeTerms).map((r) => r.chunkId);
     expect(bridged).toEqual(['a1']);
+  });
+
+  it('ranks what a term reached after the direct route\'s places, not level with its first', async () => {
+    const results = await search(store, embedder, 'Who leads the Kestrel project?', { mode: 'sag', k: 8, track: false, sag: sag(10) });
+    const ids = results.map((r) => r.chunkId);
+    expect(ids.slice(0, 2)).toEqual(['s1', 's2']);
+    expect(ids.indexOf('a1')).toBeGreaterThan(ids.indexOf('s2'));
   });
 
   it('finds the same through the substring index and by a scan', async () => {

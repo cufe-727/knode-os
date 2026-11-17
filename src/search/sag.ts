@@ -318,11 +318,24 @@ function fuseStructuralCandidates(
  * sources (search.ts GENERATED_SHARE). The direct route is itself cut to that
  * share of its own, longer, list: three pages lead its twelve, and its first
  * four were handed on as they stood.
+ *
+ * The order of the `k` is by the two routes' ranks together, the structural
+ * route's ranks starting where the direct route's places end: what the walk
+ * reached follows what the question itself found, and a passage both routes
+ * found rises. Until 2026-11-17 both counted from one, so the walk's first
+ * stood level with the direct route's first and took the second place, its
+ * second the fourth: on the 10× reports copy that cost the first five of
+ * eight results 18 of 297 questions (30 lost, 12 won), and with bridge terms
+ * on MuSiQue 7 points of recall at 2. Which passages are chosen did not change.
  */
 function mergeRoutes(direct: SearchResult[], structural: SearchResult[], k: number, directRatio: number, pages: Set<string>, places: number): SearchResult[] {
+  const directQuota = Math.round(k * directRatio);
+  const structuralQuota = k - directQuota;
   const fused = new Map<string, SearchResult>();
   const fold = (items: SearchResult[], route: 'direct' | 'sag') => {
-    items.forEach((item, rank) => {
+    const from = route === 'sag' ? directQuota : 0;
+    items.forEach((item, at) => {
+      const rank = from + at;
       const contribution = 1 / (RRF_K + rank + 1);
       const previous = fused.get(item.chunkId);
       if (previous) {
@@ -341,8 +354,6 @@ function mergeRoutes(direct: SearchResult[], structural: SearchResult[], k: numb
   fold(direct, 'direct');
   fold(structural, 'sag');
 
-  const directQuota = Math.round(k * directRatio);
-  const structuralQuota = k - directQuota;
   const selected: SearchResult[] = [];
   const selectedIds = new Set<string>();
   let pagesTaken = 0;

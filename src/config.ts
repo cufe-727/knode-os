@@ -712,7 +712,7 @@ export interface SagSearchConfig {
   candidatePool: number;
   /** Number of chunk -> entity -> chunk expansion rounds. */
   maxHops: number;
-  /** Reserved share of final results for the direct retrieval route. */
+  /** Reserved share of final results for the direct retrieval route; the walk's passages rank after those places. */
   directRatio: number;
   /**
    * Terms of the seed passages searched for as bridges, beside the entities
