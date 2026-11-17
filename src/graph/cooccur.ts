@@ -95,12 +95,38 @@ export async function coOccurringEntities(q: Queryable, ids: readonly string[], 
   const perEntity = Math.max(1, Math.floor(opts.perEntity ?? DEFAULT_PER_ENTITY));
   const maxDocuments = Math.max(1, Math.floor(opts.maxDocuments ?? DEFAULT_MAX_DOCUMENTS));
 
-  // seeds and `among` go as array parameters: graphOverview passes the web API's limit through uncapped
+  // The seeds' recent documents first, in a statement of their own. Asked for
+  // inside the next one (`document_id = ANY(ARRAY(SELECT …))`), the planner
+  // took an array of unknown length for ten documents, expected a few thousand
+  // mention rows where there were half a million, and joined them to
+  // themselves in a nested loop: twelve entities of the finance workspace took
+  // 200 s (3.1 billion comparisons), against 2 s with the documents bound.
+  const sp = new Params();
+  const seedPh = sp.add(seeds);
+  const docCond = docLiveAt('d', sp, opts.asOf, opts.filter ?? NO_FILTER);
+  const maxDocs = sp.add(maxDocuments);
+  const seedDocs = await q.query<{ entity_id: string; document_id: string }>(
+    `SELECT entity_id, document_id FROM (
+       SELECT x.entity_id, x.document_id,
+              row_number() OVER (PARTITION BY x.entity_id ORDER BY x.doc_date DESC NULLS LAST, x.updated_at DESC, x.document_id) AS rn
+       FROM (
+         SELECT DISTINCT m.entity_id, m.document_id, d.doc_date, d.updated_at
+         FROM entity_mentions m
+         JOIN documents d ON d.id = m.document_id
+         WHERE m.entity_id = ANY(${seedPh}::text[]) AND ${docCond}
+       ) x
+     ) recent
+     WHERE rn <= ${maxDocs}`,
+    sp.list,
+  );
+  if (seedDocs.length === 0) return [];
+
+  // seeds, documents and `among` go as array parameters: graphOverview passes the web API's limit through uncapped
   const p = new Params();
-  const seedPh = p.add(seeds);
+  const pairEntities = p.add(seedDocs.map((r) => r.entity_id));
+  const pairDocuments = p.add(seedDocs.map((r) => r.document_id));
+  const documents = p.add([...new Set(seedDocs.map((r) => r.document_id))]);
   const amongCond = among ? `AND o.entity_id = ANY(${p.add(among)}::text[])` : '';
-  const docCond = docLiveAt('d', p, opts.asOf, opts.filter ?? NO_FILTER);
-  const maxDocs = p.add(maxDocuments);
   const targetLive = rowLiveAt('e', 'entity', p, opts.asOf);
   const lim = p.add(perEntity);
   // Everything after the seeds' recent documents is read from those documents'
@@ -110,22 +136,12 @@ export async function coOccurringEntities(q: Queryable, ids: readonly string[], 
   // mentions, against 2 s this way.
   const rows = await q.query<{ source: string; target: string; chunks: number; documents: number }>(
     `WITH seed_docs AS (
-       SELECT entity_id, document_id FROM (
-         SELECT x.entity_id, x.document_id,
-                row_number() OVER (PARTITION BY x.entity_id ORDER BY x.doc_date DESC NULLS LAST, x.updated_at DESC, x.document_id) AS rn
-         FROM (
-           SELECT DISTINCT m.entity_id, m.document_id, d.doc_date, d.updated_at
-           FROM entity_mentions m
-           JOIN documents d ON d.id = m.document_id
-           WHERE m.entity_id = ANY(${seedPh}::text[]) AND ${docCond}
-         ) x
-       ) recent
-       WHERE rn <= ${maxDocs}
+       SELECT s.entity_id, s.document_id FROM unnest(${pairEntities}::text[], ${pairDocuments}::text[]) AS s(entity_id, document_id)
      ),
      doc_mentions AS MATERIALIZED (
        SELECT m.document_id, m.entity_id, m.chunk_id
        FROM entity_mentions m
-       WHERE m.document_id = ANY(ARRAY(SELECT DISTINCT document_id FROM seed_docs))
+       WHERE m.document_id = ANY(${documents}::text[])
      ),
      seed AS (
        SELECT DISTINCT dm.entity_id, dm.chunk_id

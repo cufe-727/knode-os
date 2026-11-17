@@ -344,12 +344,14 @@ describe('the pipeline', () => {
 
   it('pulls from a program speaking knode-feed/1, keeping what came before its last checkpoint when it fails', async () => {
     const script = path.join(tmp, 'source.mjs');
+    // an hour old whenever the test runs: a fixed date leaves a new feed's first window after a week
+    const published = new Date(Date.now() - 3_600_000).toISOString();
     fs.writeFileSync(script, `let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const req=JSON.parse(s);const n=(req.state&&req.state.n)||0;
       const out=o=>process.stdout.write(JSON.stringify(o)+'\\n');
       out({type:'log',message:'from '+n});
-      out({type:'item',item:{id:'c'+(n+1),title:'Item '+(n+1),text:'body',publishedAt:'2026-11-09T01:00:00Z'}});
+      out({type:'item',item:{id:'c'+(n+1),title:'Item '+(n+1),text:'body',publishedAt:'${published}'}});
       out({type:'state',state:{n:n+1}});
-      if(n===1){out({type:'item',item:{id:'lost',text:'x',publishedAt:'2026-11-09T01:00:00Z'}});out({type:'error',message:'site went away'});process.exit(2)}
+      if(n===1){out({type:'item',item:{id:'lost',text:'x',publishedAt:'${published}'}});out({type:'error',message:'site went away'});process.exit(2)}
     })`);
     const feed = saveFeed(data, 'program', { connector: 'command', params: { command: process.execPath, args: [script] }, render: { period: 'item' } });
     const first = await runFeed(ctx, feed);

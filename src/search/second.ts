@@ -50,6 +50,8 @@ export const SECOND_FACTS = 12;
 export const BRIDGE_DOCS = 15;
 /** One mentioned in more (up to this many), only through passages that also hold a word the first round missed. */
 export const BRIDGE_DOCS_WORDED = 80;
+/** Mention rows read of an entity before its documents are counted in full (never, when these already hold more than BRIDGE_DOCS_WORDED). */
+export const DOCS_SAMPLE = 400;
 /** Entities reached, looked further from at most. */
 const BRIDGES = 4;
 /** Passages read as candidates at most, the best first (nearest the question, else holding most missing words). */
@@ -205,6 +207,9 @@ export async function secondRound(
   const reachedNames = new Map<string, number>();
   for (const f of facts.slice(0, 40)) for (const n of [f.subject, f.object]) if (n && !names.includes(n)) reachedNames.set(n, (reachedNames.get(n) ?? 0) + 1);
   // `own`: passages mentioning it that mention no entity the question names — not the passage that led to it
+  // `docs`: exact up to BRIDGE_DOCS_WORDED, which is all a bridge is chosen by; of an entity in more, only that it is
+  // more — from its first DOCS_SAMPLE mention rows, not from every one a hub has (a million rows for one question's
+  // 139 entities on the finance workspace, 5.5 s). Few documents among a full sample are counted in full.
   const reached = await q<{ id: string; name: string; docs: number; passages: number; own: number }>(
     `WITH named AS MATERIALIZED (SELECT DISTINCT chunk_id FROM entity_mentions WHERE entity_id = ANY($3::text[]) AND chunk_id = ANY($2::text[])),
      ctx AS (
@@ -213,7 +218,11 @@ export async function secondRound(
        FROM entity_mentions m WHERE m.chunk_id = ANY($2::text[]) GROUP BY 1
      )
      SELECT e.id, e.name, COALESCE(ctx.passages, 0) AS passages, COALESCE(ctx.own, 0) AS own,
-            (SELECT count(DISTINCT m.document_id)::int FROM entity_mentions m WHERE m.entity_id = e.id) AS docs
+            (SELECT CASE WHEN s.n <= ${BRIDGE_DOCS_WORDED} AND s.read >= ${DOCS_SAMPLE}
+                         THEN (SELECT count(DISTINCT m.document_id)::int FROM entity_mentions m WHERE m.entity_id = e.id)
+                         ELSE s.n END
+             FROM (SELECT count(DISTINCT x.document_id)::int AS n, count(*)::int AS read
+                   FROM (SELECT m.document_id FROM entity_mentions m WHERE m.entity_id = e.id LIMIT ${DOCS_SAMPLE}) x) s) AS docs
      FROM entities e LEFT JOIN ctx ON ctx.entity_id = e.id
      WHERE (e.name = ANY($1::text[]) OR ctx.entity_id IS NOT NULL) AND e.tx_to IS NULL AND e.canonical_id IS NULL AND NOT e.id = ANY($3::text[])`,
     [[...reachedNames.keys()], contexts.map((c) => c.chunkId), spellingIds],

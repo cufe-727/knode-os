@@ -1,13 +1,13 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { defaultConfig } from '../src/config.js';
 import { entityKeyKinds } from '../src/graph/normalize.js';
 import { EmbeddingProvider } from '../src/ingest/embeddings.js';
 import type { LlmClient } from '../src/llm/client.js';
 import { ask } from '../src/search/ask.js';
-import { missingTerms, questionWords, SECOND_CHUNKS, secondRound } from '../src/search/second.js';
+import { BRIDGE_DOCS_WORDED, DOCS_SAMPLE, missingTerms, questionWords, SECOND_CHUNKS, secondRound } from '../src/search/second.js';
 import { Store, toVectorLiteral, VECTOR_TYPE } from '../src/store/db.js';
 
 /**
@@ -239,6 +239,74 @@ describe('the second round', () => {
       named: ['orion'], contexts: [result('orion-2', 'Orion launched in week 32.')], facts: [], chain: false,
     });
     expect(r).toBeNull();
+  });
+});
+
+/**
+ * Whether an entity the first round reached is looked further from depends on how many documents mention it, up to
+ * BRIDGE_DOCS_WORDED. Counted in full for every entity the round's passages mention, that was the mention rows of
+ * every hub among them: 139 entities and a million rows, 5.5 s, for one question on a copy of the finance workspace.
+ */
+describe('the documents of what a round reached', () => {
+  const MEGA = 3000;
+  beforeAll(async () => {
+    await addEntity('r-20', 'R-20', 'other');
+    await addEntity('mega', 'Megacorp', 'organization');
+    await addEntity('densa', 'Densa', 'organization');
+    const bulk = async (prefix: string, docs: number, chunksPerDoc: number, entity: string) => {
+      await store.query(`INSERT INTO documents (id, path, root, title, sha256, bytes, status) SELECT $1 || d, 'raw/docs/' || $1 || d || '.md', 'docs', $1 || d, 'sha-' || $1 || d, 10, 'indexed' FROM generate_series(1, $2::int) d`, [prefix, docs]);
+      await store.query(`INSERT INTO scopes (id, kind, key, sha, status, applied_at) SELECT 's-' || $1 || d, 'doc', 'raw/docs/' || $1 || d || '.md', 'sha-' || $1 || d, 'active', now() FROM generate_series(1, $2::int) d`, [prefix, docs]);
+      await store.query(
+        `INSERT INTO chunks (id, document_id, seq, content, token_count, tsv)
+         SELECT 'c-' || $1 || d || '-' || c, $1 || d, c, 'filler', 1, to_tsvector('simple', 'filler') FROM generate_series(1, $2::int) d, generate_series(0, $3::int - 1) c`,
+        [prefix, docs, chunksPerDoc],
+      );
+      await store.query(
+        `INSERT INTO entity_mentions (entity_id, chunk_id, document_id, scope_id)
+         SELECT $4, 'c-' || $1 || d || '-' || c, $1 || d, 's-' || $1 || d FROM generate_series(1, $2::int) d, generate_series(0, $3::int - 1) c`,
+        [prefix, docs, chunksPerDoc, entity],
+      );
+    };
+    // a hub: three thousand documents; and a name written sixty times in each of ten documents
+    await bulk('mega-', MEGA, 1, 'mega');
+    await bulk('densa-', 10, 60, 'densa');
+    await addDoc('ctx20', 'Megacorp and Densa discussed risk R-20.', ['mega', 'densa', 'r-20']);
+  }, 120_000);
+
+  const reachedStatement = async () => {
+    const seen: { sql: string; params?: unknown[] }[] = [];
+    const real = store.query.bind(store);
+    const spy = vi.spyOn(store, 'query').mockImplementation(((sql: string, params?: unknown[]) => { seen.push({ sql, params }); return real(sql, params); }) as never);
+    try {
+      await secondRound(store, 'Who raised risk R-20, and where did that person move?', {
+        named: ['r-20'], contexts: [result('ctx20', 'Megacorp and Densa discussed risk R-20.')], facts: [], chain: true,
+      });
+    } finally {
+      spy.mockRestore();
+    }
+    const main = seen.find((x) => /WITH named AS MATERIALIZED/.test(x.sql));
+    expect(main).toBeDefined();
+    return main!;
+  };
+
+  it('are counted exactly up to the most a bridge may have, and only known to be more beyond it', async () => {
+    const main = await reachedStatement();
+    const rows = await store.query<{ id: string; docs: number }>(main.sql, main.params);
+    const docs = Object.fromEntries(rows.map((r) => [r.id, Number(r.docs)]));
+    // sixty mentions a document, six hundred in all: more rows than the sample, and still exactly eleven documents
+    expect(docs.densa).toBe(11);
+    expect(docs.mega).toBeGreaterThan(BRIDGE_DOCS_WORDED);
+  });
+
+  it('do not cost a read of every mention of a hub', async () => {
+    const main = await reachedStatement();
+    const [row] = await store.query<Record<string, unknown>>(`EXPLAIN (ANALYZE, FORMAT JSON) ${main.sql}`, main.params);
+    const plan = Object.values(row)[0] as unknown;
+    interface PlanNode { 'Relation Name'?: string; 'Actual Rows'?: number; 'Actual Loops'?: number; Plans?: PlanNode[] }
+    const tree = (typeof plan === 'string' ? JSON.parse(plan) : plan) as { Plan: PlanNode }[];
+    const read = (n: PlanNode): number => (n['Relation Name'] === 'entity_mentions' ? (n['Actual Rows'] ?? 0) * (n['Actual Loops'] ?? 1) : 0) + (n.Plans ?? []).reduce((sum, c) => sum + read(c), 0);
+    // the sample of each entity, and Densa's six hundred in full: nowhere near Megacorp's three thousand
+    expect(read(tree[0].Plan)).toBeLessThan(MEGA / 2 + 2 * DOCS_SAMPLE);
   });
 });
 
