@@ -1,5 +1,7 @@
 # 16 — Time in the knowledge base: entries, mention timelines, measures and market data
 
+> **Record status (2026-11-17): Proposal — only phase A (§5.4, claim-type normalisation) built.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §4, §10. No `entries`, `entity_occurrences`, `time.zone` or timeline reads exist. §5.2 (measures) is superseded by design 29. Schema v17 went to content languages. `knode_feed` here is unrelated to design 26's feeds.
+
 > Status: **proposed** (2026‑10‑27); phase A (§5.4) implemented (2026‑10‑28). Builds on [05](05-agent-context-db.md) §7.1 (`as_of`, `valid_at`, `freshness`)
 > and [13](13-client-contract.md) §4–§5 (`known_at`, the entry index, the `rt-market` datasource). Schema v17 here is
 > the version 13 planned for `available_at`, and carries those columns. Figures are read-only aggregates of the

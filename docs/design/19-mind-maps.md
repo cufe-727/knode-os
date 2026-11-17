@@ -1,5 +1,7 @@
 # 19 — Mind maps: pictures of trees read as outlines, drawn as maps, joined to the graph
 
+> **Record status (2026-11-17): Built; current.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §5.1.
+
 > Status: **implemented** (2026‑10‑30). Canonical form `type: MindMap` (src/mindmap/outline.ts), image
 > converter version 2 (mind maps come back as outlines), reviewed transcripts `<original>.md`, branch-path
 > chunks, extractor `tier0.mindmap` (src/mindmap/graph.ts), web/mindmap.js + web/mindmap.css; in the Mac app

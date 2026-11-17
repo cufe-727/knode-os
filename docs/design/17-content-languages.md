@@ -1,5 +1,7 @@
 # 17 — Content languages: a primary language to read in, translations kept beside the originals
 
+> **Record status (2026-11-17): Built; current.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §5.2. Stale here: "a fourth work kind" (there are eight); "sixth stage" as the last.
+
 > Status: **implemented** (2026‑10‑28). Config block `languages`, Translate stage `extraction.translateLlm`,
 > work kind `translate`, schema v17 (`documents.language`, `translations`), `GET /api/languages`,
 > `GET /api/file?lang=`, `POST /api/file/translate`, `knode-os translate`. Wiki pages on request, and a pick that

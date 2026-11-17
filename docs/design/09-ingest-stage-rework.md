@@ -1,8 +1,10 @@
 # 09 — Reworking the ingest stages: resolve right after extraction, summaries up front, pages to research
 
+> **Record status (2026-11-17): Built, then extended.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §5.2. Stale here: "five stages" (Translate is a sixth, 17); a background document pass every `intervalMinutes` (`serve` uses leased slots, 12); "the sources index still shows heat".
+
 > Status: **implemented** (2026‑09‑30). This changes two things in [06 — Wiki research agents](06-wiki-research-agent.md) —
 > when fuzzy entity resolution runs (06 · D3) and the nightly Tier‑2 concept pages — plus how Settings' Ingest
-> (formerly Pipeline) tab divides the stages. Chinese version: [09-ingest-stage-rework.zh-CN.md](09-ingest-stage-rework.zh-CN.md).
+> (formerly Pipeline) tab divides the stages.
 
 ## 0. Background and decisions
 

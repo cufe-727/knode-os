@@ -1,5 +1,7 @@
 # 32 — One work queue: producers publish, work waits, workers decide where it runs
 
+> **Record status (2026-11-17): Stages 1 and 2 built and merged; stage 3 not built.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §7. Stale here: "not merged or deployed" for stage 2; `serve`'s "own six" calls is one machine's setting (`processing.maxLocalCalls` defaults to 2).
+
 Status: stage 1 (D1–D5, §2–§4) built on 2026-11-14 and merged (§11). Stage 2 (D6, §5) built on 2026-11-15 on branch `claude/work-queue-stage-2`, not merged or deployed; §12 says what was built and decided. Stage 3 is a design.
 
 ## Problem

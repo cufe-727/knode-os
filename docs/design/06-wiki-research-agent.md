@@ -1,10 +1,12 @@
 # 06 — Wiki research agents and graph upgrades: ontology / entity resolution / time / recommendations / lint
 
+> **Record status (2026-11-17): Built.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §4, §5.4. Stale here: team as the default pipeline (`research.pipeline` defaults to `native`); job statuses and kinds (15, 22 add `draft`, `waiting`, `study`, `section`); supersession (reworked by 29); sessions are local only (27).
+
 > Status: **implemented** (2026‑09‑15). The third layer on top of
 > [01 — document processing](01-doc-processing-graph-wiki.md) and
 > [05 — Agent Context Database](05-agent-context-db.md): how the graph gets
 > curated-grade, and how the wiki is written by external coding-agent CLIs so
-> it keeps getting more accurate. Chinese original: [06-wiki-research-agent.zh-CN.md](06-wiki-research-agent.zh-CN.md).
+> it keeps getting more accurate. Chinese original: [06-wiki-research-agent.md](06-wiki-research-agent.md).
 
 ## 0. Goals and decisions
 

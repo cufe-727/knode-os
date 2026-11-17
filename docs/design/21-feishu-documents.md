@@ -1,5 +1,7 @@
 # 21 — Feishu documents: imported once or kept in sync, pictures included
 
+> **Record status (2026-11-17): Built; current.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §5.1.
+
 > Status: **implemented** (2026‑11‑02; batches, wiki trees and the daily check the same day). Source:
 > src/ingest/feishu/ (client.ts — lark-cli; markdown.ts — links and lark-cli's Markdown; mirror.ts — one document
 > as a folder; tree.ts — a wiki page with its pages, or a space, as a tree of folders; docs.ts — import, batches,

@@ -1,5 +1,7 @@
 # 04 — SAG 查询时事件检索
 
+> **Record status (2026-11-17): Phase 1 built; phase 2 not built.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §6.1. Stale here: "default remains hybrid" holds for `search`, but `ask` picks SAG itself for multi-hop questions (30); the model rerank idea became `retrieval.rerank`.
+
 本文记录 knode-os 对 [Zleap-AI/SAG](https://github.com/Zleap-AI/SAG) 和其
 [论文](https://arxiv.org/abs/2606.15971)中事件—实体检索思想的第一阶段实现。
 目标不是再引入一套 Python/Neo4j 服务，而是在现有 PGlite 派生索引上获得

@@ -1,6 +1,8 @@
 # 13 — The client contract: how other projects use knode-os, starting with rookie-trade
 
-> Status: **proposed** (2026‑10‑21). Chinese version: [13-client-contract.zh-CN.md](13-client-contract.zh-CN.md).
+> **Record status (2026-11-17): Proposal — not built.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §9, §10. No `contract/`, SDK, `known_at` or `available_at` exists. §0 still describes the four surfaces as they are, except "33 tools" and the token scope list. Schema v17 went to content languages (17).
+
+> Status: **proposed** (2026‑10‑21).
 > Builds on [05](05-agent-context-db.md) (time axes, worksets, trust tiers), [08](08-fragment-import.zh-CN.md)
 > (rookie-trade's exports) and [12](12-remote-processing.md) (`/remote/v1` and its tokens). The contract's layout
 > follows AgentMux's `contract/`.

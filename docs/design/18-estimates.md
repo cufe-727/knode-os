@@ -1,5 +1,7 @@
 # 18 — Estimates before a task starts: time, tokens, transfer, cost, and each plan's share
 
+> **Record status (2026-11-17): Built.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §7. Stale here: D7 "Claude Code's plan windows are not readable" (`src/estimate/claude-limits.ts` records them).
+
 > Status: **implemented** (2026‑10‑28). `src/estimate/{estimate,processing,study,ledger,codex,quota,services,format}.ts`,
 > `src/llm/usage.ts`; `GET /api/labeling/estimate`, `GET /api/research/studies/:id/estimate`, `GET /api/usage`;
 > `knode-os estimate [processing | study <id>]`; the web UI's Start processing / Start research dialog, the Mac app's

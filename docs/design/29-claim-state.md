@@ -1,5 +1,7 @@
 # 29 — Claim state: current values with history, supersession in every domain, a judge that pays only for doubt
 
+> **Record status (2026-11-17): Built, including §2.1 and §9.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §4. The branches named here are merged. Stale here: the first rename rule in §8 (replaced by §5); "ran in refine alone" (replaced by §2.1). Schema is now v21 (v20 relation sources, v21 week-keyed claim ids).
+
 > Status: **implemented** on branch `claude/claim-state-model-62617a` (2026‑11‑13), not merged or deployed.
 > Code: `src/graph/claim-state.ts` (reading a claim as attribute + value), `src/graph/claim-state-store.ts` (backfill,
 > per-subject keys, supersession), `src/graph/entity-context.ts` (renames and namesakes), `src/store/temporal.ts`

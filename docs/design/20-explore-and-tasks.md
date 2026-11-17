@@ -1,5 +1,7 @@
 # 20 — Explore and Tasks: one place to look things up, one place to see what runs
 
+> **Record status (2026-11-17): Built.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §6.1, §9. Stale here: six stages (Evaluation is a seventh, 32); the scheduled-check list; processing now starts with the service.
+
 > Status: **implemented** (2026‑10‑30). Server: `GET /api/search/explore` and `GET /api/search/suggest`
 > (src/search/explore.ts), `searchExplained` (src/search/search.ts), `GET /api/tasks` (src/server/tasks.ts),
 > the activity log (src/activity.ts). Web: web/index.html, web/app.js, web/style.css. Mac app:

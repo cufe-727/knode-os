@@ -1,5 +1,7 @@
 # 31 — Evaluation on PostgreSQL, and knode answers in parallel
 
+> **Record status (2026-11-17): D1–D4 built; D5 step 2 (backend equivalence) not run.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §8. The branch named in the status line is merged. Stale here: schema names `eval_ws_<hash>` and the build's place in the run folder (35).
+
 Status: implemented (2026-11-14) on branch `claude/eval-postgres-parallel-a83957`, one commit per step: D1, D2's harness half (single-flight open; the PGlite guard is a sibling change in `src/store`), D3, D4, and D5 steps 1 and 3. D5 step 2 is not run: its commands are below, for approval. Nothing here has run against a real model or a real worker. The running 10× separation run is unaffected: it executes from its own checkout's build.
 
 ## Problem

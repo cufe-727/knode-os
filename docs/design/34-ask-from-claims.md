@@ -1,5 +1,7 @@
 # 34 — Ask: sets and states computed from the claims, and a second round when the first is thin
 
+> **Record status (2026-11-17): Built.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §6.2. §1–§2 describe the behaviour before the review; §3–§5 are the current rules. No model-backed run exists yet.
+
 Status: implemented on branch `claude/bold-liskov-1cde71` (2026-11-15), merged in main 7a299bf; reworked after an independent review on branch `claude/ask-computed-safety` (2026-11-16, §3). Measured without a model on a fresh no-model rebuild of the 10× reports benchmark. No model-backed run yet.
 
 **Switches.** Computed sets are **off by default** (`retrieval.router.computedSets`, absent: off) until a model-backed run has checked them; the second round is on (`retrieval.router.secondRound`, absent: on). `ask(…, { computed, second })` overrides either per call; `ask(…, { now })` sets the day relative periods are read from (default today; an evaluation of a past corpus sets its own); `retrieval.router.computedBudgetMs` (default 1,000) bounds a computed set's time.

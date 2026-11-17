@@ -1,6 +1,8 @@
 # 05 — Agent Context Database: redesigning the knowledge base for agents
 
-> Status: Phases 1–6 are **all implemented** — the lineage ledger, the Temporal Resolver, the Capability Graph, the Context Compiler, the learning loop (ranker / recipe distillation / pack evaluation), and negative knowledge, worksets, trust tiers, ACL inheritance and change subscriptions. Chinese version: [05-agent-context-db.zh-CN.md](05-agent-context-db.zh-CN.md).
+> **Record status (2026-11-17): Built (phases 1–6).** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §4, §6.2. Stale here: the `concept_cluster` page kind (retired by 09); "`relations.document_id` no longer written" (v20 records chunk and document); claim ids (v21 adds the ISO week); "pgvector has no index" (HNSW exists); `packs/`, `capabilities/`, `intents/` now live under `playbooks/`. §6 here words Phase 3 as a plan; the as-built text (capability tables, connector rules, utility formula) is §6.1–6.4 and §8.4 of the Chinese file.
+
+> Status: Phases 1–6 are **all implemented** — the lineage ledger, the Temporal Resolver, the Capability Graph, the Context Compiler, the learning loop (ranker / recipe distillation / pack evaluation), and negative knowledge, worksets, trust tiers, ACL inheritance and change subscriptions.
 
 ## 0. In one sentence
 

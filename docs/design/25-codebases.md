@@ -1,5 +1,7 @@
 # 25 — Code repositories as a source (`raw/codebase`)
 
+> **Record status (2026-11-17): Built; current.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §5.1, §10. The branch named in the status line is merged.
+
 Status: implemented (branch `claude/agent-knowledge-base-c273d7`, 2026-11-09).
 
 ## Problem

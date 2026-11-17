@@ -2,7 +2,7 @@
 
 > 面向 coding agent 的本地优先知识操作系统 —— 在你的文档、agent 执行 trace 和用过的 skills 之上,自动构建 **wiki** + **知识图谱** + **向量召回**。一个进程、一个文件夹、一个 PostgreSQL + pgvector 索引。
 
-[English](./README.md) · [设计文档](./docs/design/00-overview.md) · [Agent Context Database（v2 重设计）](./docs/design/05-agent-context-db.zh-CN.md) · [OKF 兼容设计](./docs/design/02-okf-compatibility.md) · [Obsidian 兼容设计](./docs/design/03-obsidian-vault.md)
+[English](./README.md) · [架构（当前实现，英文）](./docs/ARCHITECTURE.md) · [设计记录](./docs/design/README.md) · [Agent Context Database（v2 重设计）](./docs/design/05-agent-context-db.zh-CN.md) · [OKF 兼容设计](./docs/design/02-okf-compatibility.md) · [Obsidian 兼容设计](./docs/design/03-obsidian-vault.md)
 
 knode-os 结合了两个项目的核心思想:[llm_wiki](https://github.com/nashsu/llm_wiki) 的"让 LLM 维护一个持久、互链的 wiki,而不是每次从零做 RAG",以及 [gbrain](https://github.com/garrytan/gbrain) 的"Markdown 是事实源,Postgres 只是可随时重建的派生索引"——并把它们对准 coding agent 留下的资产:文档、会话 trace、skills。
 

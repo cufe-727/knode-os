@@ -1,5 +1,7 @@
 # 35 — Evaluation workspaces: a run's knowledge bases open in the app
 
+> **Record status (2026-11-17): Stages 1 and 2 built and merged (396fe1e); stages 3 and 4 not built.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §8. Stale here: "not merged" in the status line; §4 "PGlite has no read-only setting" (corrected in §11).
+
 Status: stages 1 and 2 built (2026-11-17, branch `claude/eval-workspaces-921a60`, not merged, not deployed); stages 3 and 4 not built. See §11 for what was built and where it differs from this design.
 
 ## 0. Why

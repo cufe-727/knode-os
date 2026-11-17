@@ -1,9 +1,11 @@
 # 07 — Initializing a knowledge base, and talking to it: overview + AGENTS.md guide / chat / runner improvements
 
+> **Record status (2026-11-17): Built.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §5.4, §9. Stale here: the body of §4.2 (reversed by its own postscript, `pinRoutes`); the navigation generators named in §1 (now `src/wiki/navigation.ts`).
+
 > Status: **implemented** (2026‑09‑18). This follows [06 — Wiki research agents](06-wiki-research-agent.md):
 > the runner could already write one page; here it first reads the **whole base** and writes the manual
 > every later agent gets, and people get a natural-language way in.
-> Chinese version: [07-init-and-chat.zh-CN.md](07-init-and-chat.zh-CN.md).
+>
 
 ## 0. Goals and decisions
 

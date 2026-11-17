@@ -1,5 +1,7 @@
 # 23 — Knowledge benchmarks: comparing knowledge-base approaches on the same sources
 
+> **Record status (2026-11-17): Built, then largely replaced by 27 §8, 28, 31, 32, 33, 35.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §8. Do not use as the evaluation reference. Stale here: the system list, serial answering, `--offer-seconds`, the PGlite evaluation workspace, the recipe list. §7 is a run log.
+
 > Status: **implemented** (2026‑11‑04); pilot run 2026‑11‑06. Corpus-level tasks, wiki-with-sources agents, scale padding,
 > the update stream and cost-normalized reporting added 2026‑11‑07 (§2.1, §4); their run is in §7 (phase 2 and the 3× scale point done 2026‑11‑08; the 1× API answers redone on Codex 2026‑11‑09). `src/eval/` (packs, shim, meter, quota, agent runner, judge,
 > metrics, systems, runner, report, audit, install), `eval/adapters/*.py`; `knode-os eval pack list|build|validate`,
