@@ -125,6 +125,13 @@ export interface DatabaseConfig {
   path?: string;
   /** Anything a storage plugin needs beyond the fields above. */
   options?: Record<string, unknown>;
+  /**
+   * Never in a file: set by `Store.open(…, { readOnly: true })` on the copy it
+   * hands the backend (docs/design/35 §4). The built-in backends then create
+   * nothing — no database, schema or extension — and every transaction they
+   * run is read-only (`default_transaction_read_only`).
+   */
+  readOnly?: boolean;
 }
 
 /**
@@ -1218,7 +1225,17 @@ export interface KnodeConfig {
    * kept like `agentLlms`.
    */
   modelAgents?: ModelAgent[];
-  server: { port: number; host: string; mcp: McpServerConfig; remote?: RemoteApiConfig; auth?: AuthConfig; tls?: TlsListenerConfig | null; embed?: EmbedConfig };
+  server: {
+    port: number; host: string; mcp: McpServerConfig; remote?: RemoteApiConfig; auth?: AuthConfig; tls?: TlsListenerConfig | null; embed?: EmbedConfig;
+    /**
+     * An evaluation root (docs/design/35 §2): the root's workspaces are a
+     * run's builds, `serve` on it is a viewer that changes none of them, and
+     * only an evaluation run writes into it. Set by `knode-os eval root init`.
+     */
+    evaluation?: boolean;
+  };
+  /** An evaluation root's own settings (docs/design/35 §3): the account its builds are filed under. */
+  evaluation?: { owner?: string };
   ingest: IngestConfig;
   extraction: ExtractionConfig;
   retrieval: { sag: SagSearchConfig; /** Absent in a config written before it: off. */ rerank?: RerankConfig; /** Absent in a config written before it: `defaultAskRouterConfig()`. */ router?: AskRouterConfig };
@@ -1546,18 +1563,25 @@ function deepMerge<T>(base: T, override: Partial<T>): T {
   return out as T;
 }
 
-export function loadConfig(dataDir: string): KnodeConfig {
+/**
+ * A workspace's config, as its file and its agent files say, with what older
+ * versions wrote brought up to date — and written back when that changed
+ * something. `readOnly` (an evaluation build opened in the viewer, docs/design/35
+ * §4): the same config in memory, and nothing written — no agent file
+ * upgraded or moved, no config saved.
+ */
+export function loadConfig(dataDir: string, opts: { readOnly?: boolean } = {}): KnodeConfig {
   const file = path.join(dataDir, CONFIG_FILE);
   // the agent files before anything reads them: a retired built-in leaves
   // here, and what named it follows its replacement below, before `pinRoutes`
   // resolves a single stage
-  const retired = upgradeAgentFiles(dataDir);
+  const retired = opts.readOnly ? new Map<string, string>() : upgradeAgentFiles(dataDir);
   const base = defaultConfig();
   // before the default is resolved: it may name a CLI agent
   base.agentLlms = readAgentLlms(dataDir);
   base.modelAgents = readModelAgents(dataDir);
   if (!fs.existsSync(file)) {
-    const fresh = migrateEmbeddingProviders(migrateCliConnections(migrateDefaultLlm(base), dataDir));
+    const fresh = migrateEmbeddingProviders(opts.readOnly ? migrateDefaultLlm(base) : migrateCliConnections(migrateDefaultLlm(base), dataDir));
     renameRetiredAgents(fresh, dataDir, retired);
     pinRoutes(fresh);
     return fresh;
@@ -1585,7 +1609,7 @@ export function loadConfig(dataDir: string): KnodeConfig {
   // out last, once both have had their say about which rows exist
   const routed = migrateDefaultLlm(migrateRouteConnections(merged));
   const movesCli = routed.connections.some((c) => isCliProvider(c.provider));
-  const config = migrateEmbeddingProviders(migrateCliConnections(routed, dataDir));
+  const config = migrateEmbeddingProviders(opts.readOnly ? routed : migrateCliConnections(routed, dataDir));
   // stages last, once the default and every target are where they will stay
   const pinned = pinRoutes(config);
   // the move wrote agent files, so the config that no longer names those rows
@@ -1593,7 +1617,7 @@ export function loadConfig(dataDir: string): KnodeConfig {
   // stage, a spec renamed off a retired agent, a dropped token budget or init
   // extraction choice, the Judge route's first copy and the retired concept
   // route are written for the same reason
-  if (movesCli || pinned || renamed || unbudgeted || unchosen || judged || translated || unconcepted) saveConfig(dataDir, config);
+  if (!opts.readOnly && (movesCli || pinned || renamed || unbudgeted || unchosen || judged || translated || unconcepted)) saveConfig(dataDir, config);
   return config;
 }
 

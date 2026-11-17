@@ -58,15 +58,21 @@ export interface CreateContextOptions {
    * the workspace registry under `serve`).
    */
   pluginRoots?: string[];
+  /**
+   * Open the workspace without changing it (docs/design/35 §4): no folder or
+   * starter file made, its config read but not upgraded or saved, its index
+   * opened read-only (`Store.open`'s `readOnly`).
+   */
+  readOnly?: boolean;
 }
 
 export async function createContext(dataDir: string, opts: CreateContextOptions = {}): Promise<AppContext> {
-  initDataDir(dataDir);
-  const config = loadConfig(dataDir);
+  if (!opts.readOnly) initDataDir(dataDir);
+  const config = loadConfig(dataDir, { readOnly: opts.readOnly });
   // plugins before anything that resolves a provider: the store may open on a
   // backend one of them adds, the embedder and the stages on providers they add
   await loadPlugins(dataDir, config.plugins, { log: (msg) => console.log(`[knode-os] ${msg}`), roots: opts.pluginRoots });
-  const store = await Store.open(dataDir, config.embedding.dimensions, config.database);
+  const store = await Store.open(dataDir, config.embedding.dimensions, config.database, { readOnly: opts.readOnly });
   const embedder = createConfiguredEmbeddingProvider(config);
   const llm = judgeLlmClient(config);
   const datasources = new DataSourceRegistry(dataDir, config.datasources);

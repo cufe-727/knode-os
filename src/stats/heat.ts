@@ -32,7 +32,8 @@ export interface ChunkHit {
  * document does not grow hot just by being long.
  */
 export async function recordChunkHits(store: Store, hits: ChunkHit[], heatCfg?: HeatConfig): Promise<void> {
-  if (hits.length === 0) return;
+  // an index opened read-only (an evaluation build in the viewer) counts no hits: answers must not depend on who looked
+  if (hits.length === 0 || store.readOnly) return;
   const cfg = heatCfg ?? defaultConfig().heat;
   const now = new Date();
 
