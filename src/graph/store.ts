@@ -67,8 +67,6 @@ export interface PageContext {
   chunkIds: { id: string; content: string }[];
 }
 
-export const ENTITY_TYPES = ['person', 'organization', 'product', 'project', 'component', 'technology', 'concept', 'event', 'location', 'datasource', 'dataset', 'other'];
-export const RELATION_TYPES = ['related_to', 'part_of', 'uses', 'depends_on', 'works_at', 'authored', 'mentions', 'links_to', 'co_occurs', 'stored_in', 'appears_in'];
 /**
  * `absent` is negative knowledge: a lookup that came back empty, recorded so
  * the same empty query is not re-run every session. It carries a validity

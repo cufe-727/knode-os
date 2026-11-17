@@ -1,5 +1,7 @@
 # 08 — 碎片化知识的导入规范：消息流 → 知识单元 → 文档
 
+> **Record status (2026-11-17): Proposal — never accepted as written.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §5.1, §10. K1 (frequency stoplist) is built under `playbooks/concepts/`; K2 is half built (no doc-date range filter on search); K3 is not built. D8 is reversed by design 26 (feeds). Still useful: the frontmatter key ownership table and the `event_at` / `observed_at` rule.
+
 > 状态：**提案，待确认**（2026‑09‑29）。本文回答一个具体问题：飞书群、微博/星球中转、微信群转播这类
 > "一段话就是一条观点"的碎片化内容，应该用什么载体、带哪些元数据、按什么单位进 knode-os。
 > 结论建立在对 finance 工作区现状的体检（§1）和对开源方案的调研（§7）之上。英文版待决策确认后补。

@@ -1,5 +1,7 @@
 # 30 — Answer routing, batched agent tools, and a rerank stage
 
+> **Record status (2026-11-17): Built.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §6. The branch named in the status line is merged. Stale here: §3.1 "evaluation passes no now" (it does, 34 §4); §4 "`superseded_by` is set by refinement for finance" (29).
+
 Status: implemented on branch `claude/retrieval-routing-3d5c01` (2026-11-13). Not yet measured against the benchmark: no `eval run` was spent on it.
 
 ## Problem

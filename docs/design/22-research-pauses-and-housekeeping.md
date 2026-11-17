@@ -1,5 +1,7 @@
 # 22 — Research that waits out a usage limit, resumes where it stopped, and is put away
 
+> **Record status (2026-11-17): Built.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §5.4. Stale here: the quota floor at claim time (per session since 27).
+
 > Status: **implemented** (2026‑11‑04). Source: src/research/failure.ts (classifying a failed session, reading
 > the reset time, the backoff), src/research/runner.ts (`failRun`, `pauseAgentQueue`, `markInterrupted`),
 > src/research/jobs.ts (`NOT_PAUSED`, `resumeJob`, `archiveJobs`, `deleteJobs`, `requeueStale`),

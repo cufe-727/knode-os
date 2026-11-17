@@ -7,11 +7,12 @@ import { initDataDir } from '../src/fs/datadir.js';
 import { auditDuplicateClaims, seriesRelation } from '../src/graph/claim-dedupe.js';
 import { formatValue, keyQualifiers, sameValue, namesSubject, normalizeAttribute, parseMeasure, seriesObject, subjectSpellingsOf, unifyAttributeKeys } from '../src/graph/claim-state.js';
 import { refreshClaimState, seriesSupersession, StateRow } from '../src/graph/claim-state-store.js';
-import { namesakeChoice, namesakeClusters, NamesakeDoc, renameIn, resolveEntityContext } from '../src/graph/entity-context.js';
+import { namesakeClusters, NamesakeDoc, renameIn, resolveEntityContext } from '../src/graph/entity-context.js';
 import { buildBatchExtractRequest, buildExtractRequest, RawExtractReply } from '../src/graph/llm-extract.js';
 import { enqueueTier1, runTier1Pass } from '../src/graph/tier1.js';
 import { runDocumentPass } from '../src/ingest/background.js';
 import { sync } from '../src/ingest/sync.js';
+import { startFollowUp } from '../src/labeling/followup.js';
 import { LlmClient } from '../src/llm/client.js';
 import { normalizeDateExpr } from '../src/store/dates.js';
 import { ensureEntityStubs } from '../src/wiki/pages.js';
@@ -227,11 +228,6 @@ describe('entity rules', () => {
     expect(namesakeClusters([...before, ...after], types)).toBeNull();
     // one context throughout: one person
     expect(namesakeClusters(pay, types)).toBeNull();
-    // a document resolves to the person its entities point at
-    const rules = [{ id: '陈伟（平台组）', base_id: '陈伟', name: '陈伟', label: '平台组', anchors: ['平台组'], base_anchors: ['支付组'] }];
-    expect(namesakeChoice(rules, [{ name: '平台组', type: 'organization' }, { name: '陈伟', type: 'person' }])?.id).toBe('陈伟（平台组）');
-    expect(namesakeChoice(rules, [{ name: '支付组', type: 'organization' }, { name: '陈伟', type: 'person' }])).toBeNull();
-    expect(namesakeChoice(rules, [{ name: '陈伟', type: 'person' }])).toBeNull();
   });
 });
 
@@ -470,6 +466,51 @@ describe('a fixture build of weekly reports', () => {
     // the namesakes have a page each
     expect(page('陈伟平台组')).toContain('迁移历史数据');
     expect(page('陈伟')).not.toContain('迁移历史数据');
+  });
+
+  it('leaves one current value per attribute after a review round in serve, as after a pass', async () => {
+    // extraction alone, which is what serve's slots do: every week's value stands as current
+    const { ctx } = await build('serve-follow-up');
+    opened.push(ctx);
+    (ctx as { llm: LlmClient }).llm = countingJudge({ calls: 0, pairs: 0 });
+    const current = () => ctx.store.query<{ value_num: number }>(
+      `SELECT c.value_num FROM claims c JOIN entities e ON e.id = c.subject_id
+       WHERE e.name = '风控引擎' AND c.attribute = ANY($1::text[]) AND c.tx_to IS NULL AND c.canonical_id IS NULL AND c.superseded_by IS NULL
+       ORDER BY c.value_num`,
+      [['完成度', '进度']],
+    );
+    expect((await current()).length).toBeGreaterThan(5);
+
+    // what the scheduler hands the follow-up: everything the slots wrote since the last round
+    const ids = async (sql: string) => (await ctx.store.query<{ id: string }>(sql)).map((r) => r.id);
+    const written = {
+      written: 1, failed: 0,
+      documents: await ids(`SELECT path AS id FROM documents WHERE root = 'docs'`),
+      entityIds: await ids(`SELECT id FROM entities WHERE tx_to IS NULL`),
+      claimIds: await ids(`SELECT id FROM claims WHERE tx_to IS NULL`),
+    };
+    let taken = false;
+    const scheduler = {
+      takeFinished: () => {
+        if (taken) return { written: 0, failed: 0, documents: [], entityIds: [], claimIds: [] };
+        taken = true;
+        return written;
+      },
+    };
+    const logs: string[] = [];
+    const followUp = startFollowUp(ctx, scheduler as never, { reviewIntervalMs: 10, log: (m) => logs.push(m) });
+    try {
+      for (let i = 0; i < 500 && !logs.some((m) => m.startsWith('document pass:')); i++) await new Promise((r) => setTimeout(r, 100));
+      // the review in progress ends before this gets its turn
+      await followUp.serialize(async () => {});
+    } finally {
+      followUp.stop();
+    }
+    // before 2026-11-17 a review ran the two audits and stopped there: the values above stayed current until the nightly refine
+    expect(await current()).toHaveLength(1);
+    expect(logs.find((m) => m.startsWith('document pass:'))).toMatch(/supersession marks updated/);
+    // and nothing is left for refine's run over every claim to change
+    expect(await markSupersededClaims(ctx.store)).toBe(0);
   });
 
   it('leaves one current value per attribute after each update pass, without a refine', async () => {

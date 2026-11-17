@@ -1,5 +1,7 @@
 # Obsidian Vault 原生兼容设计
 
+> **Record status (2026-11-17): Built; current.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §5.3, §9. Stale here: the vault tree omits `datasets/`, `mentions/`, `timelines/`, `disagreements/`, `lint/`, `learning/`.
+
 > 调研与实现基线：2026-07-18。
 
 ## 1. 目标

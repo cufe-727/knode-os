@@ -4,7 +4,7 @@ import path from 'node:path';
 import { sqlStringLiteral } from '../datasource/guard.js';
 import { PACKS_DIR } from '../fs/layout.js';
 import { Locator } from '../capability/store.js';
-import { readMatter } from '../markdown.js';
+import { readMatter, stringList } from '../markdown.js';
 import { Playbook, entitySymbol, loadPlaybooks, renderProbeSql } from '../pack/playbook.js';
 import { PlanNode } from './plan.js';
 
@@ -43,12 +43,6 @@ export interface Recipe {
   upgraded: boolean;
 }
 
-function strings(v: unknown): string[] {
-  if (typeof v === 'string') return v.trim() ? [v.trim()] : [];
-  if (!Array.isArray(v)) return [];
-  return v.map(String).map((s) => s.trim()).filter(Boolean);
-}
-
 function parseNode(raw: unknown, index: number): RecipeNode | null {
   if (!raw || typeof raw !== 'object') return null;
   const o = raw as Record<string, unknown>;
@@ -64,7 +58,7 @@ function parseNode(raw: unknown, index: number): RecipeNode | null {
     tool: { kind, server: typeof toolRaw.server === 'string' ? toolRaw.server : 'knode-os', name },
     args: (o.args ?? {}) as Record<string, unknown>,
     capability: typeof o.capability === 'string' ? o.capability : undefined,
-    after: strings(o.after),
+    after: stringList(o.after),
     freshness: Number.isFinite(freshness) && freshness > 0 ? freshness : null,
   };
 }
@@ -86,7 +80,7 @@ export function parseRecipe(raw: string, relPath: string): Recipe | null {
     path: relPath,
     appliesTo: typeof fm.appliesTo === 'string' && fm.appliesTo.trim() ? fm.appliesTo.trim() : 'default',
     intent: typeof fm.intent === 'string' ? fm.intent.trim() : '',
-    slots: { required: strings(slots.required), optional: strings(slots.optional) },
+    slots: { required: stringList(slots.required), optional: stringList(slots.optional) },
     nodes,
     guidance: body.trim(),
     upgraded: false,

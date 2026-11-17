@@ -11,7 +11,7 @@ import { tier0Known, weakLinkKey } from './concepts.js';
 import { ANCHOR_TYPES as ANCHOR_TYPE_LIST, Code, codeOf, Codes, codesDiffer, codesOf, namesakeName, NamesakeRule } from './identity.js';
 import { keyOf, nameKey, typesCompatible } from './normalize.js';
 import { namesApartByCode } from './resolve.js';
-import { ExtractedEntity, slugify } from './store.js';
+import { slugify } from './store.js';
 
 /**
  * Entity resolution by context (docs/design/29 §5), run by refine before the
@@ -1098,34 +1098,6 @@ async function mergeCodeIntoCarrier(
 }
 
 export type { NamesakeRule } from './identity.js';
-
-/** The namesake rules for these names: name (lower case) → its variants. */
-export async function namesakeRules(q: Queryable, names: string[]): Promise<Map<string, NamesakeRule[]>> {
-  const lower = [...new Set(names.map((n) => n.trim().toLowerCase()).filter(Boolean))];
-  if (lower.length === 0) return new Map();
-  const rows = await q.query<NamesakeRule>(
-    `SELECT id, base_id, name, label, anchors, base_anchors FROM entity_namesakes WHERE lower(name) = ANY($1::text[])`,
-    [lower],
-  );
-  return groupBy(rows, (r) => r.name.toLowerCase());
-}
-
-/**
- * Which of a split name's people a document means: the variant whose anchors
- * the document's own entities name most, if it names more of them than of the
- * base person's; else null (the base person keeps the name).
- */
-export function namesakeChoice(rules: NamesakeRule[], documentEntities: ExtractedEntity[]): NamesakeRule | null {
-  const names = new Set(documentEntities.flatMap((e) => [e.name, ...(e.aliases ?? [])]).map((n) => n.trim().toLowerCase()));
-  const score = (anchors: string[]) => anchors.filter((a) => names.has(a.toLowerCase())).length;
-  const base = rules.length ? score(rules[0].base_anchors) : 0;
-  let best: { rule: NamesakeRule; s: number } | null = null;
-  for (const r of rules) {
-    const s = score(r.anchors);
-    if (s > 0 && s > base && (!best || s > best.s)) best = { rule: r, s };
-  }
-  return best?.rule ?? null;
-}
 
 /**
  * Refine's splits: people of one name, and (review.identity "context") an

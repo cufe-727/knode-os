@@ -1,4 +1,3 @@
-import crypto from 'node:crypto';
 import { Context, Hono } from 'hono';
 import type { KnodeConfig } from '../config.js';
 import { clientInfo } from '../server/public-guard.js';
@@ -10,6 +9,7 @@ import { DEFAULT_TASK_TTL_MS, EVAL_FAMILIES, EvalFamily, EvalRunStatus, EvalSpec
 import { EvalStoreFullError } from '../work/eval-store.js';
 import { isEvalKind } from '../work/kinds.js';
 import { offeredRemotely } from '../work/config.js';
+import { tokenMatches } from '../digest.js';
 
 /**
  * The producer channel of evaluation work (docs/design/27 §8): how a
@@ -136,13 +136,6 @@ export function runStatusOf(work: EvalWork, run: string): EvalRunStatus {
   const a = work.calls.runStatus(run);
   const b = work.sessions.runStatus(run);
   return { waiting: a.waiting + b.waiting, leased: a.leased + b.leased };
-}
-
-function tokenMatches(presented: string | null, expected: string): boolean {
-  if (!presented) return false;
-  const a = Buffer.from(presented);
-  const b = Buffer.from(expected);
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 export function mountEvalProducer(app: Hono<any>, deps: EvalProducerDeps): void {

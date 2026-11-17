@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { Store } from '../store/db.js';
-import { Params, live } from '../store/temporal.js';
+import { Params } from '../store/temporal.js';
 import { appendLedger, nextLedgerSeq } from './ledger.js';
 
 /**
@@ -26,12 +26,6 @@ export const TRUST_TIERS: readonly TrustTier[] = ['trusted', 'quarantined'];
 /** Actors whose writes are quarantined until a person promotes them. */
 export function tierForActor(actor: string): TrustTier {
   return /^(agent|mcp|api)\b/i.test(actor) ? 'quarantined' : 'trusted';
-}
-
-/** SQL predicate over a scopes alias for a requested tier. `any` matches both. */
-export function trustSql(alias: string, p: Params, tier: TrustTier | 'any' | undefined): string {
-  if (!tier || tier === 'any') return 'TRUE';
-  return `${alias}.trust = ${p.add(tier)}`;
 }
 
 /**
@@ -237,24 +231,3 @@ export async function detectDisputes(store: Store, scopeId: string): Promise<Dis
   return out;
 }
 
-/** Trust predicate over an evidence alias, for read paths that filter by tier. */
-export function evidenceTrustSql(alias: string, p: Params, tier: TrustTier | 'any' | undefined): string {
-  if (!tier || tier === 'any') return 'TRUE';
-  return `${alias}.trust = ${p.add(tier)}`;
-}
-
-/** Live claims a scope asserts, with the trust tier behind each. */
-export async function claimTrust(store: Store, claimIds: string[]): Promise<Map<string, TrustTier>> {
-  if (claimIds.length === 0) return new Map();
-  const p = new Params();
-  const ph = claimIds.map((id) => p.add(id)).join(',');
-  const rows = await store.query<{ target_id: string; trust: TrustTier }>(
-    `SELECT ev.target_id, min(ev.trust) AS trust FROM evidence ev
-     WHERE ev.kind = 'claim' AND ev.target_id IN (${ph}) AND ${live('ev', p)}
-     GROUP BY ev.target_id`,
-    p.list,
-  );
-  // min() over ('quarantined','trusted') picks 'quarantined' — a claim with any
-  // trusted support reads as trusted only when *all* its support is trusted
-  return new Map(rows.map((r) => [r.target_id, r.trust]));
-}

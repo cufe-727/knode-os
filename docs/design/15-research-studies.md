@@ -1,5 +1,7 @@
 # 15 — Research studies: from a topic to a set of wiki pages, with the sources kept
 
+> **Record status (2026-11-17): Built.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §5.4. Stale here: "Research" as a top-level section (20 moved Studies under Explore); sessions always local (27).
+
 > Status: **implemented** (2026‑10‑27). Kinds `study` / `section` on `research_jobs` (no migration: two new statuses,
 > `draft` and `waiting`), `src/research/{study,refine,capture,fetch,web,sources,chart,deep-research,read}.ts`, the HTML
 > converter (`src/ingest/converters/html.ts`), the web UI's **Research** section, `knode-os research study …`. The

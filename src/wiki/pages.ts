@@ -28,7 +28,8 @@ import { DocumentRow } from '../types.js';
 import { entitiesIndex, entitiesShelf, NavPageKind, overviewHoldings, pagesIndex, pagesShelf, sourcesIndex, sourcesShelf, wikiContents } from './nav-views.js';
 import { hasRegions, renderRegion, replaceRegion, splitRegions } from './regions.js';
 import { CORPUS_GENERATORS, CorpusPageKind } from './corpus-views.js';
-import { asSummaryLanguage, detectSummaryLanguage, documentChars, isShortDocument, planSummary, produceSummary, shortByRow, summaryMinChars, summaryScaffold } from './summary.js';
+import { asSummaryLanguage, detectSummaryLanguage, documentChars, isShortDocument, planSummary, produceSummary, summaryMinChars, summaryScaffold } from './summary.js';
+import { sha16 } from '../digest.js';
 
 /**
  * Wiki pages as materialized views.
@@ -93,10 +94,6 @@ export type RegenerateOutcome = 'regenerated' | 'unchanged' | 'archived' | 'defe
 export function splitPagePath(pagePath: string): { file: string; region: string | null } {
   const at = pagePath.indexOf('#');
   return at === -1 ? { file: pagePath, region: null } : { file: pagePath.slice(0, at), region: pagePath.slice(at + 1) };
-}
-
-function sha16(value: unknown): string {
-  return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 16);
 }
 
 function sha256(text: string): string {
@@ -1114,7 +1111,7 @@ export async function ensureEntityStubs(
 }
 
 /** Bring an archived copy back so human-written parts survive re-creation. */
-function restoreArchived(dataDir: string, pagePath: string): void {
+export function restoreArchived(dataDir: string, pagePath: string): void {
   const abs = safePath(dataDir, pagePath);
   const archived = safePath(dataDir, archivedPath(pagePath));
   if (!fs.existsSync(abs) && fs.existsSync(archived)) {

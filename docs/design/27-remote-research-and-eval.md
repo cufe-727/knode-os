@@ -1,5 +1,7 @@
 # 27 — Research sessions on remote workers, and evaluation runs on other machines
 
+> **Record status (2026-11-17): Phase 1 and evaluation leasing built; phase 2 not built.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §7. Stale here: §8's held offers and `evalOfferSeconds` (replaced by the durable queue, 32); the per-session MCP bridge child (removed by 31); D15's first plan.
+
 > Status: **phase 1 implemented** (2026‑11‑10): Codex and Claude sessions of the `single` and `team` pipelines and
 > of a study's collectors go to remote workers — `src/work/session.ts` (the session source), `src/research/remote.ts`
 > (placement), `src/remote/session-mcp.ts` (the session's route), `worker/knode-worker.mjs --sessions`; tests in

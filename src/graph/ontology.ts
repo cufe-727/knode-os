@@ -3,6 +3,7 @@ import path from 'node:path';
 import { loadConfig } from '../config.js';
 import { ONTOLOGY_DIR } from '../fs/layout.js';
 import { parseYaml } from '../compiler/intents.js';
+import { stringList } from '../markdown.js';
 
 /**
  * The ontology: which entity types and relation types the graph is written in.
@@ -511,12 +512,6 @@ export function ensureDefaultOntology(dataDir: string): string[] {
   return created;
 }
 
-function strings(v: unknown): string[] {
-  if (typeof v === 'string') return v.trim() ? [v.trim()] : [];
-  if (!Array.isArray(v)) return [];
-  return v.map(String).map((s) => s.trim()).filter(Boolean);
-}
-
 function idOf(v: unknown): string {
   return typeof v === 'string' ? predicateKey(v) : '';
 }
@@ -549,7 +544,7 @@ export function parseOntologyPack(text: string): { id: string; entityTypes: Enti
       id,
       label: typeof o.label === 'string' ? o.label : undefined,
       description: typeof o.description === 'string' ? o.description : undefined,
-      examples: strings(o.examples),
+      examples: stringList(o.examples),
     });
   }
   const relationTypes: RelationTypeSpec[] = [];
@@ -570,11 +565,11 @@ export function parseOntologyPack(text: string): { id: string; entityTypes: Enti
       symmetric: o.symmetric === true,
       hierarchical: o.hierarchical === true,
       temporal: o.temporal === true,
-      domain: strings(o.domain).map(predicateKey),
-      range: strings(o.range).map(predicateKey),
-      synonyms: strings(o.synonyms),
-      inverseSynonyms: strings(o.inverseSynonyms ?? o.inverse_synonyms),
-      examples: strings(o.examples),
+      domain: stringList(o.domain).map(predicateKey),
+      range: stringList(o.range).map(predicateKey),
+      synonyms: stringList(o.synonyms),
+      inverseSynonyms: stringList(o.inverseSynonyms ?? o.inverse_synonyms),
+      examples: stringList(o.examples),
       system: o.system === true,
       documentLink: o.documentLink === true || o.document_link === true,
     });
@@ -684,10 +679,6 @@ export function builtinPackYaml(name: string): string | undefined {
 
 export function entityTypeIds(ont: Ontology): Set<string> {
   return new Set(ont.entityTypes.map((t) => t.id));
-}
-
-export function relationTypeIds(ont: Ontology): Set<string> {
-  return new Set(ont.relationTypes.map((t) => t.id));
 }
 
 export function relationSpec(ont: Ontology, id: string): RelationTypeSpec | undefined {

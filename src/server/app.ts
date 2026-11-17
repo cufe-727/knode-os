@@ -186,11 +186,11 @@ import { applyClaimMerge, listClaimMerges, unmergeClaim } from '../graph/claim-m
 import { applyMerge, listMerges, unmergeEntity } from '../graph/merge.js';
 import { auditDuplicateEntities } from '../graph/dedupe.js';
 import { reviewClaims } from '../graph/claim-review.js';
-import { archiveJobs, cancelJob, deleteJobs, getJob, latestJob, listJobs, queueJob, resumeJob, retryJob, ResearchStatus, updateJob } from '../research/jobs.js';
+import { archiveJobs, cancelJob, deleteJobs, getJob, latestJob, listJobs, queueJob, resumeJob, retryJob, ResearchStatus } from '../research/jobs.js';
 import { activePause } from '../research/failure.js';
 import { builtinAvailable, killAgentsFor } from '../research/launch.js';
 import { loadResearchTemplates, PHASES, RESEARCH_KINDS, ResearchKind } from '../research/templates.js';
-import { activeProfile, BUILTIN_PROFILES, deleteProfile, EFFORTS, effectivePipeline, isValidProfileName, loadProfile, loadProfiles, PIPELINE_MODES, profileSummary, ResearchProfile, rolePromptText, saveProfile, writeRolePrompt } from '../research/profile.js';
+import { activeProfile, BUILTIN_PROFILES, deleteProfile, effectivePipeline, isValidProfileName, loadProfile, loadProfiles, PIPELINE_MODES, profileSummary, ResearchProfile, rolePromptText, saveProfile, writeRolePrompt } from '../research/profile.js';
 import { surveyKnowledgeBase } from '../research/survey.js';
 import { cancelChatTurn, chatActivity, ChatBusyError, isChatRunning, removeChatWorkspace, resolveChatAgent, startChatTurn } from '../chat/runner.js';
 import { createConversation, deleteConversation, getConversation, listConversations } from '../chat/store.js';
@@ -2155,7 +2155,6 @@ export function createApp(
     }
   });
 
-
   /* --------------------------------- feeds -------------------------------- */
 
   // Sources that keep producing items — chats, mailboxes, accounts, searches, repositories —
@@ -3350,7 +3349,6 @@ export function createApp(
     fs.rmSync(path.join(runsRoot(ctx.dataDir, ctx.config.research?.runsDir ?? '.runs'), job.id), { recursive: true, force: true });
     return c.json({ removed });
   });
-
 
   /* ------------------------------ research studies ------------------------ */
 

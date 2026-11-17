@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { RESEARCH_DIR } from '../fs/layout.js';
-import { parseFrontmatter } from '../markdown.js';
+import { parseFrontmatter, stringList } from '../markdown.js';
 import { slugify } from '../graph/store.js';
 import type { RolePhase } from './profile.js';
 
@@ -293,7 +293,6 @@ requires:
 frontmatter：\`type: review\`，\`title: 核实：{target}\`，另有 \`sameAs\`、\`notSameAs\`、\`relations\`、\`claims\`、\`sources\`。
 `;
 
-
 const INIT = `---
 type: research-template
 kind: init
@@ -373,7 +372,6 @@ knode_write 的路径约定、必需 frontmatter、quarantine 与 promote、disp
 ## 人工备注
 \`\`\`
 `;
-
 
 /**
  * How the four comparison types read the shape (src/research/chart.ts), for
@@ -693,12 +691,6 @@ export function ensureDefaultResearchTemplates(dataDir: string): string[] {
   return created;
 }
 
-function strings(v: unknown): string[] {
-  if (typeof v === 'string') return v.trim() ? [v.trim()] : [];
-  if (!Array.isArray(v)) return [];
-  return v.map(String).map((s) => s.trim()).filter(Boolean);
-}
-
 /** A path inside the data dir / playbooks/research: posix, no `..`, no absolute paths; '' when unusable. */
 function cleanRelPath(v: unknown): string {
   const s = typeof v === 'string' ? v.trim().replace(/\\/g, '/') : '';
@@ -716,7 +708,7 @@ function parseCompanions(v: unknown): TemplateCompanion[] {
     const o = raw as Record<string, unknown>;
     const p = cleanRelPath(o.path);
     if (!p) continue;
-    out.push({ path: p, sections: strings(o.sections) });
+    out.push({ path: p, sections: stringList(o.sections) });
   }
   return out;
 }
@@ -745,7 +737,7 @@ export function parseResearchTemplate(text: string, name: string, filePath: stri
     kind,
     output: typeof fm.output === 'string' ? fm.output.trim() : '',
     maxTurns: Number.isFinite(maxTurns) && maxTurns > 0 ? Math.floor(maxTurns) : null,
-    requires: { frontmatter: strings(requires.frontmatter), sections: strings(requires.sections) },
+    requires: { frontmatter: stringList(requires.frontmatter), sections: stringList(requires.sections) },
     body: body.trim(),
     path: filePath,
     companions: parseCompanions(fm.companions),

@@ -1,5 +1,7 @@
 # Google Open Knowledge Format（OKF）v0.2 兼容设计
 
+> **Record status (2026-11-17): Built; current.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §5.3, §9.
+
 > 调研基线：2026-09-11。实现目标版本：OKF `0.2`。
 > 上一版本基线 2026-07-18 对齐的是 v0.1，本文记录升级后的实现。
 

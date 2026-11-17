@@ -2,7 +2,7 @@
 
 > Local-first knowledge OS for coding agents — an auto-built **wiki** + **knowledge graph** + **vector recall** over your documents, your agents' traces, and the skills they use. One process, one folder, one PostgreSQL + pgvector index.
 
-[简体中文](./README.zh-CN.md) · [Design overview](./docs/design/00-overview.md) · [Agent Context Database (v2)](./docs/design/05-agent-context-db.md) · [OKF compatibility](./docs/design/02-okf-compatibility.md) · [Obsidian compatibility](./docs/design/03-obsidian-vault.md)
+[简体中文](./README.zh-CN.md) · [Architecture](./docs/ARCHITECTURE.md) · [Design records](./docs/design/README.md) · [Agent Context Database (v2)](./docs/design/05-agent-context-db.md) · [OKF compatibility](./docs/design/02-okf-compatibility.md) · [Obsidian compatibility](./docs/design/03-obsidian-vault.md)
 
 knode-os combines two ideas — [llm_wiki](https://github.com/nashsu/llm_wiki)'s "the LLM maintains a persistent, interlinked wiki instead of doing RAG from scratch every time" and [gbrain](https://github.com/garrytan/gbrain)'s "markdown is the system of record, Postgres is a disposable derived index" — and points them at what coding agents leave behind: docs, session traces, and skills.
 

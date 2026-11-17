@@ -139,11 +139,6 @@ export function authMiddleware(auth: AuthService, opts: { mcpPath?: string } = {
   };
 }
 
-/** The account a request was signed in as (sign-in on), or null (sign-in off: tests, embedded apps). */
-export function requestAccount(c: Context): PublicAccount | null {
-  return (c.get('account') as PublicAccount | undefined) ?? null;
-}
-
 export interface AuthRoutesDeps {
   /** Team workspaces that exist, by slug. */
   teams: () => string[];

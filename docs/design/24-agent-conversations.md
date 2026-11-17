@@ -1,5 +1,7 @@
 # 24 — Agent conversations: picked one by one, kept in sync, read as dialogue
 
+> **Record status (2026-11-17): Built; current.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §5.1.
+
 > Status: **implemented** (2026‑11‑06). Source: src/ingest/conversations/ (transcript.ts — Claude Code and Codex
 > transcripts read as exchanges; render.ts — an exchange as Markdown, secrets redacted; catalog.ts — this machine's
 > conversations, searchable; follow.ts — import, follow, the periodic check, unfollow). Server: `/api/conversations*`

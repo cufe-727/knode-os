@@ -131,7 +131,7 @@ function describePostgres(cfg: DatabaseConfig): string {
 }
 
 /** Double-quote an identifier we generated ourselves; belt-and-braces. */
-function quoteIdent(name: string): string {
+export function quoteIdent(name: string): string {
   return `"${name.replace(/"/g, '""')}"`;
 }
 

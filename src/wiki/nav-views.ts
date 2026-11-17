@@ -1,4 +1,3 @@
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { DocumentedEntity, KbHoldings } from '../research/survey.js';
@@ -6,6 +5,7 @@ import type { Store } from '../store/db.js';
 import { toIso } from '../store/temporal.js';
 import type { PageGenerator, PagePlan, PagesContext } from './pages.js';
 import { shortByRow, summaryMinChars } from './summary.js';
+import { sha16 } from '../digest.js';
 
 /**
  * The wiki's navigation as model-free views: what `wiki/index.md` leads to,
@@ -54,10 +54,6 @@ export type NavPageKind = 'sources_shelf' | 'entities_shelf' | 'pages_index' | '
 
 /** Top-level wiki folders listed by trees of their own, or not pages at all. */
 const NOT_PAGE_DIRS = new Set(['sources', 'entities', 'attachments', '.obsidian', '.archive']);
-
-function sha16(value: unknown): string {
-  return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 16);
-}
 
 const fmt = (n: number) => n.toLocaleString('en-US');
 const plural = (n: number, one: string, many = `${one}s`) => `${fmt(n)} ${n === 1 ? one : many}`;

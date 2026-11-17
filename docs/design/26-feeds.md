@@ -1,5 +1,7 @@
 # 26 — Feeds: connectors, filter and transform layers, and a protocol to push and pull
 
+> **Record status (2026-11-17): Phase 1 built; current.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §5.1, §10. Supersedes 08 D8.
+
 > Status: **phase 1 implemented** (2026‑11‑09). Source: src/ingest/feeds/ — types.ts (items, units, stages,
 > connectors), definitions.ts (playbooks/feeds/<id>.yaml), ledger.ts (ledger/feeds/<id>/), units.ts (windows,
 > threads, periods), stages.ts (the filter and transform layers), render.ts (Markdown documents), run.ts (one run),

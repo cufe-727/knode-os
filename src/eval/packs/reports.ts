@@ -327,12 +327,6 @@ export function makeReportWorld(lang: Lang, seed: string | number, opts: ReportO
   return { lang, divisions, padTeams: pads };
 }
 
-/** The first division (the whole corpus at size 1) with the padding teams: what v1 of this recipe returned. */
-export function makeReportScript(lang: Lang, seed: string | number, opts: ReportOptions = {}): ReportScript & { padTeams: ReportScript[]; divisions: ReportScript[] } {
-  const w = makeReportWorld(lang, seed, opts);
-  return { ...w.divisions[0], padTeams: w.padTeams, divisions: w.divisions };
-}
-
 function nameMaker(lang: Lang, r: () => number, used: Set<string>, sur: string[], given: string[], given2: string[]): () => string {
   return () => {
     for (let i = 0; ; i++) {
@@ -1147,7 +1141,6 @@ export function separationTasks(s: ReportScript, docOf: (team: string, week: num
   const ev = (docs: string[]) => [...new Set(docs)].map((doc) => ({ doc }));
   const inCorpus = (w: number) => w >= 1 && w <= CORPUS_WEEKS;
   const team = (id: string) => s.teams.find((t) => t.id === id)!;
-  const cust = (id: string) => s.customers.find((c) => c.id === id)!;
   const dateZh = (w: number, d = 1) => {
     const x = dayOf(w, d);
     return `${x.getUTCFullYear()}年${x.getUTCMonth() + 1}月${x.getUTCDate()}日`;
@@ -1156,7 +1149,6 @@ export function separationTasks(s: ReportScript, docOf: (team: string, week: num
     const x = dayOf(w, d);
     return `${MONTHS_EN[x.getUTCMonth() + 1]} ${x.getUTCDate()}, ${x.getUTCFullYear()}`;
   };
-  const date = (w: number, d = 1) => (zh ? dateZh(w, d) : dateEn(w, d));
   const lineOf = (teamId: string, week: number, key: string) => {
     const f = facts(s, team(teamId), week);
     return SECTIONS.flatMap((k) => f[k]).filter((l) => l.key === key || l.key.startsWith(`${key}:`)).map((l) => l.text);

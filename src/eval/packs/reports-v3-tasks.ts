@@ -3,7 +3,7 @@ import type { GoldItem, ListSpec, Task } from '../types.js';
 import { CORPUS_TASK_MIN_DOCS, STRUCTURED_MIN_DOCS } from '../types.js';
 import type { V3Doc } from './reports-v3-render.js';
 import {
-  CITY_DESC, corpusQuarters, customerNameAt, dayOf, fmtMetric, iso, isoWeek, KINDS, Lang, leadOf, metricActual, metricReported, MONTHS_EN, ownerAt, progressAt,
+  CITY_DESC, corpusQuarters, customerNameAt, dayOf, fmtMetric, iso, KINDS, Lang, leadOf, metricActual, metricReported, MONTHS_EN, ownerAt, progressAt,
   projectNameAt, quarterName, rosterOf, settingAt, V3_CORPUS, V3Customer, V3Division, V3Incident, V3Person, V3Project, V3Setting, weekForms, weekName, weeksOfQuarter, weeksUpTo,
 } from './reports-v3.js';
 import { cnNum, crossLingualOf, Draft, enOrdinal, exactSetSpec, lexicalOverlap, paraphraseOf } from './separation.js';
@@ -37,7 +37,6 @@ export interface V3TaskCtx {
   teamName: (id: string) => string;
 }
 
-export const V3_FAMILIES = ['aggregate', 'current-state', 'alias', 'hop', 'timeline', 'lookalike', 'update', 'control-exact', 'control-paraphrase', 'control-xl'] as const;
 export const V3_FAMILY_MIN: Record<string, number> = { aggregate: 60, 'current-state': 60, alias: 60, hop: 60, timeline: 60, lookalike: 60, update: 60, 'control-exact': 20, 'control-paraphrase': 20, 'control-xl': 20 };
 export const V3_STRATUM_MIN: Record<string, number> = { h5: 20, h6: 20, h7: 20 };
 
@@ -54,8 +53,6 @@ const CONV_PERIOD: Record<Lang, string> = {
   zh: '（周报按其周一的日期计入月份、季度和年份。）',
   en: " (A weekly report counts in the month, quarter and year of its Monday.)",
 };
-
-const yearForms = (y: number, q: number) => [`${y}-Q${q}`, `${y}年第${cnNum(q)}季度`, `${y}年Q${q}`, `Q${q} ${y}`, `${y} Q${q}`];
 
 export function v3Tasks(c: V3TaskCtx, opts: { hops?: 'own' | 'cross' } = {}): Draft[] {
   if (opts.hops === 'cross') return hopTasks(c, true);

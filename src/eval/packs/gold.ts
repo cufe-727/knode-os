@@ -1,7 +1,6 @@
-import crypto from 'node:crypto';
 import { mapLimit } from '../../bench/util.js';
 import type { LlmClient } from '../../llm/client.js';
-import { foldSpace, seededKey } from '../pack.js';
+import { foldSpace, seededKey, shortHash as id } from '../pack.js';
 import { Bm25, chunkDocs } from '../retrieval.js';
 import type { GoldFact, Task } from '../types.js';
 
@@ -21,8 +20,6 @@ export interface DocText {
   text: string;
   date?: string;
 }
-
-const id = (...parts: string[]) => crypto.createHash('sha1').update(parts.join('|')).digest('hex').slice(0, 10);
 
 function langName(lang: string): string {
   return lang === 'zh' ? 'Chinese' : 'English';
@@ -66,6 +63,12 @@ export interface TaskPlan {
   temporal?: number;
   unanswerable?: number;
   global?: number;
+}
+
+/** A small build drafts proportionally fewer tasks. */
+export function scaledPlan(plan: TaskPlan, docs: number, full: number): TaskPlan {
+  const f = Math.min(1, docs / full);
+  return Object.fromEntries(Object.entries(plan).map(([k, n]) => [k, n ? Math.max(1, Math.round(n * f)) : 0]));
 }
 
 type Draft = Omit<Task, 'evidence'> & { evidence: Task['evidence'] };

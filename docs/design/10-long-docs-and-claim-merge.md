@@ -1,9 +1,11 @@
 # 10 — Extracting long documents in segments, merging duplicate claims
 
+> **Record status (2026-11-17): Built.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §4, §5.2. Stale here: `batchSize` as calls per pass (CLI pass only); limit 5 (closed by 14). Design 29 adds the rule pre-filter and attribute-based supersession.
+
 > Status: **implemented** (2026‑10‑03; the five items in §9 went as proposed). This changes two things in
 > [09 — Reworking the ingest stages](09-ingest-stage-rework.md): the Extract stage (one call per document, reading only
 > the first 12,000 characters) and what the Judge stage reviews (duplicate claims as well as duplicate entities).
-> Chinese version: [10-long-docs-and-claim-merge.zh-CN.md](10-long-docs-and-claim-merge.zh-CN.md).
+>
 
 ## 0. Where things stand
 

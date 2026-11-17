@@ -39,20 +39,6 @@ export function emptyTouched(): TouchedSet {
   return { entities: new Set(), relations: new Set(), claims: new Set(), documents: new Set(), datasets: new Set() };
 }
 
-export function touchedSize(t: TouchedSet): number {
-  return t.entities.size + t.relations.size + t.claims.size + t.documents.size + t.datasets.size;
-}
-
-export function touchedToJson(t: TouchedSet): Record<keyof TouchedSet, string[]> {
-  return {
-    entities: [...t.entities],
-    relations: [...t.relations],
-    claims: [...t.claims],
-    documents: [...t.documents],
-    datasets: [...t.datasets],
-  };
-}
-
 export type DepInputKind = 'entity' | 'relation' | 'claim' | 'document' | 'dataset' | 'trace' | 'set';
 
 export interface DepDecl {

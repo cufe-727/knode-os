@@ -1,5 +1,6 @@
 import type { ConnectorContext, FeedConnector, FeedItem, PullResult } from '../types.js';
 import { child, children, parseXml, textOf } from '../xml.js';
+import { sleep } from '../../../pool.js';
 
 /**
  * New papers on arXiv, through its query API (export.arxiv.org/api/query,
@@ -89,15 +90,6 @@ export function parseArxiv(xml: string): { items: FeedItem[]; total: number } {
   }
   return { items, total };
 }
-
-const sleep = (ms: number, signal: AbortSignal) =>
-  new Promise<void>((resolve, reject) => {
-    const t = setTimeout(resolve, ms);
-    signal.addEventListener('abort', () => {
-      clearTimeout(t);
-      reject(new Error('cancelled'));
-    }, { once: true });
-  });
 
 async function pullArxiv(ctx: ConnectorContext): Promise<PullResult> {
   const query = arxivQuery(ctx.feed.params);

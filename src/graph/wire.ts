@@ -206,17 +206,6 @@ export async function applyWirePlan(
   return stats;
 }
 
-/** Convenience: plan + apply in one call (no wiki index reuse). */
-export async function wireFromMarkdown(
-  w: ScopeWriter,
-  page: PageContext,
-  parsed: ParsedMarkdown,
-  opts: WirePlanOptions & { extractor?: string } = {},
-): Promise<{ entities: number; relations: number }> {
-  const plan = planWireFromMarkdown(w.dataDir, page, parsed, opts);
-  return applyWirePlan(w, page, plan, { extractor: opts.extractor ?? 'tier0.wikilink' });
-}
-
 interface BundleContext {
   rootRel: string;
   sourceRel: string;

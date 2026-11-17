@@ -3,7 +3,6 @@ import path from 'node:path';
 
 /** Shared helpers for the bench suite (reports live under <data>/eval/). */
 
-export const EVAL_DIR = 'eval';
 export const REPORTS_DIR = 'eval/reports';
 export const QA_FILE = 'eval/qa.jsonl';
 

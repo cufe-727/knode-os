@@ -7,6 +7,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import type { AppContext } from '../context.js';
 import { mountMcp } from '../server/mcp-http.js';
+import { tokenMatches } from '../digest.js';
 
 /**
  * One build's knode tools for every agent session that answers on it
@@ -78,13 +79,6 @@ export async function startServedTools(info: { name: string; version: string; in
 function bearerOf(req: Request): string | null {
   const auth = req.headers.get('authorization');
   return auth && /^bearer\s+/i.test(auth) ? auth.replace(/^bearer\s+/i, '').trim() : null;
-}
-
-function tokenMatches(presented: string | null, expected: string): boolean {
-  if (!presented) return false;
-  const a = Buffer.from(presented);
-  const b = Buffer.from(expected);
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 async function listen(app: Hono, secret: string, tools: string[]): Promise<ToolHost> {

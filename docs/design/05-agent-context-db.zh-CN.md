@@ -1,5 +1,7 @@
 # 05 — Agent Context Database：面向 agent 的知识库重设计
 
+> **Record status (2026-11-17): Built (phases 1–6).** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §4, §6.2. Kept because §6.1–6.4 and §8.4 here describe what was built and the English file lacks them. The same stale points as the English file apply.
+
 > 状态：Phase 1–6 **全部已实现**——血缘账本、Temporal Resolver、Capability Graph、Context Compiler、学习闭环（ranker / recipe 蒸馏 / pack 评测）、以及负知识、工作集、信任层级、ACL 继承、变更订阅。英文版见 [05-agent-context-db.md](05-agent-context-db.md)。
 
 ## 0. 一句话
@@ -96,7 +98,7 @@ datasets  + scope_id, tx_from, tx_to ；documents + scope_id, kind: source|view�
 
 新模型：实体/关系/断言仍是**内容寻址的共享行**，但每个 source 对它的支持是一条 `evidence`；可见列由 `src/lineage/fold.ts` 在 apply/dispose 的同一事务内**只对被触及的 id** 从活跃 evidence 重算，规则与顺序无关（重建可复现）：
 
-- entity：`name` = 最高权重 evidence 的名字（并列取最早、再字典序）；`type` = 活跃 evidence 读得最多的类型，只在本体里除 `concept` 以外的类型中选——声明顺序（`typePrecedence`）只用来打破平票，`concept` 只在没有任何类型化读法时胜出，人工更正（`playbooks/entities/corrections.yaml`，见 [06](06-wiki-research-agent.zh-CN.md) §3）覆盖这个结果；`description` 最长；`aliases` 大小写不敏感并集；`mention_count = COUNT(DISTINCT chunk_id)`。
+- entity：`name` = 最高权重 evidence 的名字（并列取最早、再字典序）；`type` = 活跃 evidence 读得最多的类型，只在本体里除 `concept` 以外的类型中选——声明顺序（`typePrecedence`）只用来打破平票，`concept` 只在没有任何类型化读法时胜出，人工更正（`playbooks/entities/corrections.yaml`，见 [06](06-wiki-research-agent.md) §3）覆盖这个结果；`description` 最长；`aliases` 大小写不敏感并集；`mention_count = COUNT(DISTINCT chunk_id)`。
 - relation：`weight = SUM(evidence.weight)`，每个来源一行，重 ingest 不累加。只有**类型化谓词**落库：`co_occurs` **读时推导、不再存储**（迁移 v13，2026-10-18）——`src/graph/cooccur.ts` 从 `entity_mentions` 计算：同一篮活文档提到两个实体即共现（每个共享文档 0.2），同一 chunk 提到则更强（每个共享 chunk +0.3）；`graphSearch`（跳跃增益 ×0.5）、`graphOverview`、`graphInsights`（孤立实体列表）都从这里读。旧的 co_occurs 行没有任何 mention 之外的信息，却占 finance 工作区 relations 表的 92%（912k 中的 844k，背后 2.0M 条 evidence）；迁移本身只建 mention 按文档的索引并打标记，新代码首次打开后在后台分批删除（`dropStoredCoOccurrence`：每条语句 1 万条关系、各自提交，该工作区的 Postgres 副本上每批约 1 秒、共约 100 秒，打开本身 0.1 秒即返回；`close` 时停下，下次打开续跑），期间读取端忽略该类型的行。
 - claim：任一 disputed → disputed，否则任一 fact → fact，否则 suspected；`valid_from = MIN`；`valid_to` 任一为空则为空（"未注明结束的再次断言 = 仍在断言"），否则 MAX；`primary_scope_id` = 最早的活跃来源。
 - 活跃 evidence 归零，或端点实体 / 主体实体已 tombstone → 行 tombstone（`tx_to`）；重新获得 evidence → 重开（`tx_from` 更新，完整历史在 evidence）。

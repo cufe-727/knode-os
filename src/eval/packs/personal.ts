@@ -1,5 +1,4 @@
-import crypto from 'node:crypto';
-import { seededKey } from '../pack.js';
+import { seededKey, shortHash as hash, stratified } from '../pack.js';
 import type { CorpusDoc, SourceRecord, Task, TaskType } from '../types.js';
 import { finishDocpack } from './docpack.js';
 import { fetchJson, fetchText, hfRows } from './fetch.js';
@@ -28,22 +27,6 @@ import { PackWriter } from './writer.js';
  */
 
 type Doc = CorpusDoc & { text: string };
-
-const hash = (...parts: string[]) => crypto.createHash('sha1').update(parts.join('|')).digest('hex').slice(0, 10);
-
-const slug = (s: string, n = 60) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, n) || 'x';
-
-/** Items in a seeded round-robin over strata: every stratum is drawn once before any is drawn twice. */
-function stratified<T>(items: T[], stratum: (t: T) => string, key: (t: T) => string, seed: string | number): T[] {
-  const groups = new Map<string, T[]>();
-  for (const t of items) (groups.get(stratum(t)) ?? groups.set(stratum(t), []).get(stratum(t))!).push(t);
-  const lists = [...groups.entries()]
-    .sort((a, b) => seededKey(seed, a[0]).localeCompare(seededKey(seed, b[0])))
-    .map(([, list]) => list.sort((a, b) => seededKey(seed, key(a)).localeCompare(seededKey(seed, key(b)))));
-  const out: T[] = [];
-  for (let round = 0; out.length < items.length; round++) for (const l of lists) if (round < l.length) out.push(l[round]);
-  return out;
-}
 
 /** A leading span of `text` (cut at a word boundary): an exact quote for evidence. */
 function lead(text: string, max = 240): string {

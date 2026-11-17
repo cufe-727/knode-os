@@ -1,6 +1,8 @@
 # 11 — Plugins: pluggable processing stages, storage and models
 
-> Status: **implemented** (2026‑10‑18). Chinese version: [11-plugins-and-udfs.zh-CN.md](11-plugins-and-udfs.zh-CN.md).
+> **Record status (2026-11-17): Built; current.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §9. Stale here: "three CLIs" (OpenCode is a fourth); built-in converters now include EPUB and HTML.
+
+> Status: **implemented** (2026‑10‑18).
 > How-to with examples: [docs/plugins.md](../plugins.md).
 
 ## 0. Background

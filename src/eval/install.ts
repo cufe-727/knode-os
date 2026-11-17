@@ -71,7 +71,3 @@ export async function installExternal(id: string, opts: { version?: string; pyth
   return { dir, version };
 }
 
-export function installedVersion(id: string): string | null {
-  const f = path.join(venvDir(id), 'knode-eval-version');
-  return fs.existsSync(f) ? fs.readFileSync(f, 'utf8').trim() : null;
-}

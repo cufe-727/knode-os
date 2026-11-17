@@ -1,5 +1,7 @@
 # 33 — The evaluation as a ladder: what search adds, what the wiki adds, what knode's tools add
 
+> **Record status (2026-11-17): Stages 1–3 built; stages 4 and 5 not done.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §8. Stale here: "stages 3–5 are not" (stage 3 — format-tolerant scoring, `--judge-audit`, `--repeat-sample` — is built); the team names of §4 (city names, §11).
+
 Status: design (2026-11-14); stage 1 (§10) and stage 2 (recipe v3, the families of §3, pack lint: §11) built 2026-11-15. Stages 3–5 are not.
 
 ## 0. Why

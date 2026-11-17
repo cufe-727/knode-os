@@ -1,5 +1,7 @@
 # 14 — Summary pages worth their cost: a size threshold, the document's language, the graph's names, whole documents
 
+> **Record status (2026-11-17): Built; current.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §5.2, §5.3. Stale here: D2 "in the document's language" is overridden by 17 when content languages are on. §0 and the §6 tables are measurements.
+
 > Status: **implemented** (2026‑10‑23). Config keys `extraction.summaryMinChars` and `extraction.summaryMaxSegments`,
 > schema v15 (`documents.chars`), `knode-os wiki prune-summaries`. §6 (2026‑11‑11): the document's claims on its
 > summary page, generator `source_summary@3`; the specifics rule and a figures list in the prompt.

@@ -59,15 +59,15 @@ export interface LexedSql {
   unterminated?: string;
 }
 
-const SPACE = /[ \t\n\r\f\v]/;
-const NUMBER = /(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/y;
+export const SPACE = /[ \t\n\r\f\v]/;
+export const NUMBER = /(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/y;
 
-const PG_WORD = /[A-Za-z_\u0080-\uffff][A-Za-z0-9_$\u0080-\uffff]*/y;
-const PG_DOLLAR_QUOTE = /\$(?:[A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/y;
-const PG_PARAM = /\$\d+/y;
+export const PG_WORD = /[A-Za-z_\u0080-\uffff][A-Za-z0-9_$\u0080-\uffff]*/y;
+export const PG_DOLLAR_QUOTE = /\$(?:[A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/y;
+export const PG_PARAM = /\$\d+/y;
 /** E'…' escapes with backslashes; U&'…', B'…', X'…' and N'…' quote like '…'. */
-const PG_STRING_PREFIX = /(?:[eE]|[uU]&|[bBxXnN])'/y;
-const PG_QUOTED_PREFIX = /[uU]&"/y;
+export const PG_STRING_PREFIX = /(?:[eE]|[uU]&|[bBxXnN])'/y;
+export const PG_QUOTED_PREFIX = /[uU]&"/y;
 /**
  * Whitespace holding a newline, then a quote: PostgreSQL continues the string
  * literal before it there, in that literal's escape mode — `E'a'⏎'\''` is one
@@ -75,13 +75,14 @@ const PG_QUOTED_PREFIX = /[uU]&"/y;
  * whole comment line per repetition, so a failed match cannot backtrack
  * exponentially.)
  */
-const PG_QUOTE_CONTINUE = /[ \t\f\v]*(?:--[^\n\r]*)?[\n\r](?:[ \t\n\r\f\v]|--[^\n\r]*[\n\r])*'/y;
+export const PG_QUOTE_CONTINUE = /[ \t\f\v]*(?:--[^\n\r]*)?[\n\r](?:[ \t\n\r\f\v]|--[^\n\r]*[\n\r])*'/y;
 
 const MYSQL_WORD = /[A-Za-z_$\u0080-\uffff][A-Za-z0-9_$\u0080-\uffff]*/y;
 /** An executable comment's opening — `/*!`, `/*!80013`, MariaDB's `/*M!100100` — whose text MySQL runs as SQL. */
 const MYSQL_EXECUTABLE = /\/\*M?!(?:\d{5,6})?/y;
 
-function match(re: RegExp, sql: string, at: number): string | undefined {
+/** What a sticky pattern matches at `at`, if anything. */
+export function match(re: RegExp, sql: string, at: number): string | undefined {
   re.lastIndex = at;
   return re.exec(sql)?.[0];
 }

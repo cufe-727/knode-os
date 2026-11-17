@@ -205,11 +205,6 @@ export function seriesSupersession(series: StateRow[]): Map<string, string | nul
   return out;
 }
 
-/** The object part of a claim's series: its object (seriesObject), else what its owner or state statement is about. */
-export function seriesKeyObject(r: Pick<StateRow, 'attribute' | 'object_id' | 'object_name' | 'object_type' | 'value_text' | 'statement'>, spellings: readonly string[]): string {
-  return seriesKeyObjects([r], spellings)[0];
-}
-
 /**
  * The object part of the series of each of one subject's claims: its object,
  * else what its owner or state statement is about, settled against the

@@ -35,3 +35,14 @@ export function breather(sliceMs = 20): () => Promise<void> {
     since = performance.now();
   };
 }
+
+/** Wait `ms`, or reject with "cancelled" as soon as `signal` aborts. */
+export function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const t = setTimeout(resolve, ms);
+    signal.addEventListener('abort', () => {
+      clearTimeout(t);
+      reject(new Error('cancelled'));
+    }, { once: true });
+  });
+}

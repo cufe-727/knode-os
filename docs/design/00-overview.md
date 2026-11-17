@@ -1,5 +1,7 @@
 # knode-os — design overview
 
+> **Record status (2026-11-17): Built; mostly current.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §1, §5, §6. Stale here: "no auth, bind to 127.0.0.1" (accounts, sessions and `/remote/v1` exist); `ask` as one hybrid route (it routes by question kind, design 30); MCP as stdio only; the "Further design docs" list.
+
 > Local-first knowledge OS for coding agents. One TypeScript process, one data
 > directory, one PostgreSQL + pgvector index (embedded PGlite as the opt-in
 > alternative).
@@ -373,7 +375,7 @@ reads through knode every line said `cold` (09 said the index shows heat).
   — maps chunks and entity mentions onto SAG's event/entity retrieval model,
   including multi-hop expansion, dual-route fusion, provenance, and next steps.
 - [05 — Agent Context Database](05-agent-context-db.md) ([中文](05-agent-context-db.zh-CN.md))
-- [06 — Wiki research agents and graph upgrades](06-wiki-research-agent.md) ([中文](06-wiki-research-agent.zh-CN.md))
+- [06 — Wiki research agents and graph upgrades](06-wiki-research-agent.md) ([中文](06-wiki-research-agent.md))
   — the v2 redesign: Cordis-style effect ledger (scopes / evidence / deps /
   pages, dispose reverts everything a source produced), bitemporal `as_of` /
   `valid_at`, wiki pages as views, one logical multimodal database, and the
@@ -392,7 +394,7 @@ reads through knode every line said `cold` (09 said the index shows heat).
   consistent view, quarantined agent writes that open disputes instead of
   overwriting, ACLs intersected down the derivation chain, and change
   subscriptions cursored on system time.
-- [11 — Plugins: pluggable processing stages, storage and models](11-plugins-and-udfs.md) ([中文](11-plugins-and-udfs.zh-CN.md))
+- [11 — Plugins: pluggable processing stages, storage and models](11-plugins-and-udfs.md) ([中文](11-plugins-and-udfs.md))
   — one registry for LLM / embedding providers, storage backends, document
   converters and user-defined hooks at every processing stage; the built-ins
   are registered through the same API. How-to: [docs/plugins.md](../plugins.md).
@@ -401,7 +403,7 @@ reads through knode every line said `cold` (09 said the index shows heat).
   judge calls, taken by `serve`'s own slots and by remote workers, which read
   their setup from the server; remote embedding is proposed. How-to:
   [docs/remote-labeling.md](../remote-labeling.md).
-- [13 — The client contract: how other projects use knode-os, starting with rookie-trade](13-client-contract.md) ([中文](13-client-contract.zh-CN.md))
+- [13 — The client contract: how other projects use knode-os, starting with rookie-trade](13-client-contract.md) ([中文](13-client-contract.md))
   — proposed: one contract (`contract/`, generated OpenAPI and golden schemas)
   behind `/remote/v1`, MCP and a thin Python SDK; tokens with a role and a
   trust tier; `known_at`, a fourth time axis that reads only what was available

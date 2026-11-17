@@ -1,7 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseYaml } from '../compiler/intents.js';
-import { isCliProvider, KnodeConfig, LlmProvider } from '../config.js';
 import { AGENTS_DIR } from '../fs/layout.js';
 import { agentFilePath, agentYamlText, DEEP_AGENT, isValidAgentName } from './agent-file.js';
 import { Effort, EFFORTS, Speed, SPEEDS, WEB_ACCESS, WebAccess } from './profile.js';
@@ -63,8 +62,6 @@ export interface AgentDefinition {
   path: string;
 }
 
-export const BUILTIN_AGENT_NAMES = [DEEP_AGENT.name] as const;
-
 function agent(patch: Partial<AgentDefinition> & Pick<AgentDefinition, 'name'>): AgentDefinition {
   return {
     title: patch.name,
@@ -91,11 +88,6 @@ function agent(patch: Partial<AgentDefinition> & Pick<AgentDefinition, 'name'>):
 export const BUILTIN_AGENTS: Record<string, AgentDefinition> = {
   [DEEP_AGENT.name]: agent({ name: DEEP_AGENT.name, title: DEEP_AGENT.title }),
 };
-
-/** Which runtime a definition runs on: a coding-agent CLI, or the built-in deepagents loop. */
-export function agentRuntime(definition: Pick<AgentDefinition, 'executor'>): LlmProvider | 'deepagents' {
-  return isCliProvider(definition.executor) ? definition.executor : 'deepagents';
-}
 
 function agentFile(dataDir: string, name: string): string {
   return agentFilePath(dataDir, name);
@@ -163,12 +155,6 @@ export function deleteAgent(dataDir: string, name: string): boolean {
   if (!fs.existsSync(file)) return false;
   fs.rmSync(file);
   return true;
-}
-
-/** The agent `research.agent` names, if it is a name at all. */
-export function activeAgent(dataDir: string, config: KnodeConfig): AgentDefinition | null {
-  const name = config.research?.agent?.trim();
-  return name ? loadAgent(dataDir, name) : null;
 }
 
 /* ------------------------------------------------------------------ normalization */

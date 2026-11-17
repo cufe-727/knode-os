@@ -1,5 +1,8 @@
 import crypto from 'node:crypto';
-import { assertReadOnlySql } from '../datasource/guard.js';
+import {
+  assertReadOnlySql, match, NUMBER, PG_DOLLAR_QUOTE as DOLLAR_QUOTE, PG_PARAM as PARAM, PG_QUOTE_CONTINUE as QUOTE_CONTINUE,
+  PG_QUOTED_PREFIX as QUOTED_PREFIX, PG_STRING_PREFIX as STRING_PREFIX, PG_WORD as WORD, SPACE,
+} from '../datasource/guard.js';
 import { Store } from './db.js';
 
 /**
@@ -70,29 +73,8 @@ interface Token {
   text: string;
 }
 
-const SPACE = /[ \t\n\r\f\v]/;
-const WORD = /[A-Za-z_\u0080-\uffff][A-Za-z0-9_$\u0080-\uffff]*/y;
-const NUMBER = /(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/y;
-const DOLLAR_QUOTE = /\$(?:[A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/y;
-const PARAM = /\$\d+/y;
-/** E'…' escapes with backslashes; U&'…', B'…', X'…' and N'…' quote like '…'. */
-const STRING_PREFIX = /(?:[eE]|[uU]&|[bBxXnN])'/y;
-const QUOTED_PREFIX = /[uU]&"/y;
 /** A -- comment runs to the next newline or carriage return. */
 const LINE_COMMENT = /--[^\n\r]*/y;
-/**
- * Whitespace holding a newline, then a quote: Postgres continues the string
- * literal before it there, in that literal's escape mode — `E'a'⏎'\''` is one
- * E-string. A vertical tab before the newline counts as whitespace too. One
- * character or one whole comment line per repetition, so a failed match cannot
- * backtrack exponentially.
- */
-const QUOTE_CONTINUE = /[ \t\f\v]*(?:--[^\n\r]*)?[\n\r](?:[ \t\n\r\f\v]|--[^\n\r]*[\n\r])*'/y;
-
-function match(re: RegExp, sql: string, at: number): string | undefined {
-  re.lastIndex = at;
-  return re.exec(sql)?.[0];
-}
 
 /** The index just past the quote that closes the literal opening at `open`, or the end of `sql`. */
 function closeQuote(sql: string, open: number, backslashEscapes: boolean): number {

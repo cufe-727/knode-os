@@ -1,5 +1,7 @@
 # 28 — Benchmark separation: tasks a compiled knowledge base should win
 
+> **Record status (2026-11-17): Built.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §8. The branch named in the status line is merged. Stale here: "nothing is run against a model" (runs happened 2026-11-14, see 33 §0); for new runs the task families are those of recipe v3 (33). "Version 3" here is the v2 recipe's pack version, not recipe v3.
+
 > Status: **implemented** (2026‑11‑13) on branch `claude/eval-benchmark-separation-5b403e`, not run against a model.
 > Recipe `synthetic-reports-{zh,en}` version 2, `synthetic-life-{zh,en}` version 3. Code:
 > `src/eval/packs/reports.ts`, `life-ledger.ts`, `separation.ts`; scoring in `src/eval/score/{usage,lists,values,keys}.ts`

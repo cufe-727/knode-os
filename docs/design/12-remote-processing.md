@@ -1,5 +1,7 @@
 # 12 — Remote processing: embeddings, summaries and reviews on remote workers
 
+> **Record status (2026-11-17): Phases 1–4 built, except lent keys.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §7. Stale here: the work-kind list and shares (now eight kinds: 17, 27, 32); `/api/work/status` (does not exist; `/api/labeling/status` does); summaries cut at `LLM_WIKI_INPUT_CHARS` (segments, 14).
+
 > Status: **phases 1 and 2 implemented** (2026‑10‑18): the work broker, summaries as leased work, `work/*` with
 > `work/config`, worker kinds and hints, and the Judge stage's review calls fanned out to `serve`'s judge slots and
 > remote workers (§9). **Phases 3 and 4 implemented except lent keys** (2026‑11‑06, `src/work/embed.ts`): the

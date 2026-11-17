@@ -1,6 +1,7 @@
 import { LlmConnection, resolveSecret, ResearchWebConfig } from '../config.js';
 import { guardedFetch } from './fetch.js';
 import { abortSession, registerSession } from './launch.js';
+import { sleep } from '../pool.js';
 
 /**
  * Deep-research mode: one long call to a model that researches on its own —
@@ -102,14 +103,6 @@ async function getJson(url: string, key: string, web: ResearchWebConfig): Promis
     return { status: res.status, json: null, text };
   }
 }
-
-const sleep = (ms: number, signal: AbortSignal) => new Promise<void>((resolve, reject) => {
-  const t = setTimeout(resolve, ms);
-  signal.addEventListener('abort', () => {
-    clearTimeout(t);
-    reject(new Error('cancelled'));
-  }, { once: true });
-});
 
 export async function runDeepResearch(input: DeepResearchInput): Promise<DeepResearchResult> {
   const base = trimBase(input.connection.baseUrl);

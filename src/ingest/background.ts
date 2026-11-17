@@ -2,10 +2,9 @@ import { AppContext } from '../context.js';
 import { auditDuplicateClaims, ClaimDedupeStats } from '../graph/claim-dedupe.js';
 import { auditDuplicateEntities, DedupeStats } from '../graph/dedupe.js';
 import { runTier1Pass, Tier1Stats } from '../graph/tier1.js';
-import { ensureCorpusPages } from '../wiki/corpus.js';
 import { refreshNavigationIfChanged } from '../wiki/navigation.js';
-import { ensureEntityStubs, ensureSourceSummaries, refreshSummaryClaims } from '../wiki/pages.js';
-import { supersedeForClaims } from '../wiki/refine.js';
+import { ensureSourceSummaries } from '../wiki/pages.js';
+import { afterExtraction } from './after-extraction.js';
 
 /** A tier-1 pass's stats, plus what the resolve and summary steps did. */
 export interface DocumentPassStats extends Tier1Stats {
@@ -30,9 +29,6 @@ export interface DocumentPassOptions {
   /** Parallel model calls; default `extraction.concurrency`. */
   concurrency?: number;
 }
-
-/** Entity pages one pass creates at most: each is a file the next sync indexes and embeds. */
-const ENTITY_PAGES_PER_PASS = 30;
 
 // One pass at a time per data dir: serve's timer, `knode-os extract` and an
 // initialization must not audit the same entities or summarize the same
@@ -72,8 +68,12 @@ const passChains = new Map<string, Promise<unknown>>();
  *    overview's holdings (src/wiki/navigation.ts), when the pass wrote
  *    anything and what they count has changed.
  *
- * Serve runs it every `extraction.intervalMinutes`, `knode-os extract` runs it
- * once, and an initialization runs it until the extraction queue is empty.
+ * `knode-os extract` runs it once, and an initialization or an evaluation
+ * build runs it until the extraction queue is empty. `serve` does not run it:
+ * there extraction and summaries are leased work, and its follow-up
+ * (src/labeling/followup.ts) runs the two audits of steps 2 and 3, then the
+ * same `afterExtraction` (src/ingest/after-extraction.ts) this pass runs for
+ * step 3's supersession and steps 4 to 6, then navigation.
  */
 export function runDocumentPass(ctx: AppContext, opts: DocumentPassOptions = {}): Promise<DocumentPassStats> {
   const previous = passChains.get(ctx.dataDir) ?? Promise.resolve();
@@ -115,53 +115,16 @@ async function runDocumentPassUnlocked(ctx: AppContext, opts: DocumentPassOption
     }
   }
 
-  // after the merges: a claim merged into another takes no part in a series
-  let superseded = 0;
-  if (extracted.touchedClaims.length > 0) {
-    try {
-      const marks = await supersedeForClaims(ctx.store, extracted.touchedClaims);
-      superseded = marks.superseded;
-      if (superseded) progress(`supersession: ${superseded} marks updated over ${marks.subjects} subjects`);
-    } catch (err) {
-      progress(`supersession failed: ${err instanceof Error ? err.message : err}`);
-    }
-  }
-
-  let summaries: string[] = [];
-  try {
-    summaries = await ensureSourceSummaries(
-      { ...ctx, config },
-      { limit: batchSize, prefer: extracted.documents, concurrency, actor: 'summarize', onProgress: progress },
-    );
-  } catch (err) {
-    progress(`summaries failed: ${err instanceof Error ? err.message : err}`);
-  }
-  try {
-    // the claims just extracted go on their documents' existing summary pages, from the cached summaries
-    // (a page written above is already current: its regeneration is 'unchanged')
-    await refreshSummaryClaims({ ...ctx, config }, extracted.documents, { actor: 'summarize' });
-  } catch (err) {
-    progress(`summary claims failed: ${err instanceof Error ? err.message : err}`);
-  }
-
-  let entityPages: string[] = [];
-  if (extracted.touched.length > 0) {
-    try {
-      // only what a second document now speaks of: a page per entity of every new document would grow without end
-      entityPages = await ensureEntityStubs({ ...ctx, config }, { focus: extracted.touched, minClaims: null, minMentions: null, max: ENTITY_PAGES_PER_PASS, actor: 'entities' });
-    } catch (err) {
-      progress(`entity pages failed: ${err instanceof Error ? err.message : err}`);
-    }
-  }
-
-  let corpusPages: string[] = [];
-  if (extracted.touched.length > 0 || extracted.touchedClaims.length > 0) {
-    try {
-      corpusPages = await ensureCorpusPages({ ...ctx, config }, { focus: { entities: extracted.touched, claims: extracted.touchedClaims }, actor: 'corpus' });
-    } catch (err) {
-      progress(`corpus pages failed: ${err instanceof Error ? err.message : err}`);
-    }
-  }
+  // supersession, summaries, then the pages that list what was written: the steps `serve` shares
+  const pagesCtx = { ...ctx, config };
+  const { superseded, summaries, entityPages, corpusPages } = await afterExtraction(
+    pagesCtx,
+    { entityIds: extracted.touched, claimIds: extracted.touchedClaims, documents: extracted.documents },
+    {
+      onProgress: progress,
+      summarize: () => ensureSourceSummaries(pagesCtx, { limit: batchSize, prefer: extracted.documents, concurrency, actor: 'summarize', onProgress: progress }),
+    },
+  );
 
   if (extracted.processed || summaries.length || entityPages.length || corpusPages.length) {
     try {
@@ -175,21 +138,3 @@ async function runDocumentPassUnlocked(ctx: AppContext, opts: DocumentPassOption
   return { ...extracted, resolve, claims, superseded, summaries, entityPages, corpusPages };
 }
 
-/** One log line for a pass, or null when it did nothing worth a line. */
-export function describeDocumentPass(s: DocumentPassStats): string | null {
-  const parts: string[] = [];
-  if (s.processed || s.failed || s.calls) {
-    parts.push(`${s.processed} written, ${s.failed} failed, ${s.calls} calls${s.callsFailed ? ` (${s.callsFailed} failed)` : ''}, ${s.queued} queued (${s.segmentsLeft} segments)`);
-  }
-  if (s.resolve && (s.resolve.suggested || s.resolve.autoMerged || s.resolve.llmRejected)) {
-    parts.push(`resolve: ${s.resolve.suggested} merge suggestions${s.resolve.autoMerged ? `, ${s.resolve.autoMerged} merged` : ''}${s.resolve.llmRejected ? `, ${s.resolve.llmRejected} rejected` : ''}`);
-  }
-  if (s.claims && (s.claims.merged || s.claims.suggested || s.claims.conflicts)) {
-    parts.push(`claims: ${s.claims.merged} merged, ${s.claims.suggested} suggestions, ${s.claims.conflicts} contradictions`);
-  }
-  if (s.superseded) parts.push(`${s.superseded} supersession marks`);
-  if (s.summaries.length) parts.push(`${s.summaries.length} summaries`);
-  if (s.entityPages.length) parts.push(`${s.entityPages.length} entity pages`);
-  if (s.corpusPages?.length) parts.push(`${s.corpusPages.length} cross-document pages`);
-  return parts.length ? `document pass: ${parts.join('; ')}` : null;
-}

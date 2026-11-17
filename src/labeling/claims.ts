@@ -39,6 +39,3 @@ export function heldDocuments(dataDir: string): string[] {
   return [...(held.get(dataDir)?.keys() ?? [])];
 }
 
-export function isDocumentHeld(dataDir: string, documentId: string): boolean {
-  return held.get(dataDir)?.has(documentId) ?? false;
-}

@@ -5,7 +5,6 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { loadConfig, saveConfig } from '../src/config.js';
 import { AppContext, createContext } from '../src/context.js';
 import { initDataDir } from '../src/fs/datadir.js';
-import { readPageCache, writePageCache } from '../src/fs/page-sidecar.js';
 import { readSidecarPart, readSourceSummary, updateSidecarPart, writeSourceSummary } from '../src/fs/sidecar.js';
 import { claimsForEntities } from '../src/graph/query.js';
 import { prepareDocs } from '../src/ingest/prepare.js';
@@ -111,10 +110,6 @@ describe('sidecar directories', () => {
     const body = '---\nnot: frontmatter\n---\n\nA summary that opens with a fence-like line.';
     writeSourceSummary(dataDir, key, { contentSha: meta.contentSha256, model: 'm', generatedAt: '2026-09-13T04:05:24.000Z', body });
     expect(readSourceSummary(dataDir, key)).toEqual({ contentSha: meta.contentSha256, model: 'm', generatedAt: '2026-09-13T04:05:24.000Z', body });
-    const page = { inputsSha: 'abc', model: 'm', body: '# Cluster\n\ntext', generatedAt: '2026-09-13T04:05:24.000Z' };
-    writePageCache(dataDir, 'wiki/concepts/x-cluster.md', page);
-    expect(readPageCache(dataDir, 'wiki/concepts/x-cluster.md')).toEqual(page);
-    expect(fs.existsSync(path.join(dataDir, '.sidecar', 'wiki', 'concepts', 'x-cluster.md', 'render.md'))).toBe(true);
   });
 
   it("keeps a removed source's sidecar in the attic and replays it with rebuild --history", async () => {

@@ -1,5 +1,7 @@
 # 01 — 文档处理系统：面向海量文本的 Graph Wiki 方案
 
+> **Record status (2026-11-17): Built, then revised.** This is a decision record, not the description of the system. What the code does now is in [ARCHITECTURE.md](../ARCHITECTURE.md) §3, §5.1, §5.2. Stale here: the `cooked/` layout and `*.knode.json` (now `.sidecar/`), tier-2 community summaries (retired by 09), fixed entity and relation type counts (ontology packs, 06), one call on the first 12k characters (segments, 10), `heat.coldThreshold`. Still the reference for tier-0 linking, heat and queue priority.
+
 > 文档上传后的处理管线设计：切块、实体/关系抽取、sidecar 元信息与热度追踪、
 > 目录层次。目标规模：十万至百万级文档。
 >
@@ -218,7 +220,7 @@ NLP 概念抽取与 sidecar 写入。
    - `wiki/index.md` 维护"热点主题"区块（见 3.3）。
 4. wiki 页被下一轮 ingest 索引回图谱——保留现有 wiki ↔ graph 正反馈循环。
 
-> 2026‑09‑30 起（[09](09-ingest-stage-rework.zh-CN.md)）：Tier 2 不再写社区摘要页——热点社区改为 `concept` 研究建议，由研究 agent 写带来源的概念页；文档摘要页挪到每轮抽取之后、每篇都写；重复实体审计在每轮抽取后增量跑一次，夜间仍全量兜底。
+> 2026‑09‑30 起（[09](09-ingest-stage-rework.md)）：Tier 2 不再写社区摘要页——热点社区改为 `concept` 研究建议，由研究 agent 写带来源的概念页；文档摘要页挪到每轮抽取之后、每篇都写；重复实体审计在每轮抽取后增量跑一次，夜间仍全量兜底。
 
 ### 2.5 单文档时序
 
@@ -374,7 +376,7 @@ sidecar 的 `usage` 字段。DB 与 sidecar 之间，DB 是实时账本、sideca
      顶部渲染热度徽标；
    - `wiki/index.md` 由 Tier 2 维护"热点主题"区块（top-N 热点社区/实体链接）；
    - 冷文档（heat 低于阈值且超期未访问）在 wiki 生成时降级为 sources 索引页中
-     的一行链接，不再单独维护摘要页。（2026‑09‑30 起不再区分冷热：每篇文档都有摘要页，见 [09](09-ingest-stage-rework.zh-CN.md)。）
+     的一行链接，不再单独维护摘要页。（2026‑09‑30 起不再区分冷热：每篇文档都有摘要页，见 [09](09-ingest-stage-rework.md)。）
 
 ## 4. 目录层次
 

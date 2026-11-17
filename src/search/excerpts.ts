@@ -2,7 +2,7 @@ import { gramQuery, MATCH_INDEXES, matchIndexReady, termGrams } from '../store/g
 import { Store } from '../store/db.js';
 import { Params, toDateString } from '../store/temporal.js';
 import { SearchResult } from '../types.js';
-import { docLiveAt, keywordTerms, termCount } from './search.js';
+import { docLiveAt, keywordTerms, termCount, hitsInScope } from './search.js';
 
 /**
  * Excerpts: for a question that asks for every case, the lines of further
@@ -235,18 +235,18 @@ export async function excerptsForQuestion(store: Store, question: string, contex
   const exact = anchors.map((a) => `strpos(lower(c.content), ${p.add(a)}) > 0`).join(' OR ');
   const grams = anchors.map(termGrams);
   const indexed = matchIndexReady(store, 'chunks') && grams.every((g) => g.length > 0);
-  const match = indexed ? `${MATCH_INDEXES.chunks.expr('c')} @@ ${p.add(gramQuery(grams, 1))}::tsquery` : `(${exact})`;
+  // the index narrows, the text decides: a gram match is a superset of the chunks that hold an anchor
+  const match = indexed ? `${MATCH_INDEXES.chunks.expr('c')} @@ ${p.add(gramQuery(grams, 1))}::tsquery AND (${exact})` : `(${exact})`;
   const skip = p.add(contexts.map((c) => c.chunkId));
   const docs = inDocs ? `AND c.document_id = ANY(${p.add(inDocs)}::text[])` : '';
   const cap = p.add(SCAN_CAP);
   const cond = docLiveAt('d', p);
-  // the index lookup in its own materialized step, as in search's term lists: joined directly, a planner
-  // without statistics evaluates match_grams on every chunk
+  // the cap counts chunks that hold an anchor in a live document (search.ts `hitsInScope`): taken before
+  // those two tests, it filled with a repository's chunks and left none of the prose
   const rows = await store.query<Hit>(
-    `WITH hit AS MATERIALIZED (SELECT c.id FROM chunks c WHERE ${match} ${docs} AND NOT c.id = ANY(${skip}::text[]) LIMIT ${cap})
+    `WITH hit AS MATERIALIZED (${hitsInScope({ select: 'm.id', holds: `${match} ${docs} AND NOT c.id = ANY(${skip}::text[])`, doc: '1 AS held', cond, cap })})
      SELECT c.id AS chunk_id, c.document_id, c.seq, d.path, d.title, d.doc_date, c.content
-     FROM hit h JOIN chunks c ON c.id = h.id JOIN documents d ON d.id = c.document_id
-     WHERE ${cond} AND (${exact})`,
+     FROM hit h JOIN chunks c ON c.id = h.id JOIN documents d ON d.id = c.document_id`,
     p.list,
   );
   if (rows.length === 0) return [];

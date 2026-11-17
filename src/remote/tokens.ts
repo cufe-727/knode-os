@@ -17,17 +17,6 @@ import { isEvalKind, isLlmKind, LLM_KINDS, WorkKind } from '../work/kinds.js';
 export const REMOTE_SCOPES = ['label', 'read', 'write', 'sql', 'embed', 'embed-keys', 'research', 'eval'] as const;
 export type RemoteScope = (typeof REMOTE_SCOPES)[number];
 
-export const REMOTE_SCOPE_HELP: Record<RemoteScope, string> = {
-  label: `take leased model calls and hand back results (remote workers): ${LLM_KINDS.join(', ')}, or the kinds the token names`,
-  read: 'list, read and search documents; read the graph and claims',
-  write: 'write and delete documents under raw/docs, wiki and playbooks/packs; trigger a sync',
-  sql: 'read-only SQL over the catalog views (v_*)',
-  embed: 'take embed batches and hand back vectors made on the worker\'s own endpoint, once it passes calibration (docs/design/12)',
-  'embed-keys': 'also receive the embedding keys marked "Lend to remote workers", and embed on them under this machine\'s quota ledger',
-  research: 'take research agent sessions and run them on the worker\'s own Codex or Claude account; each session reaches knode through a token of its own (docs/design/27)',
-  eval: 'take an evaluation run\'s model calls and agent sessions (eval-call, eval-session) and run them on the worker\'s own Codex or Claude account; a session reads a corpus archive or the run\'s knode tools through a token of its own (docs/design/27 §8)',
-};
-
 export interface RemoteTokenRecord {
   id: string;
   name: string;

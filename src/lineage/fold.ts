@@ -1,4 +1,3 @@
-import crypto from 'node:crypto';
 import { Queryable } from '../store/migrations.js';
 import {
   EntityAsOf,
@@ -15,6 +14,7 @@ import { EntityCorrection, EntityCorrections, refusedKeys, refuses } from '../gr
 import { CLAIM_STATE_VERSION } from '../graph/claim-state.js';
 import { entityKeyKinds, KeyKind, nameKey } from '../graph/normalize.js';
 import { emptyTouched, TouchedSet } from './types.js';
+import { sha16 } from '../digest.js';
 
 /**
  * The fold: recompute the visible aggregate columns of entities / relations /
@@ -85,10 +85,6 @@ export async function foldTouched(q: Queryable, touched: TouchedSet, txTime: str
   for (const d of touched.documents) result.changed.documents.add(d);
   for (const d of touched.datasets) result.changed.datasets.add(d);
   return result;
-}
-
-function sha16(value: unknown): string {
-  return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 16);
 }
 
 /**
