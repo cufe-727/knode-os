@@ -184,7 +184,8 @@ export function mountMcp(app: Hono<any>, opts: MountMcpOptions): void {
 
     // the base's own guide rides along as server instructions (cached by the file's mtime)
     const server = new McpServer(MCP_SERVER_INFO, { instructions: mcpInstructions(ctx.dataDir) });
-    registerKnodeTools(server, ctx, opts.context && opts.tools ? opts.tools : { caller: bound ? 'agent' : 'owner' });
+    // in registry mode `tools` narrows every workspace's tools (an evaluation root's viewer: reading only)
+    registerKnodeTools(server, ctx, opts.context && opts.tools ? opts.tools : { caller: bound ? 'agent' : 'owner', ...(opts.registry && opts.tools ? opts.tools : {}) });
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,

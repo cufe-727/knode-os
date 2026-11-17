@@ -115,6 +115,21 @@ function workspaceLabel(workspace) {
   return workspace?.name || 'Workspace';
 }
 
+/**
+ * An evaluation build's line in the workspace menu and header (docs/design/35):
+ * its state, the update batches it holds, what built it and its size — or why
+ * the viewer does not open it.
+ */
+function evaluationLine(workspace) {
+  const ev = workspace?.evaluation;
+  if (!ev) return '';
+  const mb = ev.bytes >= 1024 ** 3 ? `${(ev.bytes / 1024 ** 3).toFixed(1)} GB` : `${Math.max(1, Math.round(ev.bytes / 1024 ** 2))} MB`;
+  const batches = ev.batchesApplied?.length ? `after batch ${ev.batchesApplied.at(-1)}` : 'no update batch';
+  const built = ev.builtWith ? `knode-os ${ev.builtWith.version}${ev.builtWith.commit ? ` ${ev.builtWith.commit.slice(0, 7)}` : ''}` : '';
+  const state = ev.state === 'updating' ? 'a batch is being applied' : ev.state;
+  return [state, batches, built, mb, ev.openable ? '' : `not opened: ${ev.why}`].filter(Boolean).join(' · ');
+}
+
 /** The Teams the server says this account may open. */
 function serverTeams() {
   return (serverAuth?.teams || []).map((team) => ({ id: team.id, name: team.name, kind: 'team', code: String(team.slug || '').toUpperCase() }));
@@ -280,11 +295,13 @@ function renderWorkspaceUI() {
   $('#workspace-avatar').textContent = workspaceInitials;
   $('#workspace-avatar').classList.toggle('team', !personal);
   $('#workspace-name').textContent = workspaceLabel(workspace);
-  $('#workspace-kind').textContent = personal ? 'Private workspace' : 'Team workspace';
+  $('#workspace-kind').textContent = workspace.evaluation ? 'Evaluation build · read-only' : personal ? 'Private workspace' : 'Team workspace';
   $('#context-name').textContent = workspaceLabel(workspace);
-  $('#context-description').textContent = personal
-    ? 'Only you can access this knowledge.'
-    : 'Knowledge in this view is shared with your Team.';
+  $('#context-description').textContent = workspace.evaluation
+    ? `Built by run ${workspace.evaluation.runId}: ${evaluationLine(workspace)}`
+    : personal
+      ? 'Only you can access this knowledge.'
+      : 'Knowledge in this view is shared with your Team.';
   $('#cfg-workspace-name').textContent = personal ? workspace.name : `${workspace.name} Team workspace`;
   $('#clear-workspace-name').textContent = workspaceLabel(workspace);
   $('#workspace-context').classList.toggle('team', !personal);
@@ -302,7 +319,8 @@ function renderWorkspaceUI() {
     button.type = 'button';
     button.className = `workspace-option${item.id === workspace.id ? ' active' : ''}`;
     button.setAttribute('role', 'menuitem');
-    button.innerHTML = `<span>${esc(initials(item.name))}</span><span><b>${esc(workspaceLabel(item))}</b><small>${item.kind === 'personal' ? 'Private to you' : 'Shared Team knowledge'}</small></span>`;
+    const detail = item.evaluation ? evaluationLine(item) : item.kind === 'personal' ? 'Private to you' : 'Shared Team knowledge';
+    button.innerHTML = `<span>${esc(initials(item.name))}</span><span><b>${esc(workspaceLabel(item))}</b><small>${esc(detail)}</small></span>`;
     button.addEventListener('click', () => switchWorkspace(item.id));
     options.appendChild(button);
   }

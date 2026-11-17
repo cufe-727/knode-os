@@ -99,6 +99,7 @@ import { queryClaims } from './store/claims.js';
 import { CATALOG_SOURCE, CATALOG_VIEWS, catalogQuery } from './store/catalog.js';
 import { resolveScopeFilter, resolveTemporal } from './store/resolver.js';
 import { startServer } from './server/serve.js';
+import { EVAL_VIEW_PORT } from './eval/root.js';
 import { syncTraces } from './traces/sync.js';
 import { runDream } from './dream/dream.js';
 import { generateWiki } from './wiki/generate.js';
@@ -159,8 +160,20 @@ program
   .action(async (opts) => {
     const ctx = await createContext(dataDir());
     if (opts.port) ctx.config.server.port = Number(opts.port);
+    // an evaluation root's viewer (docs/design/35 §4) listens on its own port unless its config or --port names one
+    else if (ctx.config.server.evaluation === true && !portInConfigFile(dataDir())) ctx.config.server.port = EVAL_VIEW_PORT;
     await startServer(ctx);
   });
+
+/** Whether the data root's config file names server.port itself (not the default's). */
+function portInConfigFile(dir: string): boolean {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(dir, 'knode.config.json'), 'utf8')) as { server?: { port?: unknown } };
+    return raw.server?.port !== undefined;
+  } catch {
+    return false;
+  }
+}
 
 const syncCommand = async (opts: { llm?: boolean; datasources?: boolean; only?: string[]; verify?: boolean; reapply?: boolean; deferEmbeddings?: boolean }) => {
   const srv = server();

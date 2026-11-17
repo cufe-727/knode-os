@@ -49,6 +49,7 @@ import { startResearchLoop } from '../research/service.js';
 import { resetRunningConversations } from '../chat/store.js';
 import { McpEndpoint } from '../research/workspace.js';
 import { resolveWorkspaceScope, WorkspaceContextRegistry } from './workspaces.js';
+import { evalOwner } from '../eval/root.js';
 
 const isLoopbackHost = (host: string) => host === 'localhost' || isLoopbackAddress(host.replace(/^\[|\]$/g, ''));
 
@@ -76,6 +77,12 @@ export function assertListeners(server: AppContext['config']['server']): void {
   if (server.auth?.enabled === false && (tls || !isLoopbackHost(server.host))) {
     throw new Error('sign-in is off (server.auth.enabled: false): serve must then listen on loopback only, without server.tls');
   }
+}
+
+/** An evaluation root's viewer listens on loopback only, plain HTTP: it is not published (docs/design/35 §4). */
+export function assertViewerListeners(server: AppContext['config']['server']): void {
+  if (!isLoopbackHost(server.host)) throw new Error(`an evaluation root's viewer listens on loopback only; server.host is ${server.host}`);
+  if (server.tls) throw new Error("an evaluation root's viewer has no HTTPS listener (server.tls): it is for this machine");
 }
 
 function readPem(root: string, file: string, label: string): Buffer {
@@ -116,6 +123,9 @@ function failOnListenError(server: { on: (event: 'error', cb: (err: NodeJS.Errno
 export async function startServer(ctx: AppContext): Promise<void> {
   const log = (msg: string) => console.log(`[knode-os] ${msg}`);
   assertListeners(ctx.config.server);
+  // an evaluation root (docs/design/35 §4): a viewer of its builds, which changes none of them
+  const evaluation = ctx.config.server.evaluation === true;
+  if (evaluation) assertViewerListeners(ctx.config.server);
   // an entry that is not an exact origin stops serve here, before anything opens
   const embedAllowed = embedOrigins(ctx.config.server);
   const authConfig = ctx.config.server.auth;
@@ -143,11 +153,17 @@ export async function startServer(ctx: AppContext): Promise<void> {
   // an evaluation run's model work for remote workers (docs/design/27 §8): the server's, one source per kind behind every workspace's broker
   // its tasks and results are kept in the data root (docs/design/32 §5), bounded by server.remote.evalQueueMB
   const evalQueueMB = Number(ctx.config.server.remote?.evalQueueMB);
-  const evalWork = new EvalWork(ctx.dataDir, {
+  // none on an evaluation root: nothing is offered from there
+  const evalWork = evaluation ? null : new EvalWork(ctx.dataDir, {
     log: (msg) => log(`eval: ${msg}`),
     durable: Number.isFinite(evalQueueMB) && evalQueueMB > 0 ? { maxBytes: Math.round(evalQueueMB * 1024 ** 2) } : {},
   });
-  const workspaceContexts = new WorkspaceContextRegistry(ctx.dataDir, {
+  // the viewer: every build opened read-only, no settings written into it, none of the services below started
+  const workspaceContexts = evaluation ? new WorkspaceContextRegistry(ctx.dataDir, {
+    templateConfig: () => ctx.config,
+    log,
+    evaluation: { owner: evalOwner(ctx.config) },
+  }) : new WorkspaceContextRegistry(ctx.dataDir, {
     // read on every open: a shared setting an administrator changed reaches the root's copy first
     templateConfig: () => ctx.config,
     log,
@@ -163,7 +179,7 @@ export async function startServer(ctx: AppContext): Promise<void> {
         : null;
       let started: StartedServices;
       try {
-        started = startWorkspaceServices(workspaceCtx, workspaceLog, { mcp, rootDataDir: ctx.dataDir, machine, evalWork });
+        started = startWorkspaceServices(workspaceCtx, workspaceLog, { mcp, rootDataDir: ctx.dataDir, machine, evalWork: evalWork ?? undefined });
       } catch (err) {
         mcpTokens.revoke(agentToken);
         throw err;
@@ -180,24 +196,25 @@ export async function startServer(ctx: AppContext): Promise<void> {
       };
     },
   });
-  const app = createApp(ctx, log, workspaceContexts, { services: (workspaceCtx) => services.get(workspaceCtx.dataDir) ?? null, auth, mcpTokens, evalWork });
+  const app = createApp(ctx, log, workspaceContexts, { services: (workspaceCtx) => services.get(workspaceCtx.dataDir) ?? null, auth, mcpTokens, evalWork, evaluation });
   const { port, host } = ctx.config.server;
 
   const main = serve({ fetch: app.fetch, port, hostname: host }, (info) => {
-    log(`serving http://${host}:${info.port}  (workspace root: ${ctx.dataDir})`);
+    log(`serving http://${host}:${info.port}  (${evaluation ? 'evaluation root, read-only viewer' : 'workspace root'}: ${ctx.dataDir})`);
     const mcp = ctx.config.server.mcp;
     if (!mcp || mcp.enabled !== false) {
       const localHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
       mcpBase.url = `http://${localHost}:${info.port}${mcp?.path || '/mcp'}`;
       log(`mcp endpoint ${mcpBase.url}  (bearer token: ${MCP_TOKEN_FILE}; register with \`knode-os connect <claude|codex|cursor> --http\`)`);
     }
-    if (ctx.config.server.remote?.enabled !== false) log(`remote API http://${host}:${info.port}/remote/v1  (tokens: \`knode-os remote token create\`)`);
+    if (ctx.config.server.remote?.enabled !== false && !evaluation) log(`remote API http://${host}:${info.port}/remote/v1  (tokens: \`knode-os remote token create\`)`);
     if (embedAllowed.length) log(`embedded reader /embed/v1 may be framed by ${embedAllowed.join(', ')}  (server.embed.allowedOrigins)`);
     if (!auth) log('sign-in is OFF (server.auth.enabled: false): any local client may act as any user — for development only');
     else if (auth.setupRequired()) {
       log(`no accounts yet: create the administrator with \`knode-os user add <name> --admin\`, or open http://${host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host}:${info.port} on this machine`);
     } else log(`sign-in on: ${auth.accounts.list().length} account(s) in .knode/accounts.json  (\`knode-os user list\`)`);
-    autostartWorkspaces(ctx.dataDir, workspaceContexts, log);
+    // a viewer opens a build when someone looks at it, and starts nothing in it
+    if (!evaluation) autostartWorkspaces(ctx.dataDir, workspaceContexts, log);
   });
   failOnListenError(main, `${host}:${port}`);
 
@@ -214,7 +231,7 @@ export async function startServer(ctx: AppContext): Promise<void> {
   for (const signal of ['SIGTERM', 'SIGINT'] as const) {
     process.once(signal, () => {
       auth?.close();
-      evalWork.close();
+      evalWork?.close();
       process.exit(0);
     });
   }

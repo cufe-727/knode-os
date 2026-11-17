@@ -1,3 +1,4 @@
+import type { DatabaseConfig } from './config.js';
 import { KnodeConfig, loadConfig, resolveRoutedLlmConfig, routeTargets } from './config.js';
 import { DataSourceRegistry } from './datasource/registry.js';
 import { initDataDir } from './fs/datadir.js';
@@ -64,6 +65,8 @@ export interface CreateContextOptions {
    * opened read-only (`Store.open`'s `readOnly`).
    */
   readOnly?: boolean;
+  /** The database to open the index on, in place of the config's (the viewer reaching a build whose credential lived in its run). */
+  database?: DatabaseConfig;
 }
 
 export async function createContext(dataDir: string, opts: CreateContextOptions = {}): Promise<AppContext> {
@@ -72,6 +75,7 @@ export async function createContext(dataDir: string, opts: CreateContextOptions 
   // plugins before anything that resolves a provider: the store may open on a
   // backend one of them adds, the embedder and the stages on providers they add
   await loadPlugins(dataDir, config.plugins, { log: (msg) => console.log(`[knode-os] ${msg}`), roots: opts.pluginRoots });
+  if (opts.database) config.database = opts.database;
   const store = await Store.open(dataDir, config.embedding.dimensions, config.database, { readOnly: opts.readOnly });
   const embedder = createConfiguredEmbeddingProvider(config);
   const llm = judgeLlmClient(config);
